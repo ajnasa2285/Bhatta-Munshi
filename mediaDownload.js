@@ -3,7 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
-const config = require('../config');
+const config = require('./config');
 
 /**
  * Downloads media (audio or image) referenced by a normalized message
