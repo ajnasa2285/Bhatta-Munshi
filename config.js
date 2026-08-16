@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 function parseCreds() {
@@ -10,9 +11,14 @@ function parseCreds() {
   }
 }
 
+const geminiKey = process.env.GEMINI_API_KEY || "";
+
 const config = {
   port: process.env.PORT || 3000,
-  geminiApiKey: process.env.GEMINI_API_KEY,
+  geminiApiKey: geminiKey,
+  gemini: {
+    apiKey: geminiKey,
+  },
   googleSheetId: process.env.GOOGLE_SHEET_ID,
   googleCredentials: parseCreds(),
   gateway: {
