@@ -34,16 +34,30 @@ const CLOSING_HEADERS = [
   "Notes"
 ];
 
+function formatPrivateKey(key) {
+  if (!key) return "";
+  let cleanKey = key.trim();
+  if (
+    (cleanKey.startsWith('"') && cleanKey.endsWith('"')) ||
+    (cleanKey.startsWith("'") && cleanKey.endsWith("'"))
+  ) {
+    cleanKey = cleanKey.slice(1, -1);
+  }
+  return cleanKey.replace(/\\n/g, "\n").replace(/\r/g, "");
+}
+
 function getAuth() {
   const creds = config.googleCredentials;
   if (!creds || !creds.client_email || !creds.private_key) {
-    throw new Error("Invalid GOOGLE_SERVICE_ACCOUNT_CREDENTIALS configuration.");
+    throw new Error("Missing or invalid GOOGLE_SERVICE_ACCOUNT_CREDENTIALS configuration.");
   }
-  const privateKey = creds.private_key.replace(/\\n/g, "\n");
+
+  const formattedKey = formatPrivateKey(creds.private_key);
+
   return new google.auth.JWT(
     creds.client_email,
     null,
-    privateKey,
+    formattedKey,
     ["https://www.googleapis.com/auth/spreadsheets"]
   );
 }
