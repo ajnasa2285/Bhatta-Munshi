@@ -1,5 +1,5 @@
 
-asyncconst { resolveMediaToTempFile, cleanupTempFile } = require("./mediaDownload");
+const { resolveMediaToTempFile, cleanupTempFile } = require("./mediaDownload");
 // If your file is named geminiAudio.js:
 const { transcribeVoiceNote } = require("./geminiAudio");
 // If your file is named geminiVision.js:
