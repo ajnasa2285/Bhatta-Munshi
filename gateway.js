@@ -1,5 +1,5 @@
 const axios = require('axios');
-const config = require('../config');
+const config = require('./config');
 
 /**
  * Sends a text message back to a WhatsApp user via the configured gateway.
