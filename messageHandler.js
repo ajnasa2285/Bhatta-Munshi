@@ -1,10 +1,7 @@
 const { resolveMediaToTempFile, cleanupTempFile } = require("./mediaDownload");
-// If your file is named geminiAudio.js:
-const { transcribeVoiceNote } = require("./geminiAudio");
-// If your file is named geminiVision.js:
-const { extractLedgerTextFromImage } = require("./geminiVision");
-// If your file is named geminiExtract.js:
-const { extractLedgerData } = require("./geminiExtract");
+const { transcribeVoiceNote } = require("./whisper");
+const { extractLedgerTextFromImage } = require("./vision");
+const { extractLedgerData } = require("./extract");
 const {
   ensureAllTabs,
   logSale,
@@ -14,7 +11,8 @@ const {
 } = require("./sheets");
 const gateway = require("./gateway");
 const { config } = require("./config");
- function handleIncomingMessage(normalized) {
+
+async function handleIncomingMessage(normalized) {
   const { from, type } = normalized;
   if (!from) return;
 
