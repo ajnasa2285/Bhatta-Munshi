@@ -34,37 +34,42 @@ const CLOSING_HEADERS = [
   "Notes"
 ];
 
-function formatPrivateKey(key) {
-  if (!key) return "";
-  let cleanKey = key.trim();
-  if (
-    (cleanKey.startsWith('"') && cleanKey.endsWith('"')) ||
-    (cleanKey.startsWith("'") && cleanKey.endsWith("'"))
-  ) {
-    cleanKey = cleanKey.slice(1, -1);
+function cleanPrivateKey(rawKey) {
+  if (!rawKey) return "";
+  let k = String(rawKey).trim();
+  if ((k.startsWith('"') && k.endsWith('"')) || (k.startsWith("'") && k.endsWith("'"))) {
+    k = k.slice(1, -1);
   }
-  return cleanKey.replace(/\\n/g, "\n").replace(/\r/g, "");
+  k = k.replace(/\\n/g, "\n").replace(/\r/g, "");
+
+  const match = k.match(/-----BEGIN (?:RSA )?PRIVATE KEY-----([\s\S]+?)-----END (?:RSA )?PRIVATE KEY-----/);
+  if (match && match[1]) {
+    const body = match[1].replace(/\s+/g, "");
+    const chunks = body.match(/.{1,64}/g) || [body];
+    const isRsa = k.includes("RSA PRIVATE KEY");
+    const header = isRsa ? "-----BEGIN RSA PRIVATE KEY-----" : "-----BEGIN PRIVATE KEY-----";
+    const footer = isRsa ? "-----END RSA PRIVATE KEY-----" : "-----END PRIVATE KEY-----";
+    return `${header}\n${chunks.join("\n")}\n${footer}\n`;
+  }
+  return k;
 }
 
-function getAuth() {
+async function getSheetsClient() {
   const creds = config.googleCredentials;
   if (!creds || !creds.client_email || !creds.private_key) {
     throw new Error("Missing or invalid GOOGLE_SERVICE_ACCOUNT_CREDENTIALS configuration.");
   }
 
-  const formattedKey = formatPrivateKey(creds.private_key);
+  const formattedKey = cleanPrivateKey(creds.private_key);
 
-  return new google.auth.JWT(
-    creds.client_email,
-    null,
-    formattedKey,
-    ["https://www.googleapis.com/auth/spreadsheets"]
-  );
-}
+  const auth = new google.auth.GoogleAuth({
+    credentials: {
+      client_email: creds.client_email,
+      private_key: formattedKey,
+    },
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  });
 
-async function getSheetsClient() {
-  const auth = getAuth();
-  await auth.authorize();
   return google.sheets({ version: "v4", auth });
 }
 
