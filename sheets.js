@@ -49,16 +49,17 @@ async function getSheetsClient() {
     let key = creds.private_key || "";
     key = key.replace(/\\n/g, "\n").replace(/\r/g, "").trim();
 
-    auth = new google.auth.JWT({
-      email: creds.client_email,
-      key: key,
+    auth = new google.auth.GoogleAuth({
+      credentials: {
+        client_email: creds.client_email,
+        private_key: key,
+      },
       scopes: ["https://www.googleapis.com/auth/spreadsheets"],
     });
   } else {
     throw new Error("Missing Google Service Account Credentials");
   }
 
-  await auth.authorize();
   return google.sheets({ version: "v4", auth });
 }
 
