@@ -34,9 +34,12 @@ app.post("/webhook", async (req, res) => {
 });
 
 async function start() {
-  assertRequiredConfig();
+  if (typeof assertRequiredConfig === "function") {
+    assertRequiredConfig();
+  }
   await initSheets();
-  app.listen(config.port, () => console.log(`Munshi agent listening on port ${config.port}`));
+  const port = config?.port || process.env.PORT || 3000;
+  app.listen(port, () => console.log(`Munshi agent listening on port ${port}`));
 }
 
 start();
