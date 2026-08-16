@@ -1,5 +1,4 @@
 const fs = require("fs");
-const path = require("path");
 const { google } = require("googleapis");
 const { config } = require("./config");
 
@@ -37,32 +36,29 @@ const CLOSING_HEADERS = [
 ];
 
 async function getSheetsClient() {
-  const secretFilePath = "/etc/secrets/google-credentials.json";
+  const secretPath = "/etc/secrets/google-credentials.json";
   let auth;
 
-  if (fs.existsSync(secretFilePath)) {
-    // 1. Load directly from Render Secret File (100% reliable)
+  if (fs.existsSync(secretPath)) {
     auth = new google.auth.GoogleAuth({
-      keyFile: secretFilePath,
+      keyFile: secretPath,
       scopes: ["https://www.googleapis.com/auth/spreadsheets"],
     });
   } else if (config.googleCredentials) {
-    // 2. Fallback to env variable
-    let creds = config.googleCredentials;
-    let privateKey = String(creds.private_key || "")
-      .replace(/\\n/g, "\n")
-      .replace(/\\r/g, "")
-      .replace(/\r/g, "");
+    const creds = config.googleCredentials;
+    let key = creds.private_key || "";
+    key = key.replace(/\\n/g, "\n").replace(/\r/g, "").trim();
 
     auth = new google.auth.JWT({
       email: creds.client_email,
-      key: privateKey,
+      key: key,
       scopes: ["https://www.googleapis.com/auth/spreadsheets"],
     });
   } else {
-    throw new Error("No Google Service Account credentials found.");
+    throw new Error("Missing Google Service Account Credentials");
   }
 
+  await auth.authorize();
   return google.sheets({ version: "v4", auth });
 }
 
