@@ -1,5 +1,6 @@
+const fs = require("fs");
+const path = require("path");
 const { google } = require("googleapis");
-const crypto = require("crypto");
 const { config } = require("./config");
 
 const SALES_TAB = "Sales";
@@ -35,50 +36,33 @@ const CLOSING_HEADERS = [
   "Notes"
 ];
 
-function normalizePrivateKey(rawKey) {
-  if (!rawKey) return "";
-  let key = String(rawKey).trim();
-
-  // Strip wrapping quotes if any exist
-  if (
-    (key.startsWith('"') && key.endsWith('"')) ||
-    (key.startsWith("'") && key.endsWith("'"))
-  ) {
-    key = key.slice(1, -1);
-  }
-
-  // Convert literal \n or \\n strings to real newline characters
-  key = key.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\r/g, "");
-
-  // Extract base64 payload between PEM header and footer
-  const match = key.match(/-----BEGIN (?:RSA )?PRIVATE KEY-----([\s\S]+?)-----END (?:RSA )?PRIVATE KEY-----/);
-  if (match && match[1]) {
-    const rawBase64 = match[1].replace(/[\s\r\n]+/g, "");
-    const chunked = rawBase64.match(/.{1,64}/g)?.join("\n") || rawBase64;
-    const isRsa = key.includes("RSA PRIVATE KEY");
-    const header = isRsa ? "-----BEGIN RSA PRIVATE KEY-----" : "-----BEGIN PRIVATE KEY-----";
-    const footer = isRsa ? "-----END RSA PRIVATE KEY-----" : "-----END PRIVATE KEY-----";
-    return `${header}\n${chunked}\n${footer}\n`;
-  }
-
-  return key;
-}
-
 async function getSheetsClient() {
-  const creds = config.googleCredentials;
-  if (!creds || !creds.client_email || !creds.private_key) {
-    throw new Error("Missing or invalid GOOGLE_SERVICE_ACCOUNT_CREDENTIALS configuration.");
+  const secretFilePath = "/etc/secrets/google-credentials.json";
+  let auth;
+
+  if (fs.existsSync(secretFilePath)) {
+    // 1. Load directly from Render Secret File (100% reliable)
+    auth = new google.auth.GoogleAuth({
+      keyFile: secretFilePath,
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+  } else if (config.googleCredentials) {
+    // 2. Fallback to env variable
+    let creds = config.googleCredentials;
+    let privateKey = String(creds.private_key || "")
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "")
+      .replace(/\r/g, "");
+
+    auth = new google.auth.JWT({
+      email: creds.client_email,
+      key: privateKey,
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+  } else {
+    throw new Error("No Google Service Account credentials found.");
   }
 
-  const cleanKey = normalizePrivateKey(creds.private_key);
-
-  const auth = new google.auth.JWT({
-    email: creds.client_email,
-    key: cleanKey,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-  });
-
-  await auth.authorize();
   return google.sheets({ version: "v4", auth });
 }
 
