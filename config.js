@@ -83,4 +83,5 @@ function validateConfig() {
 
 validateConfig();
 
-module.exports = config;
+
+module.exports = { config, assertRequiredConfig };
