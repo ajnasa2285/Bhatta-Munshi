@@ -1,8 +1,8 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const config = require('./config');
-const { normalizeWebhookPayload } = require('./webhook/normalize');
-const { handleIncomingMessage } = require('./handlers/messageHandler');
+const { normalizeIncomingMessage } = require("./src/webhook/normalize");
+const { handleIncomingMessage, initSheets } = require("./src/handlers/messageHandler");
 const { initializeSheet } = require('./services/sheets');
 
 const app = express();
