@@ -1,47 +1,30 @@
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const config = require('./config');
+const fs = require("fs");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { config } = require("./config");
 
-const genAI = new GoogleGenerativeAI(config.gemini.apiKey);
+const apiKey = config?.geminiApiKey || config?.gemini?.apiKey || process.env.GEMINI_API_KEY || "";
+const genAI = new GoogleGenerativeAI(apiKey);
 
-/**
- * Reads a photo of a handwritten ledger page (bahi-khata) and returns a
- * clean plain-text transcription of its contents using Gemini 1.5 Flash
- * vision/OCR capability. No OpenAI used.
- *
- * @param {string} base64Image - base64-encoded image bytes
- * @param {string} mimeType - e.g. 'image/jpeg', 'image/png'
- * @returns {Promise<string>} transcribed ledger text
- */
-async function readLedgerImage(base64Image, mimeType = 'image/jpeg') {
-  const model = genAI.getGenerativeModel({ model: config.gemini.model });
+const EXTRACTION_INSTRUCTION = `This is a photo of a handwritten ledger page from an Indian brick kiln (bhatta).
+Entries are usually in Hindi and/or English. They typically record: customer/party name, brick grade (Awwal, Meetha, Khanjad, Peela, Godiya, Addha Awwal, Addha Peela), quantity of bricks, cash received, and pending amount.
+Transcribe everything you can read line by line.`;
 
-  const prompt = `You are reading a photo of a handwritten ledger page (bahi-khata) from an Indian brick kiln (ईंट भट्ठा).
-The handwriting may be in Hindi (Devanagari), English, or numerals mixed with local shorthand for:
-- Brick grades: Awwal, Meetha, Khanjad, Peela, Godiya, Addha Awwal, Addha Peela
-- Money amounts (₹, Rs, /-)
-- Names of customers/thekedars and workers
-- Dates in Indian formats (DD/MM/YY etc.)
-
-Transcribe EVERY legible line of the ledger as accurately as possible, preserving the original script
-(Hindi words in Devanagari, English words in English, numbers as digits).
-If a word or number is unclear, make your best guess and mark it with [?] immediately after.
-Output ONLY the transcription, line by line. No extra commentary, no markdown formatting.`;
+async function extractLedgerTextFromImage(filePath, mimeType) {
+  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+  const imageData = fs.readFileSync(filePath).toString("base64");
 
   const result = await model.generateContent([
-    { text: prompt },
-    {
-      inlineData: {
-        mimeType,
-        data: base64Image,
-      },
-    },
+    { inlineData: { data: imageData, mimeType } },
+    { text: EXTRACTION_INSTRUCTION },
   ]);
 
-  const response = result.response;
-  const text = response.text().trim();
+  const text = (result.response.text() || "").trim();
+  if (!text || text.length < 3) {
+    const err = new Error("EMPTY_VISION_EXTRACTION");
+    err.userMessage = "Photo saaf nahi padhi ja saki. Kripya achhi roshni mein dobara bhejein.";
+    throw err;
+  }
   return text;
 }
 
-module.exports = {
-  readLedgerImage,
-};
+module.exports = { extractLedgerTextFromImage };
