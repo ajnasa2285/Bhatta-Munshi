@@ -39,10 +39,11 @@ function getAuth() {
   if (!creds || !creds.client_email || !creds.private_key) {
     throw new Error("Invalid GOOGLE_SERVICE_ACCOUNT_CREDENTIALS configuration.");
   }
+  const privateKey = creds.private_key.replace(/\\n/g, "\n");
   return new google.auth.JWT(
     creds.client_email,
     null,
-    creds.private_key,
+    privateKey,
     ["https://www.googleapis.com/auth/spreadsheets"]
   );
 }
