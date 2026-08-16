@@ -1,0 +1,32 @@
+{
+  "name": "whatsapp-munshi-agent",
+  "version": "1.0.0",
+  "description": "WhatsApp Munshi Agent for Indian brick kiln (ईंट भट्ठा) ledger automation using Google Gemini + Google Sheets",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "gemini",
+    "brick-kiln",
+    "munshi",
+    "google-sheets"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "googleapis": "^144.0.0",
+    "express": "^4.21.1",
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "body-parser": "^1.20.3",
+    "uuid": "^9.0.1",
+    "form-data": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
