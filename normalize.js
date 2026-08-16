@@ -18,7 +18,8 @@
  * } | null   // null if the payload should be ignored (e.g. status updates, own messages)
  */
 
-const config = require('../config');
+const { config } = require("./config");
+
 
 function digitsOnly(str) {
   return (str || '').replace(/\D/g, '');
