@@ -1,3 +1,4 @@
+const fs = require("fs");
 const { google } = require("googleapis");
 const { config } = require("./config");
 
@@ -34,20 +35,55 @@ const CLOSING_HEADERS = [
   "Notes"
 ];
 
+function sanitizePrivateKey(rawKey) {
+  if (!rawKey) return "";
+  let key = String(rawKey).trim();
+
+  // Strip wrapping quotes if present
+  if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+    key = key.slice(1, -1);
+  }
+
+  // Convert literal escape sequences to real newlines
+  key = key.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\r/g, "");
+
+  // Re-chunk the Base64 body to strict 64-char lines for OpenSSL compliance
+  const pemMatch = key.match(/-----BEGIN (?:RSA )?PRIVATE KEY-----([\s\S]+?)-----END (?:RSA )?PRIVATE KEY-----/);
+  if (pemMatch && pemMatch[1]) {
+    const rawBody = pemMatch[1].replace(/[\s\r\n]+/g, "");
+    const chunked = rawBody.match(/.{1,64}/g)?.join("\n") || rawBody;
+    const isRsa = key.includes("RSA PRIVATE KEY");
+    const header = isRsa ? "-----BEGIN RSA PRIVATE KEY-----" : "-----BEGIN PRIVATE KEY-----";
+    const footer = isRsa ? "-----END RSA PRIVATE KEY-----" : "-----END PRIVATE KEY-----";
+    return `${header}\n${chunked}\n${footer}\n`;
+  }
+
+  return key;
+}
+
 async function getSheetsClient() {
+  const secretPath = "/etc/secrets/google-credentials.json";
+
+  if (fs.existsSync(secretPath)) {
+    const auth = new google.auth.GoogleAuth({
+      keyFile: secretPath,
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    });
+    return google.sheets({ version: "v4", auth });
+  }
+
   const creds = config.googleCredentials;
-  if (!creds || !creds.client_email) {
+  if (!creds || !creds.client_email || !creds.private_key) {
     throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_CREDENTIALS configuration.");
   }
 
-  // Format private key safely: fix newlines if squashed as literal text
-  const formattedCreds = {
-    ...creds,
-    private_key: (creds.private_key || "").replace(/\\n/g, "\n"),
-  };
+  const cleanKey = sanitizePrivateKey(creds.private_key);
 
-  const auth = google.auth.fromJSON(formattedCreds);
-  auth.scopes = ["https://www.googleapis.com/auth/spreadsheets"];
+  const auth = new google.auth.JWT({
+    email: creds.client_email,
+    key: cleanKey,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  });
 
   return google.sheets({ version: "v4", auth });
 }
