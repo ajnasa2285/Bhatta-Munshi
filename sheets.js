@@ -1,3 +1,5 @@
+const path = require("path");
+const fs = require("fs");
 const { google } = require("googleapis");
 const { config } = require("./config");
 
@@ -35,13 +37,25 @@ const CLOSING_HEADERS = [
 ];
 
 async function getSheetsClient() {
-  const creds = config.googleCredentials;
-  if (!creds || !creds.client_email || !creds.private_key) {
-    throw new Error("Missing or invalid GOOGLE_SERVICE_ACCOUNT_CREDENTIALS.");
+  const localCredsPath = path.join(__dirname, "credentials.json");
+  const secretCredsPath = "/etc/secrets/google-credentials.json";
+
+  let keyFileToUse = null;
+
+  if (fs.existsSync(localCredsPath)) {
+    keyFileToUse = localCredsPath;
+  } else if (fs.existsSync(secretCredsPath)) {
+    keyFileToUse = secretCredsPath;
   }
 
-  const auth = google.auth.fromJSON(creds);
-  auth.scopes = ["https://www.googleapis.com/auth/spreadsheets"];
+  if (!keyFileToUse) {
+    throw new Error("Credentials file not found. Ensure credentials.json is in the project root.");
+  }
+
+  const auth = new google.auth.GoogleAuth({
+    keyFile: keyFileToUse,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  });
 
   return google.sheets({ version: "v4", auth });
 }
