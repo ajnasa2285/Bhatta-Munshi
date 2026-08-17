@@ -63,6 +63,23 @@ async function sendWhatsAppReply(targetNumber, text) {
   }
 }
 
+async function generateWithRetry(request, maxRetries = 2) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await genAI.models.generateContent(request);
+    } catch (err) {
+      const isOverloaded = err.message?.includes("UNAVAILABLE") || err.message?.includes("high demand");
+      if (isOverloaded && attempt < maxRetries) {
+        const delayMs = 2000 * (attempt + 1);
+        console.log(`[Gemini] Overloaded, retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxRetries})...`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 function cleanJsonText(raw) {
   return raw
     .trim()
@@ -110,7 +127,7 @@ app.post("/webhook", async (req, res) => {
 
     if (base64Audio && base64Audio.length > 100) {
       console.log("[Gemini] Analyzing audio payload...");
-      result = await genAI.models.generateContent({
+      result = await generateWithRetry({
         model: GEMINI_MODEL,
         contents: [
           { text: SYSTEM_PROMPT },
@@ -124,7 +141,7 @@ app.post("/webhook", async (req, res) => {
       });
     } else {
       console.log(`[Gemini] Analyzing text: "${userText}"`);
-      result = await genAI.models.generateContent({
+      result = await generateWithRetry({
         model: GEMINI_MODEL,
         contents: [
           { text: SYSTEM_PROMPT },
