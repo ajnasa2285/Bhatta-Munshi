@@ -18,8 +18,8 @@ You are an expert Munshi (accountant) for an Indian Brick Kiln (ईंट भट
 Analyze the text or audio transcription and return ONLY a valid JSON object (no markdown, no backticks):
 {
   "intent": "sale" | "expense" | "daily_closing" | "correction" | "unknown",
-  "name": "Customer or party name",
-  "grade": "1st/अव्वल" | "2nd/दोयम" | "3rd/सोयम" | "Tukda/टुकड़ा" | "Roda/रोड़ा" | "Chatka/चटका" | "Other",
+  "name": "Customer or party name, extracted exactly as spoken or typed by the user — do not translate or transliterate the script (keep Hindi names in Devanagari, English-typed names in Latin script, as given)",
+  "grade": "Awwal" | "Meetha" | "Khanjad" | "Peela" | "Godiya" | "Roda" | "Awwal Roda" | "Peela Roda" | "Other",
   "quantity": 0,
   "amount_payable": 0,
   "amount_received": 0,
@@ -39,6 +39,11 @@ Analyze the text or audio transcription and return ONLY a valid JSON object (no 
   "corrected_value": "",
   "reply_text": "A brief confirmation message in Hindi acknowledging the recorded entry"
 }
+
+Grade matching rules:
+- Match the "grade" field to exactly what the user said, using the closest term from the list: Awwal, Meetha, Khanjad, Peela, Godiya, Roda, Awwal Roda, Peela Roda.
+- These are distinct grade categories, not variants of each other — do not substitute one for another (e.g. "meetha" must map to "Meetha", never to "Awwal").
+- Only use "Other" if the spoken/typed grade genuinely does not match any of the above terms or their common phonetic variants.
 `;
 
 async function sendWhatsAppReply(targetNumber, text) {
