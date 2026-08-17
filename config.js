@@ -1,12 +1,20 @@
-
 require("dotenv").config();
 
 function parseCreds() {
-  if (!process.env.GOOGLE_SERVICE_ACCOUNT_CREDENTIALS) return null;
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_CREDENTIALS;
+  if (!raw) return null;
+
   try {
-    return JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_CREDENTIALS);
+    const trimmed = raw.trim();
+    // Check if it is a raw JSON string
+    if (trimmed.startsWith("{")) {
+      return JSON.parse(trimmed);
+    }
+    // Otherwise decode base64
+    const decoded = Buffer.from(trimmed, "base64").toString("utf-8");
+    return JSON.parse(decoded);
   } catch (err) {
-    console.error("GOOGLE_SERVICE_ACCOUNT_CREDENTIALS is not valid JSON:", err.message);
+    console.error("Failed to parse GOOGLE_SERVICE_ACCOUNT_CREDENTIALS:", err.message);
     return null;
   }
 }
