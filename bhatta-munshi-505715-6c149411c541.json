@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "bhatta-munshi-505715",
+  "private_key_id": "6c149411c5416b5c165e0923ecc649a54e384ef8",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDKo2qO8IHxuypR\n1p24SexGUXVzBfNCDmPmZwa7n1r0KYXl05VmzZhJVdstYSTEthzxd63YXJFOlNQS\nmtfh69Edp313ir1vUV5t0L9TwEE1bpnq2/5vgBVZpxTEDe4t3vp1YQLmaKf69t8m\nkVNzhxdScpJIwB6QY5ASlxuXRm7ka2WRlVQqBYvDUKxjLp8jYl7ktJTfKICs9B6L\nzrpQQKQBSGV2hFvA8tX7CG3wnKLLLmNyS5/rQhQzVpjyz7Pw7AUIgZdObCAeY308\n1PaAZDiyT9s3UnxvThLwIEmpt5yTUnvQ970DbiDDWn/LIfAyqGL7HQNqG0Upv1Ym\nPiDSK0ZRAgMBAAECggEAAR7JSPYjzMShb7ODWpSHiq26e87ejPjgBOMAzLadQcxt\nN+OdH8TvFKg1qoz+/1qnoy7bgl7EI6JjYAE0xHQpmzus4BVfddsl/c7NsPqHDcLh\nVVTfJaoITC8mGG2giYbCHRYixkfxtkupOQkMhF7swkUdgYsU3Czdu/mTgqkGNctu\n7Th70jldxUBVxS4dZIdRaLDBz+mI1XS2Mcju09CA0zsZAMA6dVAbiKgTGgqj75u5\nvO8Y4DoIoZKDmyJSe7jx9ilw80g062T+8fhYGu4srzjEawGZv+70x4Rg5tFIoXrC\nAV/r6Czsfsh3b+O8tHvd8wCZTC723b2OUco1HTBEwQKBgQD1njhz9/gD/WfdvWto\n6Xqeg71aCJR1U96kVAb6WTfvxFWQ2geLIDBWHqVj4gIoSX3rWS0X17ePDSGrdMpy\nn7x/n/EpyukjTKEwf9RuXmDlcU0zeZgaroOde+5AAd9l+nkIdJEjd7dm13Xitqf9\nC4lfTr0nJdPPBzsQRVm2bTN/wQKBgQDTNB8nUv8uktRB2iydxSwGJZWtRYe57Btr\n0upWM6doVkNY2Omn7T5vPxkQbCQ7W42DmYXTUXll2kez2JnRP+zXQEUZOsznG+uo\nv8zxZRJ6w0ZMk6E0uq8EYIVLRcPY94U/KFe9SqbttVZZQynoZek6yjzC8JYIVsUP\nAdx9i5pqkQKBgD+2Ux6B7Cvcx9yVDg+gwNXthmicYSYuI0qtIUI/cmsXmrqAVASa\nzO8J9Az8y2J37dnmv/O3WT4aQemf2gPxu4u/iWc141PsxMM35XrbsHbT9RqtJ++D\n5VAsnZis464oUs0Gr79rhn9+1G2CxAC3xWKboiVNgqvpTEDkPGk92mYBAoGBALyr\nthzZ/s3rKqQ9M1gpWF+RWbl1AH9tVT2oJ+Cjuivxy63l8C0sOXcFpe1Ovbss2Skz\njyIsiUccjKszlo0gDwJnDpMwPPVDsuyHkpweTzjNktI7m2nQTyKY2tpYU1FSJH08\nG80kkCSPtrh80EYkLApxuX/njg+a++ShJAgfGu2RAoGBAOF4ZB77Jg7DAkbpu624\nD1vSpHqgIHxTeL3Is0n8277IIa+C7SaqQONQPuQ2CLwz6JNbOwfQBQSlTVUJxmpn\nb0JawBbCS3GQqp+M1zWSq2qEh/eP8KJ3JQScxgxzsGiuaEB2xrDcAsgIvm0FlqR8\npnopFxTzEgOVehLpnFK9V5Ou\n-----END PRIVATE KEY-----\n",
+  "client_email": "munshi@bhatta-munshi-505715.iam.gserviceaccount.com",
+  "client_id": "117973081633017546916",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/munshi%40bhatta-munshi-505715.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
