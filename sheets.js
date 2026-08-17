@@ -1,4 +1,3 @@
-const fs = require("fs");
 const { google } = require("googleapis");
 const { config } = require("./config");
 
@@ -36,29 +35,19 @@ const CLOSING_HEADERS = [
 ];
 
 async function getSheetsClient() {
-  const secretPath = "/etc/secrets/google-credentials.json";
-  let auth;
-
-  if (fs.existsSync(secretPath)) {
-    auth = new google.auth.GoogleAuth({
-      keyFile: secretPath,
-      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-    });
-  } else if (config.googleCredentials) {
-    const creds = config.googleCredentials;
-    let key = creds.private_key || "";
-    key = key.replace(/\\n/g, "\n").replace(/\r/g, "").trim();
-
-    auth = new google.auth.GoogleAuth({
-      credentials: {
-        client_email: creds.client_email,
-        private_key: key,
-      },
-      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-    });
-  } else {
-    throw new Error("Missing Google Service Account Credentials");
+  const creds = config.googleCredentials;
+  if (!creds || !creds.client_email) {
+    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_CREDENTIALS configuration.");
   }
+
+  // Format private key safely: fix newlines if squashed as literal text
+  const formattedCreds = {
+    ...creds,
+    private_key: (creds.private_key || "").replace(/\\n/g, "\n"),
+  };
+
+  const auth = google.auth.fromJSON(formattedCreds);
+  auth.scopes = ["https://www.googleapis.com/auth/spreadsheets"];
 
   return google.sheets({ version: "v4", auth });
 }
