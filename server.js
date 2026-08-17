@@ -14,35 +14,35 @@ const genAI = new GoogleGenerativeAI(config.geminiApiKey);
 
 const SYSTEM_PROMPT = `
 You are an expert Munshi (accountant) for an Indian Brick Kiln (ईंट भट्ठा).
-Parse the message (Hindi, Hinglish, or English, audio transcript or text) and return strict JSON with no markdown formatting:
+Analyze the text or audio transcription and return ONLY a valid JSON object (no markdown, no backticks):
 {
   "intent": "sale" | "expense" | "daily_closing" | "correction" | "unknown",
-  "name": string,
+  "name": "Customer or party name",
   "grade": "1st/अव्वल" | "2nd/दोयम" | "3rd/सोयम" | "Tukda/टुकड़ा" | "Roda/रोड़ा" | "Chatka/चटका" | "Other",
-  "quantity": number,
-  "amount_payable": number,
-  "amount_received": number,
-  "pending_amount": number,
+  "quantity": 0,
+  "amount_payable": 0,
+  "amount_received": 0,
+  "pending_amount": 0,
   "mode_of_payment": "Cash" | "UPI" | "Bank Transfer" | "Credit",
   "category": "Coal/कोयला" | "Labor/मजदूरी" | "Diesel/डीजल" | "Soil/मिट्टी" | "Maintenance" | "Other",
-  "paid_to": string,
-  "amount": number,
-  "remarks": string,
-  "total_jama": number,
-  "total_kharcha": number,
-  "maalik_ko_diya": number,
-  "munshi_cash_in_hand": number,
-  "notes": string,
-  "target_customer": string,
-  "field_to_update": string,
-  "corrected_value": string,
-  "reply_text": string
+  "paid_to": "",
+  "amount": 0,
+  "remarks": "",
+  "total_jama": 0,
+  "total_kharcha": 0,
+  "maalik_ko_diya": 0,
+  "munshi_cash_in_hand": 0,
+  "notes": "",
+  "target_customer": "",
+  "field_to_update": "",
+  "corrected_value": "",
+  "reply_text": "A brief confirmation message in Hindi acknowledging the recorded entry"
 }
 `;
 
-async function sendWhatsAppReply(recipient, text) {
+async function sendWhatsAppReply(targetNumber, text) {
   try {
-    const cleanNumber = recipient.replace("@s.whatsapp.net", "").replace("@c.us", "");
+    const cleanNumber = targetNumber.replace("@s.whatsapp.net", "").replace("@c.us", "");
     const url = `${config.gateway.baseUrl}/message/sendText/Bhatta-bot1`;
     await axios.post(
       url,
@@ -56,9 +56,9 @@ async function sendWhatsAppReply(recipient, text) {
         },
       }
     );
-    console.log(`WhatsApp reply successfully sent to ${cleanNumber}`);
+    console.log(`[Reply] Confirmation sent to ${cleanNumber}`);
   } catch (err) {
-    console.error("Error sending WhatsApp reply:", err.response?.data || err.message);
+    console.error("[Reply Error]", err.response?.data || err.message);
   }
 }
 
@@ -66,27 +66,41 @@ app.post("/webhook", async (req, res) => {
   res.status(200).send("OK");
 
   try {
-    const data = req.body?.data;
+    const body = req.body;
+    console.log("[Webhook Hit] Event:", body?.event);
+
+    const data = body?.data;
     if (!data) return;
 
-    const key = data.key;
-    const remoteJid = key?.remoteJid || "";
+    const key = data.key || {};
+    const remoteJid = key.remoteJid || "";
     const senderNumber = remoteJid.replace("@s.whatsapp.net", "").replace("@c.us", "");
 
-    const msg = data.message;
-    if (!msg) return;
+    const msg = data.message || {};
+    
+    // Extract text across different WhatsApp message types
+    let userText = 
+      msg.conversation || 
+      msg.extendedTextMessage?.text || 
+      msg.imageMessage?.caption || 
+      msg.videoMessage?.caption || 
+      "";
 
-    let userText = msg.conversation || msg.extendedTextMessage?.text || "";
+    // Extract audio
     let base64Audio = msg.base64 || data.base64 || "";
 
-    if (!userText && !base64Audio) return;
+    console.log(`[Incoming] Sender: ${senderNumber}, Text: "${userText}", Audio: ${Boolean(base64Audio)}`);
 
-    console.log(`[Munshi] Processing input from ${senderNumber}: ${userText || "[Audio Message]"}`);
+    if (!userText && !base64Audio) {
+      console.log("[Webhook] No text or audio content found in message payload.");
+      return;
+    }
 
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
     let result;
     if (base64Audio && base64Audio.length > 100) {
+      console.log("[Gemini] Analyzing audio payload...");
       result = await model.generateContent([
         { text: SYSTEM_PROMPT },
         {
@@ -97,37 +111,44 @@ app.post("/webhook", async (req, res) => {
         },
       ]);
     } else {
+      console.log(`[Gemini] Analyzing text: "${userText}"`);
       result = await model.generateContent([
         { text: SYSTEM_PROMPT },
-        { text: `Process this entry: "${userText}"` },
+        { text: `Parse this entry: "${userText}"` },
       ]);
     }
 
-    const raw = result.response.text().trim().replace(/^```json/, "").replace(/```$/, "").trim();
-    const parsed = JSON.parse(raw);
-    console.log("[Munshi] Parsed data:", parsed);
+    const rawText = result.response.text().trim().replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
+    console.log("[Gemini Response Raw]:", rawText);
+
+    const parsed = JSON.parse(rawText);
+    console.log("[Parsed JSON]:", parsed);
 
     if (parsed.intent === "sale") {
       await sheets.logSale(parsed);
+      console.log("[Sheets] Sale logged successfully.");
     } else if (parsed.intent === "expense") {
       await sheets.logExpense(parsed);
+      console.log("[Sheets] Expense logged successfully.");
     } else if (parsed.intent === "daily_closing") {
       await sheets.logDailyClosing(parsed);
+      console.log("[Sheets] Daily Closing logged successfully.");
     } else if (parsed.intent === "correction") {
       await sheets.applyCorrection(parsed);
+      console.log("[Sheets] Correction applied successfully.");
     }
 
     if (parsed.reply_text) {
       await sendWhatsAppReply(remoteJid, parsed.reply_text);
     }
   } catch (err) {
-    console.error("[Munshi] Webhook error:", err.message);
+    console.error("[Webhook Error]:", err.message, err.stack);
   }
 });
 
 const PORT = config.port || 10000;
 app.listen(PORT, async () => {
-  console.log(`Munshi server live on port ${PORT}`);
+  console.log(`Munshi server listening on port ${PORT}`);
   try {
     await sheets.ensureAllTabs();
     console.log("Google Sheet tabs verified.");
