@@ -1,6 +1,6 @@
 const express = require("express");
 const axios = require("axios");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { GoogleGenAI } = require("@google/genai");
 const { config, assertRequiredConfig } = require("./config");
 const sheets = require("./sheets");
 
@@ -10,7 +10,8 @@ const app = express();
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-const genAI = new GoogleGenerativeAI(config.geminiApiKey);
+const genAI = new GoogleGenAI({ apiKey: config.geminiApiKey });
+const GEMINI_MODEL = "gemini-2.5-flash";
 
 const SYSTEM_PROMPT = `
 You are an expert Munshi (accountant) for an Indian Brick Kiln (ईंट भट्ठा).
@@ -62,6 +63,15 @@ async function sendWhatsAppReply(targetNumber, text) {
   }
 }
 
+function cleanJsonText(raw) {
+  return raw
+    .trim()
+    .replace(/^```json/i, "")
+    .replace(/^```/, "")
+    .replace(/```$/, "")
+    .trim();
+}
+
 app.post("/webhook", async (req, res) => {
   res.status(200).send("OK");
 
@@ -77,13 +87,13 @@ app.post("/webhook", async (req, res) => {
     const senderNumber = remoteJid.replace("@s.whatsapp.net", "").replace("@c.us", "");
 
     const msg = data.message || {};
-    
+
     // Extract text across different WhatsApp message types
-    let userText = 
-      msg.conversation || 
-      msg.extendedTextMessage?.text || 
-      msg.imageMessage?.caption || 
-      msg.videoMessage?.caption || 
+    let userText =
+      msg.conversation ||
+      msg.extendedTextMessage?.text ||
+      msg.imageMessage?.caption ||
+      msg.videoMessage?.caption ||
       "";
 
     // Extract audio
@@ -96,29 +106,34 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
     let result;
+
     if (base64Audio && base64Audio.length > 100) {
       console.log("[Gemini] Analyzing audio payload...");
-      result = await model.generateContent([
-        { text: SYSTEM_PROMPT },
-        {
-          inlineData: {
-            mimeType: "audio/ogg; codecs=opus",
-            data: base64Audio.replace(/^data:audio\/\w+;base64,/, ""),
+      result = await genAI.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: [
+          { text: SYSTEM_PROMPT },
+          {
+            inlineData: {
+              mimeType: "audio/ogg; codecs=opus",
+              data: base64Audio.replace(/^data:audio\/\w+;base64,/, ""),
+            },
           },
-        },
-      ]);
+        ],
+      });
     } else {
       console.log(`[Gemini] Analyzing text: "${userText}"`);
-      result = await model.generateContent([
-        { text: SYSTEM_PROMPT },
-        { text: `Parse this entry: "${userText}"` },
-      ]);
+      result = await genAI.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: [
+          { text: SYSTEM_PROMPT },
+          { text: `Parse this entry: "${userText}"` },
+        ],
+      });
     }
 
-    const rawText = result.response.text().trim().replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
+    const rawText = cleanJsonText(result.text);
     console.log("[Gemini Response Raw]:", rawText);
 
     const parsed = JSON.parse(rawText);
