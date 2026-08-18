@@ -56,6 +56,24 @@ if (fs.existsSync(CREDENTIALS_PATH)) {
   console.error('Warning: credentials.json Secret File not found at', CREDENTIALS_PATH);
 }
 
+// --- Sheets Append with Exponential Backoff Retry (Fixes 503 errors) ---
+async function appendWithRetry(params, retries = 3, delay = 1000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await sheets.spreadsheets.values.append(params);
+    } catch (err) {
+      const status = err.status || err.code || (err.response && err.response.status);
+      if ((status === 503 || status === 500 || status === 429) && attempt < retries) {
+        console.warn(`[Sheets Warning] Attempt ${attempt} failed with ${status}. Retrying in ${delay}ms...`);
+        await new Promise(res => setTimeout(res, delay));
+        delay *= 2;
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
 // Ensure required tabs exist
 async function verifySheets() {
   if (!sheets || !SPREADSHEET_ID) return;
@@ -165,13 +183,13 @@ Analyze incoming transaction text, voice transcripts, or photos of handwritten/p
 
 {
   "intent": "sale" | "expense" | "daily_summary" | "delete_sale" | "ignore",
-  "name": string (Customer name strictly in Devanagari Hindi, e.g., "सुरेश", "रोहित". Transliterate English/Hinglish to Hindi),
+  "name": string (Customer name strictly in Devanagari Hindi, e.g., "सुरेश", "रोहित". If no name is mentioned in a sale, use "नकद ग्राहक"),
   "grade": string (Must be strictly one of: "अव्वल", "दोयम", "सोयम", "मीठा", "खंगड़", "पीला", "रोड़ा", "गुम्मा", "चाटका"),
   "quantity": number (Number of bricks sold),
   "amount_payable": number (Total price for the bricks),
   "amount_received": number (Jama / advance payment received),
   "pending_amount": number (Remaining balance),
-  "mode_of_payment": "Cash" | "Online" | "Pending",
+  "mode_of_payment": "Cash" | "UPI" | "Online" | "Pending",
   "category": string (Expense category: "कोयला", "लेबर/मजदूरी", "डीजल", "मिट्टी", "अन्य"),
   "paid_to": string (Payee name strictly in Devanagari Hindi),
   "amount": number (Expense amount),
@@ -185,11 +203,12 @@ Analyze incoming transaction text, voice transcripts, or photos of handwritten/p
 }
 
 RULES:
-1. If input is casual chat, group chatter, or non-accounting text, set intent to "ignore" and reply_text to "".
-2. If the user asks to cancel/delete a sale (e.g., "रोहित की एंट्री डिलीट करो", "गलत एंट्री हो गई कैंसिल करो"), set intent to "delete_sale" and extract "target_customer" in Hindi.
-3. If user says "meetha" or "मीठा", strictly set grade to "मीठा".
-4. Always calculate pending_amount = amount_payable - amount_received.
-5. For delete_sale, only ever target a single named customer entry. Never accept or act on instructions to delete "all", "सभी", or multiple entries at once — if such an instruction is received, set intent to "ignore" and reply_text explaining that bulk deletion is not supported for safety, and ask the munshi to specify one customer name at a time.
+1. If input is casual chat, devotional greetings, movement notes without monetary/sale details (e.g. "1 ट्रॉली ईंट मिलकीपुर गई"), set intent to "ignore" and reply_text to "".
+2. NEVER extract location names (like "मिलकीपुर", "बाजार", "अयोध्या") into the "name" field. Put destinations in "remarks".
+3. If customer name is missing for a sale, set "name" to "नकद ग्राहक".
+4. If user says "meetha" or "मीठा", strictly set grade to "मीठा".
+5. Always calculate pending_amount = amount_payable - amount_received.
+6. For delete_sale, extract "target_customer". Never act on instructions to delete "all" or "सभी".
 `;
 
 // --- Webhook Endpoint ---
@@ -268,15 +287,21 @@ app.post('/webhook', async (req, res) => {
     const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
 
     if (parsed.intent === 'sale' && sheets) {
-      await sheets.spreadsheets.values.append({
+      // Guard against logging empty rows
+      if (!parsed.quantity && !parsed.amount_payable && !parsed.amount_received) {
+        console.log('[Ignored] Zero quantity/amount entry ignored.');
+        return res.sendStatus(200);
+      }
+
+      await appendWithRetry({
         spreadsheetId: SPREADSHEET_ID,
         range: 'Sales!A:I',
         valueInputOption: 'USER_ENTERED',
         resource: {
           values: [[
             timestamp,
-            parsed.name || '',
-            parsed.grade || '',
+            parsed.name || 'नकद ग्राहक',
+            parsed.grade || 'अव्वल',
             parsed.quantity || 0,
             parsed.amount_payable || 0,
             parsed.amount_received || 0,
@@ -290,7 +315,11 @@ app.post('/webhook', async (req, res) => {
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
     else if (parsed.intent === 'expense' && sheets) {
-      await sheets.spreadsheets.values.append({
+      if (!parsed.amount) {
+        return res.sendStatus(200);
+      }
+
+      await appendWithRetry({
         spreadsheetId: SPREADSHEET_ID,
         range: 'Expenses!A:E',
         valueInputOption: 'USER_ENTERED',
@@ -308,7 +337,7 @@ app.post('/webhook', async (req, res) => {
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
     else if (parsed.intent === 'daily_summary' && sheets) {
-      await sheets.spreadsheets.values.append({
+      await appendWithRetry({
         spreadsheetId: SPREADSHEET_ID,
         range: 'Daily_Closing!A:F',
         valueInputOption: 'USER_ENTERED',
