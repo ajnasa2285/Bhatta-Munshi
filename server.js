@@ -109,7 +109,7 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
     const rowCustomer = rows[i][1] || '';
     const rowStatus = rows[i][9] || '';
     if (dispatch.name && rowCustomer.includes(dispatch.name) && rowStatus !== 'Completed') {
-      targetRowIndex = i + 2; // Offset for 1-based index and header
+      targetRowIndex = i + 2; // Offset for header + 1-based index
       targetRow = rows[i];
       break;
     }
@@ -239,17 +239,23 @@ async function deleteSheetEntry(targetTab, filter) {
     range: `${tab}!A2:J`
   });
   const rows = res.data.values || [];
+  if (rows.length === 0) return false;
 
   let rowIndexToDelete = -1;
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const row = rows[i];
-    const matchName = filter?.customer_name && (row[1] || '').includes(filter.customer_name);
-    const matchPayee = filter?.paid_to && (row[2] || '').includes(filter.paid_to);
-    
-    if (matchName || matchPayee) {
-      rowIndexToDelete = i + 1; // 0-based index for API
-      break;
+
+  if (filter && (filter.customer_name || filter.paid_to)) {
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      const matchName = filter.customer_name && (row[1] || '').includes(filter.customer_name);
+      const matchPayee = filter.paid_to && (row[2] || '').includes(filter.paid_to);
+      if (matchName || matchPayee) {
+        rowIndexToDelete = i + 1; // 0-based index for batchUpdate
+        break;
+      }
     }
+  } else {
+    // If no filter, delete the most recent (last) entry
+    rowIndexToDelete = rows.length;
   }
 
   if (rowIndexToDelete === -1) return false;
@@ -359,7 +365,8 @@ PARSING RULES:
 4. Calculate pending_amount = amount_payable - amount_received.
 5. If an order is placed without delivery, create an order in "orders" and also a dispatch item in "dispatches" with dispatched_qty: 0 and total_ordered_qty populated.
 6. For modifications (e.g., "सन्तरम का गाँव बरईपारा कर दो"), use intent "update_entry" with search_filter and fields_to_update.
-7. For deletions (e.g., "सन्तरम वाली एंट्री हटा दो"), use intent "delete_entry" with search_filter.
+7. For deletions by name (e.g., "सन्तरम वाली एंट्री हटा दो"), use intent "delete_entry" with search_filter.
+8. For general delete requests (e.g., "delete previous entry", "delete last entry", "पिछली एंट्री डिलीट करो"), set intent to "delete_entry", target_tab to "Orders", and search_filter to null.
 `;
 
 // --- Webhook Endpoint ---
@@ -409,7 +416,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     const model = genAI.getGenerativeModel({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-1.5-flash',
       generationConfig: { responseMimeType: 'application/json' }
     });
 
