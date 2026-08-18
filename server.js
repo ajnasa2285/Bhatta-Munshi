@@ -11,7 +11,7 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 const genAI = new GoogleGenAI({ apiKey: config.geminiApiKey });
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-1.5-flash latest";
 
 const SYSTEM_PROMPT = `
 You are an expert Munshi (accountant) for an Indian Brick Kiln (ईंट भट्ठा).
