@@ -92,6 +92,17 @@ async function sendWhatsAppReply(recipient, text) {
   }
 }
 
+// --- Hindi Normalization Helper for Robust Matching ---
+function normalizeHindi(str) {
+  if (!str) return '';
+  return str
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/[\u0902\u0901]/g, 'न') // convert anusvara/chandrabindu (ं, ँ) to न (e.g. संतराम -> सन्तरम)
+    .replace(/[\u093E\u093F\u0940\u0941\u0942\u0943\u0947\u0948\u094B\u094C\u094D]/g, ''); // strip matras for root matching
+}
+
 // --- Supply / Dispatch Update & Upsert Logic ---
 async function logOrUpdateDispatch(dateStr, dispatch) {
   if (!sheets || !SPREADSHEET_ID) return;
@@ -105,10 +116,12 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
   let targetRowIndex = -1;
   let targetRow = null;
 
+  const searchNameNorm = normalizeHindi(dispatch.name);
+
   for (let i = 0; i < rows.length; i++) {
-    const rowCustomer = rows[i][1] || '';
+    const rowCustomerNorm = normalizeHindi(rows[i][1]);
     const rowStatus = rows[i][9] || '';
-    if (dispatch.name && rowCustomer.includes(dispatch.name) && rowStatus !== 'Completed') {
+    if (searchNameNorm && rowCustomerNorm.includes(searchNameNorm) && rowStatus !== 'Completed') {
       targetRowIndex = i + 2; // Offset for header + 1-based index
       targetRow = rows[i];
       break;
@@ -169,60 +182,82 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
   }
 }
 
-// --- Dynamic Row Update Logic ---
+// --- Dynamic Row Update Logic with Fuzzy Matching & Cross-Tab Fallback ---
 async function updateSheetEntry(targetTab, filter, updates) {
   if (!sheets || !SPREADSHEET_ID) return false;
 
-  const tab = targetTab || 'Orders';
-  const range = `${tab}!A2:J`;
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range });
-  const rows = res.data.values || [];
+  const tabsToSearch = targetTab ? [targetTab] : ['Orders', 'Supply_Dispatch', 'Expenses'];
+  const searchNameNorm = normalizeHindi(filter?.customer_name);
+  const searchPayeeNorm = normalizeHindi(filter?.paid_to);
 
-  let rowIndex = -1;
-  let targetRow = null;
+  for (const tab of tabsToSearch) {
+    try {
+      const range = `${tab}!A2:J`;
+      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range });
+      const rows = res.data.values || [];
 
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const row = rows[i];
-    const matchName = filter?.customer_name && (row[1] || '').includes(filter.customer_name);
-    const matchPayee = filter?.paid_to && (row[2] || '').includes(filter.paid_to);
-    
-    if (matchName || matchPayee) {
-      rowIndex = i + 2;
-      targetRow = row;
-      break;
+      let rowIndex = -1;
+      let targetRow = null;
+
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const row = rows[i];
+        const rowNameNorm = normalizeHindi(row[1]);
+        const rowPayeeNorm = normalizeHindi(row[2]);
+
+        const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
+        const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
+
+        if (matchName || matchPayee) {
+          rowIndex = i + 2; // Offset for header + 1-based index
+          targetRow = [...row];
+          break;
+        }
+      }
+
+      if (rowIndex !== -1 && targetRow) {
+        if (tab === 'Orders') {
+          // Columns: [Date, Customer Name, Village, Grade, Quantity, Amount Payable, Amount Received, Pending Amount, Mode]
+          if (updates.village) targetRow[2] = updates.village;
+          if (updates.grade) targetRow[3] = updates.grade;
+          if (updates.quantity) targetRow[4] = updates.quantity;
+          if (updates.amount_payable) targetRow[5] = updates.amount_payable;
+          if (updates.amount_received) targetRow[6] = updates.amount_received;
+          
+          const payable = Number(targetRow[5]) || 0;
+          const received = Number(targetRow[6]) || 0;
+          targetRow[7] = Math.max(0, payable - received);
+        } else if (tab === 'Supply_Dispatch') {
+          // Columns: [Date, Customer Name, Village, Grade, Total Ordered, Dispatched Today, Total Dispatched, Balance, Driver, Status]
+          if (updates.village) targetRow[2] = updates.village;
+          if (updates.grade) targetRow[3] = updates.grade;
+          if (updates.driver) targetRow[8] = updates.driver;
+        } else if (tab === 'Expenses') {
+          // Columns: [Date, Category, Paid To, Amount, Remarks]
+          if (updates.category) targetRow[1] = updates.category;
+          if (updates.paid_to) targetRow[2] = updates.paid_to;
+          if (updates.amount) targetRow[3] = updates.amount;
+          if (updates.remarks) targetRow[4] = updates.remarks;
+        }
+
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `${tab}!A${rowIndex}:J${rowIndex}`,
+          valueInputOption: 'USER_ENTERED',
+          resource: { values: [targetRow] }
+        });
+
+        console.log(`[Update Success] Updated ${tab} row ${rowIndex}`);
+        return true;
+      }
+    } catch (err) {
+      console.error(`[Update Error in ${tab}]:`, err.message);
     }
   }
 
-  if (rowIndex === -1 || !targetRow) return false;
-
-  if (tab === 'Orders') {
-    if (updates.village) targetRow[2] = updates.village;
-    if (updates.grade) targetRow[3] = updates.grade;
-    if (updates.quantity) targetRow[4] = updates.quantity;
-    if (updates.amount_payable) targetRow[5] = updates.amount_payable;
-    if (updates.amount_received) targetRow[6] = updates.amount_received;
-    
-    const payable = Number(targetRow[5]) || 0;
-    const received = Number(targetRow[6]) || 0;
-    targetRow[7] = Math.max(0, payable - received);
-  } else if (tab === 'Expenses') {
-    if (updates.category) targetRow[1] = updates.category;
-    if (updates.paid_to) targetRow[2] = updates.paid_to;
-    if (updates.amount) targetRow[3] = updates.amount;
-    if (updates.remarks) targetRow[4] = updates.remarks;
-  }
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${tab}!A${rowIndex}:I${rowIndex}`,
-    valueInputOption: 'USER_ENTERED',
-    resource: { values: [targetRow] }
-  });
-
-  return true;
+  return false;
 }
 
-// --- Dynamic Row Delete Logic ---
+// --- Dynamic Row Delete Logic with Multi-Tab Search ---
 async function deleteSheetEntry(targetTab, filter) {
   if (!sheets || !SPREADSHEET_ID) return false;
 
@@ -240,19 +275,25 @@ async function deleteSheetEntry(targetTab, filter) {
   if (rows.length === 0) return false;
 
   let rowIndexToDelete = -1;
+  const searchNameNorm = normalizeHindi(filter?.customer_name);
+  const searchPayeeNorm = normalizeHindi(filter?.paid_to);
 
-  if (filter && (filter.customer_name || filter.paid_to)) {
+  if (searchNameNorm || searchPayeeNorm) {
     for (let i = rows.length - 1; i >= 0; i--) {
       const row = rows[i];
-      const matchName = filter.customer_name && (row[1] || '').includes(filter.customer_name);
-      const matchPayee = filter.paid_to && (row[2] || '').includes(filter.paid_to);
+      const rowNameNorm = normalizeHindi(row[1]);
+      const rowPayeeNorm = normalizeHindi(row[2]);
+      
+      const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
+      const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
+      
       if (matchName || matchPayee) {
-        rowIndexToDelete = i + 1; // 0-based index for batchUpdate
+        rowIndexToDelete = i + 1; // 0-based index for API
         break;
       }
     }
   } else {
-    // If no filter, delete the most recent (last) entry
+    // If no specific filter given, delete the latest (last) entry
     rowIndexToDelete = rows.length;
   }
 
@@ -362,7 +403,7 @@ PARSING RULES:
 3. Never put village names into the customer "name" field.
 4. Calculate pending_amount = amount_payable - amount_received.
 5. If an order is placed without delivery, create an order in "orders" and also a dispatch item in "dispatches" with dispatched_qty: 0 and total_ordered_qty populated.
-6. For modifications (e.g., "सन्तरम का गाँव बरईपारा कर दो"), use intent "update_entry" with search_filter and fields_to_update.
+6. For modifications (e.g., "सन्तरम का गाँव बरईपारा कर दो", "राम का रेट बदल दो"), use intent "update_entry" with search_filter and fields_to_update.
 7. For deletions by name (e.g., "सन्तरम वाली एंट्री हटा दो"), use intent "delete_entry" with search_filter.
 8. For general delete requests (e.g., "delete previous entry", "delete last entry", "पिछली एंट्री डिलीट करो"), set intent to "delete_entry", target_tab to "Orders", and search_filter to null.
 `;
@@ -569,7 +610,7 @@ app.post('/webhook', async (req, res) => {
     else if (parsed.intent === 'update_entry' && sheets) {
       const success = await updateSheetEntry(parsed.target_tab, parsed.search_filter, parsed.fields_to_update);
       const reply = success 
-        ? (parsed.reply_text || 'एंट्री अपडेट कर दी गई है।')
+        ? (parsed.reply_text || 'एंट्री सफलतापूर्वक अपडेट कर दी गई है।')
         : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
       await sendWhatsAppReply(sender, reply);
     }
@@ -578,7 +619,7 @@ app.post('/webhook', async (req, res) => {
     else if (parsed.intent === 'delete_entry' && sheets) {
       const success = await deleteSheetEntry(parsed.target_tab, parsed.search_filter);
       const reply = success 
-        ? (parsed.reply_text || 'एंट्री डिलीट कर दी गई है।')
+        ? (parsed.reply_text || 'एंट्री सफलतापूर्वक डिलीट कर दी गई है।')
         : 'माफ कीजिए, डिलीट करने के लिए एंट्री नहीं मिली।';
       await sendWhatsAppReply(sender, reply);
     }
