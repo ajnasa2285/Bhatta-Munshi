@@ -1,4 +1,5 @@
 require('dotenv').config();
+const fs = require('fs');
 const express = require('express');
 const axios = require('axios');
 const { google } = require('googleapis');
@@ -18,26 +19,26 @@ const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE;
 // Initialize Gemini Client
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || '');
 
-// Initialize Google Sheets API with Safe Credentials Check
+// Initialize Google Sheets API using Render Secret File
 let auth = null;
 let sheets = null;
 
-if (process.env.GOOGLE_CREDENTIALS) {
+const CREDENTIALS_PATH = '/etc/secrets/credentials.json';
+
+if (fs.existsSync(CREDENTIALS_PATH)) {
   try {
-    const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
-    if (credentials.private_key) {
-      credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
-    }
+    const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
     auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
     sheets = google.sheets({ version: 'v4', auth });
+    console.log('Google Sheets credentials loaded from Secret File.');
   } catch (err) {
-    console.error('Failed to parse GOOGLE_CREDENTIALS:', err.message);
+    console.error('Failed to load credentials.json:', err.message);
   }
 } else {
-  console.error('Warning: GOOGLE_CREDENTIALS environment variable is missing.');
+  console.error('Warning: credentials.json Secret File not found at', CREDENTIALS_PATH);
 }
 
 // Ensure required tabs exist
