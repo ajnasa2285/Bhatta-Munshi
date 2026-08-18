@@ -85,14 +85,13 @@ async function sendWhatsAppReply(recipient, text) {
       `${WHATSAPP_GATEWAY_BASE_URL}/message/sendText/${WHATSAPP_GATEWAY_TYPE}`,
       {
         number: cleanNumber,
-        options: { delay: 1200, presence: 'composing', linkPreview: false },
-        textMessage: { text: text }
+        text: text
       },
       { headers: { apikey: WHATSAPP_GATEWAY_KEY } }
     );
     console.log(`[Reply] Confirmation sent to ${cleanNumber}`);
   } catch (error) {
-    console.error('[Reply Error]:', error.response?.data || error.message);
+    console.error('[Reply Error]:', JSON.stringify(error.response?.data || error.message, null, 2));
   }
 }
 
