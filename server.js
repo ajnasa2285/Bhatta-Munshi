@@ -146,7 +146,7 @@ async function deleteLastSaleEntry(customerName) {
 // --- System Prompt for Gemini ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
-Analyze incoming transaction text or voice transcripts and return ONLY valid JSON matching this schema:
+Analyze incoming transaction text, voice transcripts, or photos of handwritten/printed slips and return ONLY valid JSON matching this schema:
 
 {
   "intent": "sale" | "expense" | "daily_summary" | "delete_sale" | "ignore",
@@ -174,6 +174,7 @@ RULES:
 2. If the user asks to cancel/delete a sale (e.g., "रोहित की एंट्री डिलीट करो", "गलत एंट्री हो गई कैंसिल करो"), set intent to "delete_sale" and extract "target_customer" in Hindi.
 3. If user says "meetha" or "मीठा", strictly set grade to "मीठा".
 4. Always calculate pending_amount = amount_payable - amount_received.
+5. For delete_sale, only ever target a single named customer entry. Never accept or act on instructions to delete "all", "सभी", or multiple entries at once — if such an instruction is received, set intent to "ignore" and reply_text explaining that bulk deletion is not supported for safety, and ask the munshi to specify one customer name at a time.
 `;
 
 // --- Webhook Endpoint ---
@@ -192,6 +193,7 @@ app.post('/webhook', async (req, res) => {
     const message = data.message;
     const text = message?.conversation || message?.extendedTextMessage?.text;
     const audioMessage = message?.audioMessage;
+    const imageMessage = message?.imageMessage;
 
     if (text) {
       console.log(`[Incoming] Sender: ${sender}, Text: "${text}"`);
@@ -209,6 +211,22 @@ app.post('/webhook', async (req, res) => {
           inlineData: {
             mimeType: 'audio/ogg; codecs=opus',
             data: base64Audio
+          }
+        }
+      ];
+    } else if (imageMessage) {
+      console.log(`[Gemini] Analyzing image payload from ${sender}...`);
+      const base64Image = req.body?.data?.message?.base64 || '';
+      if (!base64Image) return res.sendStatus(200);
+
+      const mimeType = imageMessage.mimetype || 'image/jpeg';
+
+      contents = [
+        SYSTEM_PROMPT,
+        {
+          inlineData: {
+            mimeType: mimeType,
+            data: base64Image
           }
         }
       ];
@@ -293,6 +311,9 @@ app.post('/webhook', async (req, res) => {
         ? `${parsed.target_customer ? parsed.target_customer + ' की ' : ''}पिछली एंट्री सफलतापूर्वक हटा दी गई है।`
         : 'डिलीट करने के लिए कोई एंट्री नहीं मिली।';
       await sendWhatsAppReply(sender, reply);
+    }
+    else if (parsed.intent === 'ignore' && parsed.reply_text) {
+      await sendWhatsAppReply(sender, parsed.reply_text);
     }
 
     return res.sendStatus(200);
