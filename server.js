@@ -16,18 +16,30 @@ const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
 const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE;
 
 // Initialize Gemini Client
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || '');
 
-// Initialize Google Sheets API via Service Account
-const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
-const auth = new google.auth.GoogleAuth({
-  credentials,
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
-const sheets = google.sheets({ version: 'v4', auth });
+// Initialize Google Sheets API with Safe Credentials Check
+let auth = null;
+let sheets = null;
+
+if (process.env.GOOGLE_CREDENTIALS) {
+  try {
+    const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+    auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    sheets = google.sheets({ version: 'v4', auth });
+  } catch (err) {
+    console.error('Failed to parse GOOGLE_CREDENTIALS:', err.message);
+  }
+} else {
+  console.error('Warning: GOOGLE_CREDENTIALS environment variable is missing.');
+}
 
 // Ensure required tabs exist
 async function verifySheets() {
+  if (!sheets || !SPREADSHEET_ID) return;
   try {
     const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
     const existingTabs = meta.data.sheets.map(s => s.properties.title);
@@ -55,6 +67,7 @@ verifySheets();
 
 // --- Send WhatsApp Reply ---
 async function sendWhatsAppReply(recipient, text) {
+  if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY || !EVOLUTION_INSTANCE) return;
   try {
     const cleanNumber = recipient.replace('@s.whatsapp.net', '').replace('@c.us', '');
     await axios.post(
@@ -74,44 +87,50 @@ async function sendWhatsAppReply(recipient, text) {
 
 // --- Delete Last Matching Sale Entry ---
 async function deleteLastSaleEntry(customerName) {
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: 'Sales!A2:E'
-  });
+  if (!sheets || !SPREADSHEET_ID) return false;
+  try {
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Sales!A2:E'
+    });
 
-  const rows = response.data.values || [];
-  let targetRowIndex = -1;
+    const rows = response.data.values || [];
+    let targetRowIndex = -1;
 
-  for (let i = rows.length - 1; i >= 0; i--) {
-    if (!customerName || (rows[i][1] && rows[i][1].includes(customerName))) {
-      targetRowIndex = i + 2; // +2 offset for 1-based index and header
-      break;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (!customerName || (rows[i][1] && rows[i][1].includes(customerName))) {
+        targetRowIndex = i + 2; // Offset for 1-based index and header
+        break;
+      }
     }
-  }
 
-  if (targetRowIndex === -1) return false;
+    if (targetRowIndex === -1) return false;
 
-  const sheetMeta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-  const salesSheet = sheetMeta.data.sheets.find(s => s.properties.title === 'Sales');
-  const sheetId = salesSheet.properties.sheetId;
+    const sheetMeta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+    const salesSheet = sheetMeta.data.sheets.find(s => s.properties.title === 'Sales');
+    const sheetId = salesSheet.properties.sheetId;
 
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: SPREADSHEET_ID,
-    resource: {
-      requests: [{
-        deleteDimension: {
-          range: {
-            sheetId: sheetId,
-            dimension: 'ROWS',
-            startIndex: targetRowIndex - 1,
-            endIndex: targetRowIndex
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      resource: {
+        requests: [{
+          deleteDimension: {
+            range: {
+              sheetId: sheetId,
+              dimension: 'ROWS',
+              startIndex: targetRowIndex - 1,
+              endIndex: targetRowIndex
+            }
           }
-        }
-      }]
-    }
-  });
+        }]
+      }
+    });
 
-  return true;
+    return true;
+  } catch (err) {
+    console.error('Error deleting entry from sheets:', err.message);
+    return false;
+  }
 }
 
 // --- System Prompt for Gemini ---
@@ -202,7 +221,7 @@ app.post('/webhook', async (req, res) => {
     const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
 
     // Handle Intents
-    if (parsed.intent === 'sale') {
+    if (parsed.intent === 'sale' && sheets) {
       await sheets.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
         range: 'Sales!A:I',
@@ -224,7 +243,7 @@ app.post('/webhook', async (req, res) => {
       console.log('[Sheets] Sale logged successfully.');
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     } 
-    else if (parsed.intent === 'expense') {
+    else if (parsed.intent === 'expense' && sheets) {
       await sheets.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
         range: 'Expenses!A:E',
@@ -242,7 +261,7 @@ app.post('/webhook', async (req, res) => {
       console.log('[Sheets] Expense logged successfully.');
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     } 
-    else if (parsed.intent === 'daily_summary') {
+    else if (parsed.intent === 'daily_summary' && sheets) {
       await sheets.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
         range: 'Daily_Summary!A:F',
