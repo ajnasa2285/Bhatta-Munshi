@@ -73,6 +73,24 @@ async function appendWithRetry(params, retries = 3, delay = 1000) {
   }
 }
 
+// --- Gemini Generate Helper with Retry Loop ---
+async function generateContentWithRetry(model, contents, retries = 3, delay = 1500) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await model.generateContent(contents);
+    } catch (err) {
+      const status = err.status || (err.response && err.response.status);
+      if ((status === 503 || status === 429 || status === 500) && attempt < retries) {
+        console.warn(`[Gemini Spike] 503/429 on attempt ${attempt}. Retrying in ${delay}ms...`);
+        await new Promise(res => setTimeout(res, delay));
+        delay *= 2;
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
 // --- WhatsApp Reply Helper ---
 async function sendWhatsAppReply(recipient, text) {
   if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) {
@@ -92,15 +110,15 @@ async function sendWhatsAppReply(recipient, text) {
   }
 }
 
-// --- Hindi Normalization Helper for Robust Matching ---
+// --- Hindi Normalization Helper ---
 function normalizeHindi(str) {
   if (!str) return '';
   return str
     .toString()
     .trim()
     .toLowerCase()
-    .replace(/[\u0902\u0901]/g, 'न') // convert anusvara/chandrabindu (ं, ँ) to न (e.g. संतराम -> सन्तरम)
-    .replace(/[\u093E\u093F\u0940\u0941\u0942\u0943\u0947\u0948\u094B\u094C\u094D]/g, ''); // strip matras for root matching
+    .replace(/[\u0902\u0901]/g, 'न')
+    .replace(/[\u093E\u093F\u0940\u0941\u0942\u0943\u0947\u0948\u094B\u094C\u094D]/g, '');
 }
 
 // --- Supply / Dispatch Update & Upsert Logic ---
@@ -122,7 +140,7 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
     const rowCustomerNorm = normalizeHindi(rows[i][1]);
     const rowStatus = rows[i][9] || '';
     if (searchNameNorm && rowCustomerNorm.includes(searchNameNorm) && rowStatus !== 'Completed') {
-      targetRowIndex = i + 2; // Offset for header + 1-based index
+      targetRowIndex = i + 2;
       targetRow = rows[i];
       break;
     }
@@ -182,7 +200,7 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
   }
 }
 
-// --- Dynamic Row Update Logic with Fuzzy Matching & Cross-Tab Fallback ---
+// --- Dynamic Row Update Logic ---
 async function updateSheetEntry(targetTab, filter, updates) {
   if (!sheets || !SPREADSHEET_ID) return false;
 
@@ -208,7 +226,7 @@ async function updateSheetEntry(targetTab, filter, updates) {
         const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
 
         if (matchName || matchPayee) {
-          rowIndex = i + 2; // Offset for header + 1-based index
+          rowIndex = i + 2;
           targetRow = [...row];
           break;
         }
@@ -216,7 +234,6 @@ async function updateSheetEntry(targetTab, filter, updates) {
 
       if (rowIndex !== -1 && targetRow) {
         if (tab === 'Orders') {
-          // Columns: [Date, Customer Name, Village, Grade, Quantity, Amount Payable, Amount Received, Pending Amount, Mode]
           if (updates.village) targetRow[2] = updates.village;
           if (updates.grade) targetRow[3] = updates.grade;
           if (updates.quantity) targetRow[4] = updates.quantity;
@@ -227,12 +244,10 @@ async function updateSheetEntry(targetTab, filter, updates) {
           const received = Number(targetRow[6]) || 0;
           targetRow[7] = Math.max(0, payable - received);
         } else if (tab === 'Supply_Dispatch') {
-          // Columns: [Date, Customer Name, Village, Grade, Total Ordered, Dispatched Today, Total Dispatched, Balance, Driver, Status]
           if (updates.village) targetRow[2] = updates.village;
           if (updates.grade) targetRow[3] = updates.grade;
           if (updates.driver) targetRow[8] = updates.driver;
         } else if (tab === 'Expenses') {
-          // Columns: [Date, Category, Paid To, Amount, Remarks]
           if (updates.category) targetRow[1] = updates.category;
           if (updates.paid_to) targetRow[2] = updates.paid_to;
           if (updates.amount) targetRow[3] = updates.amount;
@@ -257,7 +272,7 @@ async function updateSheetEntry(targetTab, filter, updates) {
   return false;
 }
 
-// --- Dynamic Row Delete Logic with Multi-Tab Search ---
+// --- Dynamic Row Delete Logic with Tab Targeting ---
 async function deleteSheetEntry(targetTab, filter) {
   if (!sheets || !SPREADSHEET_ID) return false;
 
@@ -293,8 +308,7 @@ async function deleteSheetEntry(targetTab, filter) {
       }
     }
   } else {
-    // If no specific filter given, delete the latest (last) entry
-    rowIndexToDelete = rows.length;
+    rowIndexToDelete = rows.length; // points to latest data row
   }
 
   if (rowIndexToDelete === -1) return false;
@@ -315,6 +329,7 @@ async function deleteSheetEntry(targetTab, filter) {
     }
   });
 
+  console.log(`[Delete Success] Deleted row ${rowIndexToDelete + 1} from ${tab}`);
   return true;
 }
 
@@ -403,9 +418,8 @@ PARSING RULES:
 3. Never put village names into the customer "name" field.
 4. Calculate pending_amount = amount_payable - amount_received.
 5. If an order is placed without delivery, create an order in "orders" and also a dispatch item in "dispatches" with dispatched_qty: 0 and total_ordered_qty populated.
-6. For modifications (e.g., "सन्तरम का गाँव बरईपारा कर दो", "राम का रेट बदल दो"), use intent "update_entry" with search_filter and fields_to_update.
-7. For deletions by name (e.g., "सन्तरम वाली एंट्री हटा दो"), use intent "delete_entry" with search_filter.
-8. For general delete requests (e.g., "delete previous entry", "delete last entry", "पिछली एंट्री डिलीट करो"), set intent to "delete_entry", target_tab to "Orders", and search_filter to null.
+6. For modifications (e.g., "सन्तरम का गाँव बरईपारा कर दो"), use intent "update_entry" with search_filter and fields_to_update.
+7. For deletions (e.g., "डिस्पैच में पिछली एंट्री हटा दो", "delete previous entry in dispatch"), use intent "delete_entry", identify the target_tab ("Supply_Dispatch", "Orders", or "Expenses"), and set search_filter if a name is specified.
 `;
 
 // --- Webhook Endpoint ---
@@ -459,7 +473,7 @@ app.post('/webhook', async (req, res) => {
       generationConfig: { responseMimeType: 'application/json' }
     });
 
-    const result = await model.generateContent(contents);
+    const result = await generateContentWithRetry(model, contents);
     const responseText = result.response.text();
     const parsed = JSON.parse(responseText.trim());
     console.log('[Parsed JSON]:', parsed);
