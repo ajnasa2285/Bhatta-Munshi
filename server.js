@@ -196,7 +196,6 @@ async function updateSheetEntry(targetTab, filter, updates) {
   if (rowIndex === -1 || !targetRow) return false;
 
   if (tab === 'Orders') {
-    // Columns: [Date, Customer Name, Village, Grade, Quantity, Amount Payable, Amount Received, Pending Amount, Mode]
     if (updates.village) targetRow[2] = updates.village;
     if (updates.grade) targetRow[3] = updates.grade;
     if (updates.quantity) targetRow[4] = updates.quantity;
@@ -207,7 +206,6 @@ async function updateSheetEntry(targetTab, filter, updates) {
     const received = Number(targetRow[6]) || 0;
     targetRow[7] = Math.max(0, payable - received);
   } else if (tab === 'Expenses') {
-    // Columns: [Date, Category, Paid To, Amount, Remarks]
     if (updates.category) targetRow[1] = updates.category;
     if (updates.paid_to) targetRow[2] = updates.paid_to;
     if (updates.amount) targetRow[3] = updates.amount;
@@ -416,7 +414,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     const model = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
+      model: 'gemini-3.6-flash',
       generationConfig: { responseMimeType: 'application/json' }
     });
 
