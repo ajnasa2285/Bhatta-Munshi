@@ -25,6 +25,9 @@ let sheets = null;
 if (process.env.GOOGLE_CREDENTIALS) {
   try {
     const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+    if (credentials.private_key) {
+      credentials.private_key = credentials.private_key.replace(/\\n/g, '\n');
+    }
     auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
@@ -173,7 +176,7 @@ app.post('/webhook', async (req, res) => {
     if (!data) return res.sendStatus(200);
 
     const sender = data.key?.remoteJid || '';
-    
+
     // Ignore group chats to protect quota limits
     if (sender.includes('@g.us')) {
       return res.sendStatus(200);
@@ -242,7 +245,7 @@ app.post('/webhook', async (req, res) => {
       });
       console.log('[Sheets] Sale logged successfully.');
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
-    } 
+    }
     else if (parsed.intent === 'expense' && sheets) {
       await sheets.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
@@ -260,7 +263,7 @@ app.post('/webhook', async (req, res) => {
       });
       console.log('[Sheets] Expense logged successfully.');
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
-    } 
+    }
     else if (parsed.intent === 'daily_summary' && sheets) {
       await sheets.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
@@ -279,7 +282,7 @@ app.post('/webhook', async (req, res) => {
       });
       console.log('[Sheets] Daily summary logged.');
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
-    } 
+    }
     else if (parsed.intent === 'delete_sale') {
       const deleted = await deleteLastSaleEntry(parsed.target_customer);
       const reply = deleted
