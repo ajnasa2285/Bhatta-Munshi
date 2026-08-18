@@ -16,7 +16,7 @@ const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
 const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
 const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 
-// --- Deduplication: Track recently processed message IDs ---
+// --- Deduplication Cache ---
 const processedMessageIds = new Set();
 const MAX_TRACKED_IDS = 500;
 
@@ -31,10 +31,10 @@ function isDuplicateMessage(messageId) {
   return false;
 }
 
-// Initialize Gemini Client
+// --- Initialize Gemini Client ---
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || '');
 
-// Initialize Google Sheets API using Render Secret File
+// --- Initialize Google Sheets API ---
 let auth = null;
 let sheets = null;
 const CREDENTIALS_PATH = '/etc/secrets/credentials.json';
@@ -73,7 +73,7 @@ async function appendWithRetry(params, retries = 3, delay = 1000) {
   }
 }
 
-// --- Send WhatsApp Reply ---
+// --- WhatsApp Reply Helper ---
 async function sendWhatsAppReply(recipient, text) {
   if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) {
     console.error('[Reply Error] Missing WhatsApp gateway configuration.');
@@ -86,13 +86,13 @@ async function sendWhatsAppReply(recipient, text) {
       { number: cleanNumber, text: text },
       { headers: { apikey: WHATSAPP_GATEWAY_KEY } }
     );
-    console.log(`[Reply] Confirmation sent to ${cleanNumber}`);
+    console.log(`[Reply] Sent to ${cleanNumber}`);
   } catch (error) {
     console.error('[Reply Error]:', JSON.stringify(error.response?.data || error.message, null, 2));
   }
 }
 
-// --- Update or Append Supply / Dispatch Tab ---
+// --- Supply / Dispatch Update & Upsert Logic ---
 async function logOrUpdateDispatch(dateStr, dispatch) {
   if (!sheets || !SPREADSHEET_ID) return;
 
@@ -109,7 +109,7 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
     const rowCustomer = rows[i][1] || '';
     const rowStatus = rows[i][9] || '';
     if (dispatch.name && rowCustomer.includes(dispatch.name) && rowStatus !== 'Completed') {
-      targetRowIndex = i + 2;
+      targetRowIndex = i + 2; // Offset for 1-based index and header
       targetRow = rows[i];
       break;
     }
@@ -138,7 +138,7 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
         ]]
       }
     });
-    console.log(`[Supply_Dispatch] Updated existing row ${targetRowIndex} for ${dispatch.name}`);
+    console.log(`[Supply_Dispatch] Updated row ${targetRowIndex} for ${dispatch.name}`);
   } else {
     const totalOrdered = Number(dispatch.total_ordered_qty) || dispatchedQty;
     const balanceRemaining = Math.max(0, totalOrdered - dispatchedQty);
@@ -165,8 +165,112 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
         ]]
       }
     });
-    console.log(`[Supply_Dispatch] Appended new row for ${dispatch.name}`);
+    console.log(`[Supply_Dispatch] Logged new row for ${dispatch.name}`);
   }
+}
+
+// --- Dynamic Row Update Logic ---
+async function updateSheetEntry(targetTab, filter, updates) {
+  if (!sheets || !SPREADSHEET_ID) return false;
+
+  const tab = targetTab || 'Orders';
+  const range = `${tab}!A2:J`;
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range });
+  const rows = res.data.values || [];
+
+  let rowIndex = -1;
+  let targetRow = null;
+
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    const matchName = filter?.customer_name && (row[1] || '').includes(filter.customer_name);
+    const matchPayee = filter?.paid_to && (row[2] || '').includes(filter.paid_to);
+    
+    if (matchName || matchPayee) {
+      rowIndex = i + 2;
+      targetRow = row;
+      break;
+    }
+  }
+
+  if (rowIndex === -1 || !targetRow) return false;
+
+  if (tab === 'Orders') {
+    // Columns: [Date, Customer Name, Village, Grade, Quantity, Amount Payable, Amount Received, Pending Amount, Mode]
+    if (updates.village) targetRow[2] = updates.village;
+    if (updates.grade) targetRow[3] = updates.grade;
+    if (updates.quantity) targetRow[4] = updates.quantity;
+    if (updates.amount_payable) targetRow[5] = updates.amount_payable;
+    if (updates.amount_received) targetRow[6] = updates.amount_received;
+    
+    const payable = Number(targetRow[5]) || 0;
+    const received = Number(targetRow[6]) || 0;
+    targetRow[7] = Math.max(0, payable - received);
+  } else if (tab === 'Expenses') {
+    // Columns: [Date, Category, Paid To, Amount, Remarks]
+    if (updates.category) targetRow[1] = updates.category;
+    if (updates.paid_to) targetRow[2] = updates.paid_to;
+    if (updates.amount) targetRow[3] = updates.amount;
+    if (updates.remarks) targetRow[4] = updates.remarks;
+  }
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${tab}!A${rowIndex}:I${rowIndex}`,
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: [targetRow] }
+  });
+
+  return true;
+}
+
+// --- Dynamic Row Delete Logic ---
+async function deleteSheetEntry(targetTab, filter) {
+  if (!sheets || !SPREADSHEET_ID) return false;
+
+  const tab = targetTab || 'Orders';
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+  const sheetMeta = meta.data.sheets.find(s => s.properties.title === tab);
+  if (!sheetMeta) return false;
+  const sheetId = sheetMeta.properties.sheetId;
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${tab}!A2:J`
+  });
+  const rows = res.data.values || [];
+
+  let rowIndexToDelete = -1;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    const matchName = filter?.customer_name && (row[1] || '').includes(filter.customer_name);
+    const matchPayee = filter?.paid_to && (row[2] || '').includes(filter.paid_to);
+    
+    if (matchName || matchPayee) {
+      rowIndexToDelete = i + 1; // 0-based index for API
+      break;
+    }
+  }
+
+  if (rowIndexToDelete === -1) return false;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    resource: {
+      requests: [{
+        deleteDimension: {
+          range: {
+            sheetId: sheetId,
+            dimension: 'ROWS',
+            startIndex: rowIndexToDelete,
+            endIndex: rowIndexToDelete + 1
+          }
+        }
+      }]
+    }
+  });
+
+  return true;
 }
 
 // --- System Prompt for Gemini ---
@@ -175,12 +279,29 @@ You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
 
 {
-  "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "ignore",
+  "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "update_entry" | "delete_entry" | "ignore",
+  "target_tab": "Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing",
+  "search_filter": {
+    "customer_name": string,
+    "paid_to": string
+  },
+  "fields_to_update": {
+    "village": string,
+    "grade": string,
+    "quantity": number,
+    "amount_payable": number,
+    "amount_received": number,
+    "driver": string,
+    "category": string,
+    "paid_to": string,
+    "amount": number,
+    "remarks": string
+  },
   "orders": [
     {
-      "name": string (Customer name in Hindi),
-      "village": string (Village / location in Hindi),
-      "grade": string (Brick grade),
+      "name": string,
+      "village": string,
+      "grade": string,
       "quantity": number,
       "amount_payable": number,
       "amount_received": number,
@@ -190,18 +311,18 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
   ],
   "dispatches": [
     {
-      "name": string (Customer name in Hindi),
-      "village": string (Village / destination in Hindi),
-      "grade": string (Brick grade),
+      "name": string,
+      "village": string,
+      "grade": string,
       "total_ordered_qty": number,
       "dispatched_qty": number,
-      "driver": string (Driver / tractor name in Hindi)
+      "driver": string
     }
   ],
   "expenses": [
     {
-      "category": string ("कोयला" | "लेबर/मजदूरी" | "डीजल" | "मिट्टी" | "अन्य"),
-      "paid_to": string (Payee or purpose in Hindi),
+      "category": string,
+      "paid_to": string,
       "amount": number,
       "remarks": string
     }
@@ -214,7 +335,7 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
     "closing_balance": number,
     "remarks": string
   },
-  "reply_text": string (Concise confirmation summary in Devanagari Hindi)
+  "reply_text": string
 }
 
 BRICK GRADE & TERMINOLOGY STANDARDIZATION:
@@ -227,15 +348,18 @@ BRICK GRADE & TERMINOLOGY STANDARDIZATION:
 - "पीला" (पी० / Peela)
 - "अव्वल रोड़ा" (अ० रो०)
 - "पीला रोड़ा" (पी० रो०)
+- "रोड़ा" (रो० / Roda)
 - "गुम्मा" (Gumma)
 - "चाटका" (Chatka)
 
 PARSING RULES:
-1. DIARY PHOTO PARSING: When an image is provided, parse it as "batch_update", populate all 4 sections (orders, dispatches, expenses, daily_closing), and generate a clean WhatsApp summary in "reply_text".
+1. DIARY PHOTO PARSING: When an image is provided, parse it as "batch_update", populate all sections (orders, dispatches, expenses, daily_closing), and generate a clear summary in "reply_text".
 2. If customer name is missing, use "नकद ग्राहक".
-3. Never put villages or locations into the "name" field.
+3. Never put village names into the customer "name" field.
 4. Calculate pending_amount = amount_payable - amount_received.
-5. If an order has 0 dispatched quantity, ensure it is added to dispatches with dispatched_qty: 0 and total_ordered_qty set so it becomes a Pending order.
+5. If an order is placed without delivery, create an order in "orders" and also a dispatch item in "dispatches" with dispatched_qty: 0 and total_ordered_qty populated.
+6. For modifications (e.g., "सन्तरम का गाँव बरईपारा कर दो"), use intent "update_entry" with search_filter and fields_to_update.
+7. For deletions (e.g., "सन्तरम वाली एंट्री हटा दो"), use intent "delete_entry" with search_filter.
 `;
 
 // --- Webhook Endpoint ---
@@ -285,7 +409,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     const model = genAI.getGenerativeModel({
-      model: 'gemini-3.6-flash',
+      model: 'gemini-2.5-flash',
       generationConfig: { responseMimeType: 'application/json' }
     });
 
@@ -296,9 +420,8 @@ app.post('/webhook', async (req, res) => {
 
     const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
 
-    // --- 1. Batch Update (e.g. Diary Photos) ---
+    // 1. Batch Update (Diary Photos)
     if (parsed.intent === 'batch_update' && sheets) {
-      // Append Orders
       if (parsed.orders && parsed.orders.length > 0) {
         const orderRows = parsed.orders.map(o => [
           timestamp,
@@ -319,14 +442,12 @@ app.post('/webhook', async (req, res) => {
         });
       }
 
-      // Update / Append Dispatches
       if (parsed.dispatches && parsed.dispatches.length > 0) {
         for (const d of parsed.dispatches) {
           await logOrUpdateDispatch(timestamp, d);
         }
       }
 
-      // Append Expenses
       if (parsed.expenses && parsed.expenses.length > 0) {
         const expenseRows = parsed.expenses.map(e => [
           timestamp,
@@ -343,7 +464,6 @@ app.post('/webhook', async (req, res) => {
         });
       }
 
-      // Append Daily Closing
       if (parsed.daily_closing && (parsed.daily_closing.total_jama || parsed.daily_closing.closing_balance)) {
         const dc = parsed.daily_closing;
         await appendWithRetry({
@@ -367,7 +487,7 @@ app.post('/webhook', async (req, res) => {
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
 
-    // --- 2. Single Order Intent ---
+    // 2. Single Order Intent
     else if (parsed.intent === 'order' && sheets) {
       const order = parsed.orders?.[0] || parsed;
       await appendWithRetry({
@@ -391,14 +511,14 @@ app.post('/webhook', async (req, res) => {
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
 
-    // --- 3. Single Dispatch Intent ---
+    // 3. Single Dispatch Intent
     else if (parsed.intent === 'dispatch' && sheets) {
       const dispatch = parsed.dispatches?.[0] || parsed;
       await logOrUpdateDispatch(timestamp, dispatch);
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
 
-    // --- 4. Single Expense Intent ---
+    // 4. Single Expense Intent
     else if (parsed.intent === 'expense' && sheets) {
       const expense = parsed.expenses?.[0] || parsed;
       await appendWithRetry({
@@ -418,7 +538,7 @@ app.post('/webhook', async (req, res) => {
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
 
-    // --- 5. Single Daily Closing Intent ---
+    // 5. Single Daily Closing Intent
     else if (parsed.intent === 'daily_summary' && sheets) {
       const dc = parsed.daily_closing || parsed;
       await appendWithRetry({
@@ -438,6 +558,24 @@ app.post('/webhook', async (req, res) => {
         }
       });
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+    }
+
+    // 6. Update Entry Intent
+    else if (parsed.intent === 'update_entry' && sheets) {
+      const success = await updateSheetEntry(parsed.target_tab, parsed.search_filter, parsed.fields_to_update);
+      const reply = success 
+        ? (parsed.reply_text || 'एंट्री अपडेट कर दी गई है।')
+        : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
+      await sendWhatsAppReply(sender, reply);
+    }
+
+    // 7. Delete Entry Intent
+    else if (parsed.intent === 'delete_entry' && sheets) {
+      const success = await deleteSheetEntry(parsed.target_tab, parsed.search_filter);
+      const reply = success 
+        ? (parsed.reply_text || 'एंट्री डिलीट कर दी गई है।')
+        : 'माफ कीजिए, डिलीट करने के लिए एंट्री नहीं मिली।';
+      await sendWhatsAppReply(sender, reply);
     }
 
     return res.sendStatus(200);
