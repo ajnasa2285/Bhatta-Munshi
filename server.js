@@ -12,9 +12,9 @@ app.use(express.json({ limit: '50mb' }));
 const PORT = process.env.PORT || 10000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL;
-const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
-const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE;
+const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
+const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
+const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE; // ⚠️ CONFIRM THIS EXACT NAME
 
 // Initialize Gemini Client
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || '');
@@ -71,17 +71,24 @@ verifySheets();
 
 // --- Send WhatsApp Reply ---
 async function sendWhatsAppReply(recipient, text) {
-  if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY || !EVOLUTION_INSTANCE) return;
+  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) {
+    console.error('[Reply Error] Missing WhatsApp gateway config:', {
+      hasUrl: !!WHATSAPP_GATEWAY_BASE_URL,
+      hasKey: !!WHATSAPP_GATEWAY_KEY,
+      hasType: !!WHATSAPP_GATEWAY_TYPE
+    });
+    return;
+  }
   try {
     const cleanNumber = recipient.replace('@s.whatsapp.net', '').replace('@c.us', '');
     await axios.post(
-      `${EVOLUTION_API_URL}/message/sendText/${EVOLUTION_INSTANCE}`,
+      `${WHATSAPP_GATEWAY_BASE_URL}/message/sendText/${WHATSAPP_GATEWAY_TYPE}`,
       {
         number: cleanNumber,
         options: { delay: 1200, presence: 'composing', linkPreview: false },
         textMessage: { text: text }
       },
-      { headers: { apikey: EVOLUTION_API_KEY } }
+      { headers: { apikey: WHATSAPP_GATEWAY_KEY } }
     );
     console.log(`[Reply] Confirmation sent to ${cleanNumber}`);
   } catch (error) {
@@ -274,31 +281,3 @@ app.post('/webhook', async (req, res) => {
           values: [[
             timestamp,
             parsed.total_jama || 0,
-            parsed.total_kharcha || 0,
-            parsed.maalik_ko_diya || 0,
-            parsed.munshi_cash_in_hand || 0,
-            parsed.remarks || ''
-          ]]
-        }
-      });
-      console.log('[Sheets] Daily summary logged.');
-      if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
-    }
-    else if (parsed.intent === 'delete_sale') {
-      const deleted = await deleteLastSaleEntry(parsed.target_customer);
-      const reply = deleted
-        ? `${parsed.target_customer ? parsed.target_customer + ' की ' : ''}पिछली एंट्री सफलतापूर्वक हटा दी गई है।`
-        : 'डिलीट करने के लिए कोई एंट्री नहीं मिली।';
-      await sendWhatsAppReply(sender, reply);
-    }
-
-    return res.sendStatus(200);
-  } catch (error) {
-    console.error('[Webhook Error]:', error);
-    return res.sendStatus(500);
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`Munshi server listening on port ${PORT}`);
-});
