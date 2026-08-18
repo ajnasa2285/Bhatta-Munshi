@@ -16,6 +16,21 @@ const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
 const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
 const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 
+// --- Deduplication: track recently processed message IDs ---
+const processedMessageIds = new Set();
+const MAX_TRACKED_IDS = 500;
+
+function isDuplicateMessage(messageId) {
+  if (!messageId) return false;
+  if (processedMessageIds.has(messageId)) return true;
+  processedMessageIds.add(messageId);
+  if (processedMessageIds.size > MAX_TRACKED_IDS) {
+    const oldest = processedMessageIds.values().next().value;
+    processedMessageIds.delete(oldest);
+  }
+  return false;
+}
+
 // Initialize Gemini Client
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || '');
 
@@ -47,7 +62,7 @@ async function verifySheets() {
   try {
     const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
     const existingTabs = meta.data.sheets.map(s => s.properties.title);
-    const requiredTabs = ['Sales', 'Expenses', 'Daily_Summary'];
+    const requiredTabs = ['Sales', 'Expenses', 'Daily_Closing'];
     const requests = [];
 
     for (const tab of requiredTabs) {
@@ -184,6 +199,12 @@ app.post('/webhook', async (req, res) => {
     if (!data) return res.sendStatus(200);
 
     const sender = data.key?.remoteJid || '';
+    const messageId = data.key?.id || '';
+
+    if (isDuplicateMessage(messageId)) {
+      console.log(`[Dedup] Skipping duplicate message ${messageId}`);
+      return res.sendStatus(200);
+    }
 
     if (sender.includes('@g.us')) {
       return res.sendStatus(200);
@@ -289,7 +310,7 @@ app.post('/webhook', async (req, res) => {
     else if (parsed.intent === 'daily_summary' && sheets) {
       await sheets.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
-        range: 'Daily_Summary!A:F',
+        range: 'Daily_Closing!A:F',
         valueInputOption: 'USER_ENTERED',
         resource: {
           values: [[
@@ -302,7 +323,7 @@ app.post('/webhook', async (req, res) => {
           ]]
         }
       });
-      console.log('[Sheets] Daily summary logged.');
+      console.log('[Sheets] Daily closing logged.');
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
     else if (parsed.intent === 'delete_sale') {
