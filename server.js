@@ -14,7 +14,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
 const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
-const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE; // ⚠️ CONFIRM THIS EXACT NAME
+const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 
 // Initialize Gemini Client
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || '');
@@ -110,7 +110,7 @@ async function deleteLastSaleEntry(customerName) {
 
     for (let i = rows.length - 1; i >= 0; i--) {
       if (!customerName || (rows[i][1] && rows[i][1].includes(customerName))) {
-        targetRowIndex = i + 2; // Offset for 1-based index and header
+        targetRowIndex = i + 2;
         break;
       }
     }
@@ -185,7 +185,6 @@ app.post('/webhook', async (req, res) => {
 
     const sender = data.key?.remoteJid || '';
 
-    // Ignore group chats to protect quota limits
     if (sender.includes('@g.us')) {
       return res.sendStatus(200);
     }
@@ -218,7 +217,6 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Call Gemini 3.6 Flash via official SDK
     const model = genAI.getGenerativeModel({
       model: 'gemini-3.6-flash',
       generationConfig: { responseMimeType: 'application/json' }
@@ -231,7 +229,6 @@ app.post('/webhook', async (req, res) => {
 
     const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
 
-    // Handle Intents
     if (parsed.intent === 'sale' && sheets) {
       await sheets.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
@@ -281,3 +278,31 @@ app.post('/webhook', async (req, res) => {
           values: [[
             timestamp,
             parsed.total_jama || 0,
+            parsed.total_kharcha || 0,
+            parsed.maalik_ko_diya || 0,
+            parsed.munshi_cash_in_hand || 0,
+            parsed.remarks || ''
+          ]]
+        }
+      });
+      console.log('[Sheets] Daily summary logged.');
+      if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+    }
+    else if (parsed.intent === 'delete_sale') {
+      const deleted = await deleteLastSaleEntry(parsed.target_customer);
+      const reply = deleted
+        ? `${parsed.target_customer ? parsed.target_customer + ' की ' : ''}पिछली एंट्री सफलतापूर्वक हटा दी गई है।`
+        : 'डिलीट करने के लिए कोई एंट्री नहीं मिली।';
+      await sendWhatsAppReply(sender, reply);
+    }
+
+    return res.sendStatus(200);
+  } catch (error) {
+    console.error('[Webhook Error]:', error);
+    return res.sendStatus(500);
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Munshi server listening on port ${PORT}`);
+});
