@@ -16,7 +16,7 @@ const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
 const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
 const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 
-// --- Deduplication: track recently processed message IDs ---
+// --- Deduplication: Track recently processed message IDs ---
 const processedMessageIds = new Set();
 const MAX_TRACKED_IDS = 500;
 
@@ -37,7 +37,6 @@ const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || '');
 // Initialize Google Sheets API using Render Secret File
 let auth = null;
 let sheets = null;
-
 const CREDENTIALS_PATH = '/etc/secrets/credentials.json';
 
 if (fs.existsSync(CREDENTIALS_PATH)) {
@@ -48,7 +47,7 @@ if (fs.existsSync(CREDENTIALS_PATH)) {
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
     sheets = google.sheets({ version: 'v4', auth });
-    console.log('Google Sheets credentials loaded from Secret File.');
+    console.log('Google Sheets credentials loaded successfully.');
   } catch (err) {
     console.error('Failed to load credentials.json:', err.message);
   }
@@ -56,7 +55,7 @@ if (fs.existsSync(CREDENTIALS_PATH)) {
   console.error('Warning: credentials.json Secret File not found at', CREDENTIALS_PATH);
 }
 
-// --- Sheets Append with Exponential Backoff Retry (Fixes 503 errors) ---
+// --- Sheets API Helper with Exponential Backoff Retry ---
 async function appendWithRetry(params, retries = 3, delay = 1000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -74,52 +73,17 @@ async function appendWithRetry(params, retries = 3, delay = 1000) {
   }
 }
 
-// Ensure required tabs exist
-async function verifySheets() {
-  if (!sheets || !SPREADSHEET_ID) return;
-  try {
-    const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-    const existingTabs = meta.data.sheets.map(s => s.properties.title);
-    const requiredTabs = ['Sales', 'Expenses', 'Daily_Closing'];
-    const requests = [];
-
-    for (const tab of requiredTabs) {
-      if (!existingTabs.includes(tab)) {
-        requests.push({ addSheet: { properties: { title: tab } } });
-      }
-    }
-
-    if (requests.length > 0) {
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: SPREADSHEET_ID,
-        resource: { requests }
-      });
-    }
-    console.log('Google Sheet tabs verified.');
-  } catch (err) {
-    console.error('Error verifying sheet tabs:', err.message);
-  }
-}
-verifySheets();
-
 // --- Send WhatsApp Reply ---
 async function sendWhatsAppReply(recipient, text) {
   if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) {
-    console.error('[Reply Error] Missing WhatsApp gateway config:', {
-      hasUrl: !!WHATSAPP_GATEWAY_BASE_URL,
-      hasKey: !!WHATSAPP_GATEWAY_KEY,
-      hasType: !!WHATSAPP_GATEWAY_TYPE
-    });
+    console.error('[Reply Error] Missing WhatsApp gateway configuration.');
     return;
   }
   try {
     const cleanNumber = recipient.replace('@s.whatsapp.net', '').replace('@c.us', '');
     await axios.post(
       `${WHATSAPP_GATEWAY_BASE_URL}/message/sendText/${WHATSAPP_GATEWAY_TYPE}`,
-      {
-        number: cleanNumber,
-        text: text
-      },
+      { number: cleanNumber, text: text },
       { headers: { apikey: WHATSAPP_GATEWAY_KEY } }
     );
     console.log(`[Reply] Confirmation sent to ${cleanNumber}`);
@@ -128,87 +92,150 @@ async function sendWhatsAppReply(recipient, text) {
   }
 }
 
-// --- Delete Last Matching Sale Entry ---
-async function deleteLastSaleEntry(customerName) {
-  if (!sheets || !SPREADSHEET_ID) return false;
-  try {
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'Sales!A2:E'
-    });
+// --- Update or Append Supply / Dispatch Tab ---
+async function logOrUpdateDispatch(dateStr, dispatch) {
+  if (!sheets || !SPREADSHEET_ID) return;
 
-    const rows = response.data.values || [];
-    let targetRowIndex = -1;
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: 'Supply_Dispatch!A2:J'
+  });
 
-    for (let i = rows.length - 1; i >= 0; i--) {
-      if (!customerName || (rows[i][1] && rows[i][1].includes(customerName))) {
-        targetRowIndex = i + 2;
-        break;
-      }
+  const rows = res.data.values || [];
+  let targetRowIndex = -1;
+  let targetRow = null;
+
+  for (let i = 0; i < rows.length; i++) {
+    const rowCustomer = rows[i][1] || '';
+    const rowStatus = rows[i][9] || '';
+    if (dispatch.name && rowCustomer.includes(dispatch.name) && rowStatus !== 'Completed') {
+      targetRowIndex = i + 2;
+      targetRow = rows[i];
+      break;
     }
+  }
 
-    if (targetRowIndex === -1) return false;
+  const dispatchedQty = Number(dispatch.dispatched_qty) || 0;
 
-    const sheetMeta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-    const salesSheet = sheetMeta.data.sheets.find(s => s.properties.title === 'Sales');
-    const sheetId = salesSheet.properties.sheetId;
+  if (targetRowIndex !== -1 && targetRow) {
+    const totalOrdered = Number(targetRow[4]) || dispatchedQty;
+    const prevDispatched = Number(targetRow[6]) || 0;
+    const newTotalDispatched = prevDispatched + dispatchedQty;
+    const balanceRemaining = Math.max(0, totalOrdered - newTotalDispatched);
+    const newStatus = (totalOrdered > 0 && newTotalDispatched >= totalOrdered) ? 'Completed' : 'Partial';
 
-    await sheets.spreadsheets.batchUpdate({
+    await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
+      range: `Supply_Dispatch!F${targetRowIndex}:J${targetRowIndex}`,
+      valueInputOption: 'USER_ENTERED',
       resource: {
-        requests: [{
-          deleteDimension: {
-            range: {
-              sheetId: sheetId,
-              dimension: 'ROWS',
-              startIndex: targetRowIndex - 1,
-              endIndex: targetRowIndex
-            }
-          }
-        }]
+        values: [[
+          dispatchedQty,
+          newTotalDispatched,
+          balanceRemaining,
+          dispatch.driver || targetRow[8] || '',
+          newStatus
+        ]]
       }
     });
+    console.log(`[Supply_Dispatch] Updated existing row ${targetRowIndex} for ${dispatch.name}`);
+  } else {
+    const totalOrdered = Number(dispatch.total_ordered_qty) || dispatchedQty;
+    const balanceRemaining = Math.max(0, totalOrdered - dispatchedQty);
+    let status = 'Completed';
+    if (dispatchedQty === 0) status = 'Pending';
+    else if (balanceRemaining > 0) status = 'Partial';
 
-    return true;
-  } catch (err) {
-    console.error('Error deleting entry from sheets:', err.message);
-    return false;
+    await appendWithRetry({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Supply_Dispatch!A:J',
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [[
+          dateStr,
+          dispatch.name || 'नकद ग्राहक',
+          dispatch.village || '',
+          dispatch.grade || 'अव्वल',
+          totalOrdered,
+          dispatchedQty,
+          dispatchedQty,
+          balanceRemaining,
+          dispatch.driver || '',
+          status
+        ]]
+      }
+    });
+    console.log(`[Supply_Dispatch] Appended new row for ${dispatch.name}`);
   }
 }
 
 // --- System Prompt for Gemini ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
-Analyze incoming transaction text, voice transcripts, or photos of handwritten/printed slips and return ONLY valid JSON matching this schema:
+Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
 
 {
-  "intent": "sale" | "expense" | "daily_summary" | "delete_sale" | "ignore",
-  "name": string (Customer name strictly in Devanagari Hindi, e.g., "सुरेश", "रोहित". If no name is mentioned in a sale, use "नकद ग्राहक"),
-  "grade": string (Must be strictly one of: "अव्वल", "दोयम", "सोयम", "मीठा", "खंगड़", "पीला", "रोड़ा", "गुम्मा", "चाटका"),
-  "quantity": number (Number of bricks sold),
-  "amount_payable": number (Total price for the bricks),
-  "amount_received": number (Jama / advance payment received),
-  "pending_amount": number (Remaining balance),
-  "mode_of_payment": "Cash" | "UPI" | "Online" | "Pending",
-  "category": string (Expense category: "कोयला", "लेबर/मजदूरी", "डीजल", "मिट्टी", "अन्य"),
-  "paid_to": string (Payee name strictly in Devanagari Hindi),
-  "amount": number (Expense amount),
-  "remarks": string,
-  "total_jama": number,
-  "total_kharcha": number,
-  "maalik_ko_diya": number,
-  "munshi_cash_in_hand": number,
-  "target_customer": string (For delete_sale intent: customer name in Hindi),
-  "reply_text": string (Polite confirmation message in Devanagari Hindi)
+  "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "ignore",
+  "orders": [
+    {
+      "name": string (Customer name in Hindi),
+      "village": string (Village / location in Hindi),
+      "grade": string (Brick grade),
+      "quantity": number,
+      "amount_payable": number,
+      "amount_received": number,
+      "pending_amount": number,
+      "mode_of_payment": "Cash" | "UPI" | "Online"
+    }
+  ],
+  "dispatches": [
+    {
+      "name": string (Customer name in Hindi),
+      "village": string (Village / destination in Hindi),
+      "grade": string (Brick grade),
+      "total_ordered_qty": number,
+      "dispatched_qty": number,
+      "driver": string (Driver / tractor name in Hindi)
+    }
+  ],
+  "expenses": [
+    {
+      "category": string ("कोयला" | "लेबर/मजदूरी" | "डीजल" | "मिट्टी" | "अन्य"),
+      "paid_to": string (Payee or purpose in Hindi),
+      "amount": number,
+      "remarks": string
+    }
+  ],
+  "daily_closing": {
+    "opening_balance": number,
+    "total_jama": number,
+    "total_kharcha": number,
+    "maalik_ko_diya": number,
+    "closing_balance": number,
+    "remarks": string
+  },
+  "reply_text": string (Concise confirmation summary in Devanagari Hindi)
 }
 
-RULES:
-1. If input is casual chat, devotional greetings, movement notes without monetary/sale details (e.g. "1 ट्रॉली ईंट मिलकीपुर गई"), set intent to "ignore" and reply_text to "".
-2. NEVER extract location names (like "मिलकीपुर", "बाजार", "अयोध्या") into the "name" field. Put destinations in "remarks".
-3. If customer name is missing for a sale, set "name" to "नकद ग्राहक".
-4. If user says "meetha" or "मीठा", strictly set grade to "मीठा".
-5. Always calculate pending_amount = amount_payable - amount_received.
-6. For delete_sale, extract "target_customer". Never act on instructions to delete "all" or "सभी".
+BRICK GRADE & TERMINOLOGY STANDARDIZATION:
+- "अव्वल" (अ० / I / Avwal)
+- "दोयम" (दो० / II / Doyam)
+- "सोयम" (सो० / III / Soyam)
+- "मीठा" (मी० / Meetha)
+- "गोड़िया" (गो० / Godiya)
+- "खंजड़" (खं० / Khanjjad / Khangar)
+- "पीला" (पी० / Peela)
+- "अव्वल रोड़ा" (अ० रो०)
+- "पीला रोड़ा" (पी० रो०)
+- "गुम्मा" (Gumma)
+- "चाटका" (Chatka)
+
+PARSING RULES:
+1. DIARY PHOTO PARSING: When an image is provided, parse it as "batch_update", populate all 4 sections (orders, dispatches, expenses, daily_closing), and generate a clean WhatsApp summary in "reply_text".
+2. If customer name is missing, use "नकद ग्राहक".
+3. Never put villages or locations into the "name" field.
+4. Calculate pending_amount = amount_payable - amount_received.
+5. If an order has 0 dispatched quantity, ensure it is added to dispatches with dispatched_qty: 0 and total_ordered_qty set so it becomes a Pending order.
 `;
 
 // --- Webhook Endpoint ---
@@ -225,9 +252,7 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    if (sender.includes('@g.us')) {
-      return res.sendStatus(200);
-    }
+    if (sender.includes('@g.us')) return res.sendStatus(200);
 
     let contents = [];
     const message = data.message;
@@ -236,39 +261,24 @@ app.post('/webhook', async (req, res) => {
     const imageMessage = message?.imageMessage;
 
     if (text) {
-      console.log(`[Incoming] Sender: ${sender}, Text: "${text}"`);
-      contents = [
-        `${SYSTEM_PROMPT}\n\nInput message: "${text}"`
-      ];
+      console.log(`[Incoming] Text from ${sender}: "${text}"`);
+      contents = [`${SYSTEM_PROMPT}\n\nInput message: "${text}"`];
     } else if (audioMessage) {
-      console.log(`[Gemini] Analyzing audio payload from ${sender}...`);
+      console.log(`[Gemini] Processing voice note from ${sender}...`);
       const base64Audio = req.body?.data?.message?.base64 || '';
       if (!base64Audio) return res.sendStatus(200);
-
       contents = [
         SYSTEM_PROMPT,
-        {
-          inlineData: {
-            mimeType: 'audio/ogg; codecs=opus',
-            data: base64Audio
-          }
-        }
+        { inlineData: { mimeType: 'audio/ogg; codecs=opus', data: base64Audio } }
       ];
     } else if (imageMessage) {
-      console.log(`[Gemini] Analyzing image payload from ${sender}...`);
+      console.log(`[Gemini] Processing diary image from ${sender}...`);
       const base64Image = req.body?.data?.message?.base64 || '';
       if (!base64Image) return res.sendStatus(200);
-
       const mimeType = imageMessage.mimetype || 'image/jpeg';
-
       contents = [
         SYSTEM_PROMPT,
-        {
-          inlineData: {
-            mimeType: mimeType,
-            data: base64Image
-          }
-        }
+        { inlineData: { mimeType: mimeType, data: base64Image } }
       ];
     } else {
       return res.sendStatus(200);
@@ -286,39 +296,111 @@ app.post('/webhook', async (req, res) => {
 
     const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
 
-    if (parsed.intent === 'sale' && sheets) {
-      // Guard against logging empty rows
-      if (!parsed.quantity && !parsed.amount_payable && !parsed.amount_received) {
-        console.log('[Ignored] Zero quantity/amount entry ignored.');
-        return res.sendStatus(200);
+    // --- 1. Batch Update (e.g. Diary Photos) ---
+    if (parsed.intent === 'batch_update' && sheets) {
+      // Append Orders
+      if (parsed.orders && parsed.orders.length > 0) {
+        const orderRows = parsed.orders.map(o => [
+          timestamp,
+          o.name || 'नकद ग्राहक',
+          o.village || '',
+          o.grade || 'अव्वल',
+          o.quantity || 0,
+          o.amount_payable || (o.amount_received || 0),
+          o.amount_received || 0,
+          o.pending_amount || 0,
+          o.mode_of_payment || 'Cash'
+        ]);
+        await appendWithRetry({
+          spreadsheetId: SPREADSHEET_ID,
+          range: 'Orders!A:I',
+          valueInputOption: 'USER_ENTERED',
+          resource: { values: orderRows }
+        });
       }
 
+      // Update / Append Dispatches
+      if (parsed.dispatches && parsed.dispatches.length > 0) {
+        for (const d of parsed.dispatches) {
+          await logOrUpdateDispatch(timestamp, d);
+        }
+      }
+
+      // Append Expenses
+      if (parsed.expenses && parsed.expenses.length > 0) {
+        const expenseRows = parsed.expenses.map(e => [
+          timestamp,
+          e.category || 'अन्य',
+          e.paid_to || '',
+          e.amount || 0,
+          e.remarks || ''
+        ]);
+        await appendWithRetry({
+          spreadsheetId: SPREADSHEET_ID,
+          range: 'Expenses!A:E',
+          valueInputOption: 'USER_ENTERED',
+          resource: { values: expenseRows }
+        });
+      }
+
+      // Append Daily Closing
+      if (parsed.daily_closing && (parsed.daily_closing.total_jama || parsed.daily_closing.closing_balance)) {
+        const dc = parsed.daily_closing;
+        await appendWithRetry({
+          spreadsheetId: SPREADSHEET_ID,
+          range: 'Daily_Closing!A:G',
+          valueInputOption: 'USER_ENTERED',
+          resource: {
+            values: [[
+              timestamp,
+              dc.opening_balance || 0,
+              dc.total_jama || 0,
+              dc.total_kharcha || 0,
+              dc.maalik_ko_diya || 0,
+              dc.closing_balance || 0,
+              dc.remarks || ''
+            ]]
+          }
+        });
+      }
+
+      if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+    }
+
+    // --- 2. Single Order Intent ---
+    else if (parsed.intent === 'order' && sheets) {
+      const order = parsed.orders?.[0] || parsed;
       await appendWithRetry({
         spreadsheetId: SPREADSHEET_ID,
-        range: 'Sales!A:I',
+        range: 'Orders!A:I',
         valueInputOption: 'USER_ENTERED',
         resource: {
           values: [[
             timestamp,
-            parsed.name || 'नकद ग्राहक',
-            parsed.grade || 'अव्वल',
-            parsed.quantity || 0,
-            parsed.amount_payable || 0,
-            parsed.amount_received || 0,
-            parsed.pending_amount || 0,
-            parsed.mode_of_payment || 'Cash',
-            parsed.remarks || ''
+            order.name || 'नकद ग्राहक',
+            order.village || '',
+            order.grade || 'अव्वल',
+            order.quantity || 0,
+            order.amount_payable || (order.amount_received || 0),
+            order.amount_received || 0,
+            order.pending_amount || 0,
+            order.mode_of_payment || 'Cash'
           ]]
         }
       });
-      console.log('[Sheets] Sale logged successfully.');
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
-    else if (parsed.intent === 'expense' && sheets) {
-      if (!parsed.amount) {
-        return res.sendStatus(200);
-      }
 
+    // --- 3. Single Dispatch Intent ---
+    else if (parsed.intent === 'dispatch' && sheets) {
+      const dispatch = parsed.dispatches?.[0] || parsed;
+      await logOrUpdateDispatch(timestamp, dispatch);
+      if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+    }
+
+    // --- 4. Single Expense Intent ---
+    else if (parsed.intent === 'expense' && sheets) {
+      const expense = parsed.expenses?.[0] || parsed;
       await appendWithRetry({
         spreadsheetId: SPREADSHEET_ID,
         range: 'Expenses!A:E',
@@ -326,44 +408,36 @@ app.post('/webhook', async (req, res) => {
         resource: {
           values: [[
             timestamp,
-            parsed.category || 'अन्य',
-            parsed.paid_to || '',
-            parsed.amount || 0,
-            parsed.remarks || ''
+            expense.category || 'अन्य',
+            expense.paid_to || '',
+            expense.amount || 0,
+            expense.remarks || ''
           ]]
         }
       });
-      console.log('[Sheets] Expense logged successfully.');
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
+
+    // --- 5. Single Daily Closing Intent ---
     else if (parsed.intent === 'daily_summary' && sheets) {
+      const dc = parsed.daily_closing || parsed;
       await appendWithRetry({
         spreadsheetId: SPREADSHEET_ID,
-        range: 'Daily_Closing!A:F',
+        range: 'Daily_Closing!A:G',
         valueInputOption: 'USER_ENTERED',
         resource: {
           values: [[
             timestamp,
-            parsed.total_jama || 0,
-            parsed.total_kharcha || 0,
-            parsed.maalik_ko_diya || 0,
-            parsed.munshi_cash_in_hand || 0,
-            parsed.remarks || ''
+            dc.opening_balance || 0,
+            dc.total_jama || 0,
+            dc.total_kharcha || 0,
+            dc.maalik_ko_diya || 0,
+            dc.closing_balance || 0,
+            dc.remarks || ''
           ]]
         }
       });
-      console.log('[Sheets] Daily closing logged.');
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
-    }
-    else if (parsed.intent === 'delete_sale') {
-      const deleted = await deleteLastSaleEntry(parsed.target_customer);
-      const reply = deleted
-        ? `${parsed.target_customer ? parsed.target_customer + ' की ' : ''}पिछली एंट्री सफलतापूर्वक हटा दी गई है।`
-        : 'डिलीट करने के लिए कोई एंट्री नहीं मिली।';
-      await sendWhatsAppReply(sender, reply);
-    }
-    else if (parsed.intent === 'ignore' && parsed.reply_text) {
-      await sendWhatsAppReply(sender, parsed.reply_text);
     }
 
     return res.sendStatus(200);
@@ -374,5 +448,5 @@ app.post('/webhook', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Munshi server listening on port ${PORT}`);
+  console.log(`Munshi server running on port ${PORT}`);
 });
