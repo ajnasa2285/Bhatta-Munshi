@@ -1,23 +1,16 @@
 {
   "name": "bhatta-munshi",
   "version": "1.0.0",
-  "description": "Multimodal WhatsApp Munshi Agent for Indian Brick Kilns",
+  "description": "WhatsApp Munshi Bot for Brick Kiln Accounting",
   "main": "server.js",
-  "engines": {
-    "node": "20.x"
-  },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@google/genai": "^1.0.0",
-    "axios": "^1.7.9",
-    "body-parser": "^1.20.3",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2",
-    "form-data": "^4.0.1",
-    "google-auth-library": "^9.15.0",
-    "googleapis": "^144.0.0",
-    "uuid": "^11.0.5"
+    "@google/genai": "^0.1.1",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "googleapis": "^140.0.1"
   }
 }
