@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const { google } = require('googleapis');
-const { GoogleGenAI } = require('@google/genai');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -16,7 +16,7 @@ const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
 const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE;
 
 // Initialize Gemini Client
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
 // Initialize Google Sheets API via Service Account
 const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
@@ -168,7 +168,7 @@ app.post('/webhook', async (req, res) => {
     if (text) {
       console.log(`[Incoming] Sender: ${sender}, Text: "${text}"`);
       contents = [
-        { role: 'user', parts: [{ text: `${SYSTEM_PROMPT}\n\nInput message: "${text}"` }] }
+        `${SYSTEM_PROMPT}\n\nInput message: "${text}"`
       ];
     } else if (audioMessage) {
       console.log(`[Gemini] Analyzing audio payload from ${sender}...`);
@@ -176,28 +176,27 @@ app.post('/webhook', async (req, res) => {
       if (!base64Audio) return res.sendStatus(200);
 
       contents = [
+        SYSTEM_PROMPT,
         {
-          role: 'user',
-          parts: [
-            { text: SYSTEM_PROMPT },
-            { inlineData: { mimeType: 'audio/ogg; codecs=opus', data: base64Audio } }
-          ]
+          inlineData: {
+            mimeType: 'audio/ogg; codecs=opus',
+            data: base64Audio
+          }
         }
       ];
     } else {
       return res.sendStatus(200);
     }
 
-    // Call Gemini 3.6 Flash
-    const response = await ai.models.generateContent({
+    // Call Gemini 3.6 Flash via official SDK
+    const model = genAI.getGenerativeModel({
       model: 'gemini-3.6-flash',
-      contents: contents,
-      config: {
-        responseMimeType: 'application/json'
-      }
+      generationConfig: { responseMimeType: 'application/json' }
     });
 
-    const parsed = JSON.parse(response.text.trim());
+    const result = await model.generateContent(contents);
+    const responseText = result.response.text();
+    const parsed = JSON.parse(responseText.trim());
     console.log('[Parsed JSON]:', parsed);
 
     const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
