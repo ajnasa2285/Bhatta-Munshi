@@ -110,15 +110,36 @@ async function sendWhatsAppReply(recipient, text) {
   }
 }
 
-// --- Hindi Normalization Helper ---
+// --- Enhanced Hindi & English Transliteration Normalization ---
 function normalizeHindi(str) {
   if (!str) return '';
-  return str
-    .toString()
-    .trim()
-    .toLowerCase()
-    .replace(/[\u0902\u0901]/g, 'न')
-    .replace(/[\u093E\u093F\u0940\u0941\u0942\u0943\u0947\u0948\u094B\u094C\u094D]/g, '');
+  let s = str.toString().trim().toLowerCase();
+
+  // Transliteration map for common Bhatta keywords
+  const transMap = [
+    [/anup|anoop/g, 'अनूप'],
+    [/singh/g, 'सिंह'],
+    [/balgobind|balgovind|balgovind/g, 'बालगोविन्द'],
+    [/blooming|bird/g, 'ब्लूमिंग'],
+    [/kandhai|kandhai/g, 'कन्धाई'],
+    [/meetha|mitha/g, 'मीठा'],
+    [/awwal|awal/g, 'अव्वल'],
+    [/peela|pila/g, 'पीला'],
+    [/roda|roda/g, 'रोड़ा'],
+    [/bindha|vindha/g, 'विन्धा'],
+    [/chintu/g, 'चिन्टू'],
+    [/suraj/g, 'सूरज'],
+    [/diesel/g, 'डीजल']
+  ];
+
+  for (const [regex, hindiVal] of transMap) {
+    s = s.replace(regex, hindiVal);
+  }
+
+  return s
+    .replace(/[\u0902\u0901]/g, 'न') // Anusvara
+    .replace(/[\u093E\u093F\u0940\u0941\u0942\u0943\u0947\u0948\u094B\u094C\u094D]/g, '') // Matras
+    .replace(/[\s\.\-_]/g, '');
 }
 
 // --- Supply / Dispatch Update & Upsert Logic ---
@@ -200,15 +221,19 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
   }
 }
 
-// --- Dynamic Row Update Logic ---
+// --- Dynamic Row Update Logic Across All Tabs ---
 async function updateSheetEntry(targetTab, filter, updates) {
   if (!sheets || !SPREADSHEET_ID) return false;
 
-  const tabsToSearch = targetTab ? [targetTab] : ['Orders', 'Supply_Dispatch', 'Expenses'];
+  // Search Priority: Supply_Dispatch -> Orders -> Expenses -> Daily_Closing
+  const tabsToSearch = targetTab ? [targetTab, 'Supply_Dispatch', 'Orders', 'Expenses'] : ['Supply_Dispatch', 'Orders', 'Expenses', 'Daily_Closing'];
+  const uniqueTabs = [...new Set(tabsToSearch)];
+
   const searchNameNorm = normalizeHindi(filter?.customer_name);
   const searchPayeeNorm = normalizeHindi(filter?.paid_to);
+  const targetGradeNorm = normalizeHindi(updates?.grade);
 
-  for (const tab of tabsToSearch) {
+  for (const tab of uniqueTabs) {
     try {
       const range = `${tab}!A2:J`;
       const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range });
@@ -221,11 +246,16 @@ async function updateSheetEntry(targetTab, filter, updates) {
         const row = rows[i];
         const rowNameNorm = normalizeHindi(row[1]);
         const rowPayeeNorm = normalizeHindi(row[2]);
+        const rowGradeNorm = normalizeHindi(row[3]);
 
         const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
         const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
 
         if (matchName || matchPayee) {
+          // If grade is specified (e.g. meetha/awwal), ensure the row matches the grade too
+          if (targetGradeNorm && rowGradeNorm && !rowGradeNorm.includes(targetGradeNorm) && !targetGradeNorm.includes(rowGradeNorm)) {
+            continue;
+          }
           rowIndex = i + 2;
           targetRow = [...row];
           break;
@@ -246,6 +276,12 @@ async function updateSheetEntry(targetTab, filter, updates) {
         } else if (tab === 'Supply_Dispatch') {
           if (updates.village) targetRow[2] = updates.village;
           if (updates.grade) targetRow[3] = updates.grade;
+          if (updates.quantity) {
+            targetRow[4] = updates.quantity; // Total Ordered
+            targetRow[5] = updates.quantity; // Dispatched Qty
+            targetRow[6] = updates.quantity; // Total Dispatched
+            targetRow[7] = 0; // Balance Remaining
+          }
           if (updates.driver) targetRow[8] = updates.driver;
         } else if (tab === 'Expenses') {
           if (updates.category) targetRow[1] = updates.category;
@@ -272,65 +308,72 @@ async function updateSheetEntry(targetTab, filter, updates) {
   return false;
 }
 
-// --- Dynamic Row Delete Logic with Tab Targeting ---
+// --- Dynamic Row Delete Logic Across All Tabs ---
 async function deleteSheetEntry(targetTab, filter) {
   if (!sheets || !SPREADSHEET_ID) return false;
 
-  const tab = targetTab || 'Orders';
+  const tabsToSearch = targetTab ? [targetTab, 'Supply_Dispatch', 'Orders', 'Expenses'] : ['Supply_Dispatch', 'Orders', 'Expenses', 'Daily_Closing'];
+  const uniqueTabs = [...new Set(tabsToSearch)];
+
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-  const sheetMeta = meta.data.sheets.find(s => s.properties.title === tab);
-  if (!sheetMeta) return false;
-  const sheetId = sheetMeta.properties.sheetId;
 
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${tab}!A2:J`
-  });
-  const rows = res.data.values || [];
-  if (rows.length === 0) return false;
+  for (const tab of uniqueTabs) {
+    const sheetMeta = meta.data.sheets.find(s => s.properties.title === tab);
+    if (!sheetMeta) continue;
+    const sheetId = sheetMeta.properties.sheetId;
 
-  let rowIndexToDelete = -1;
-  const searchNameNorm = normalizeHindi(filter?.customer_name);
-  const searchPayeeNorm = normalizeHindi(filter?.paid_to);
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${tab}!A2:J`
+    });
+    const rows = res.data.values || [];
+    if (rows.length === 0) continue;
 
-  if (searchNameNorm || searchPayeeNorm) {
-    for (let i = rows.length - 1; i >= 0; i--) {
-      const row = rows[i];
-      const rowNameNorm = normalizeHindi(row[1]);
-      const rowPayeeNorm = normalizeHindi(row[2]);
-      
-      const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
-      const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
-      
-      if (matchName || matchPayee) {
-        rowIndexToDelete = i + 1; // 0-based index for API
-        break;
+    let rowIndexToDelete = -1;
+    const searchNameNorm = normalizeHindi(filter?.customer_name);
+    const searchPayeeNorm = normalizeHindi(filter?.paid_to);
+
+    if (searchNameNorm || searchPayeeNorm) {
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const row = rows[i];
+        const rowNameNorm = normalizeHindi(row[1]);
+        const rowPayeeNorm = normalizeHindi(row[2]);
+        
+        const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
+        const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
+        
+        if (matchName || matchPayee) {
+          rowIndexToDelete = i + 1; // 0-based index for API
+          break;
+        }
       }
+    } else {
+      rowIndexToDelete = rows.length; // points to latest data row
     }
-  } else {
-    rowIndexToDelete = rows.length; // points to latest data row
+
+    if (rowIndexToDelete !== -1) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: SPREADSHEET_ID,
+        resource: {
+          requests: [{
+            deleteDimension: {
+              range: {
+                sheetId: sheetId,
+                dimension: 'ROWS',
+                startIndex: rowIndexToDelete,
+                endIndex: rowIndexToDelete + 1
+              }
+            }
+          }]
+        }
+      });
+
+      console.log(`[Delete Success] Deleted row ${rowIndexToDelete + 1} from ${tab}`);
+      return true;
+    }
   }
 
-  if (rowIndexToDelete === -1) return false;
-
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: SPREADSHEET_ID,
-    resource: {
-      requests: [{
-        deleteDimension: {
-          range: {
-            sheetId: sheetId,
-            dimension: 'ROWS',
-            startIndex: rowIndexToDelete,
-            endIndex: rowIndexToDelete + 1
-          }
-        }
-      }]
-    }
-  });
-
-  console.log(`[Delete Success] Deleted row ${rowIndexToDelete + 1} from ${tab}`);
-  return true;
+  return false;
 }
 
 // --- System Prompt for Gemini ---
@@ -412,14 +455,15 @@ BRICK GRADE & TERMINOLOGY STANDARDIZATION:
 - "गुम्मा" (Gumma)
 - "चाटका" (Chatka)
 
-PARSING RULES:
-1. DIARY PHOTO PARSING: When an image is provided, parse it as "batch_update", populate all sections (orders, dispatches, expenses, daily_closing), and generate a clear summary in "reply_text".
-2. If customer name is missing, use "नकद ग्राहक".
-3. Never put village names into the customer "name" field.
-4. Calculate pending_amount = amount_payable - amount_received.
-5. If an order is placed without delivery, create an order in "orders" and also a dispatch item in "dispatches" with dispatched_qty: 0 and total_ordered_qty populated.
-6. For modifications (e.g., "सन्तरम का गाँव बरईपारा कर दो"), use intent "update_entry" with search_filter and fields_to_update.
-7. For deletions (e.g., "डिस्पैच में पिछली एंट्री हटा दो", "delete previous entry in dispatch"), use intent "delete_entry", identify the target_tab ("Supply_Dispatch", "Orders", or "Expenses"), and set search_filter if a name is specified.
+CRITICAL RULES:
+1. CUSTOMER & VENDOR NAMES: Always standardize Indian names in Hindi Devanagari in search_filter (e.g. "Anup Singh" -> "अनूप सिंह", "Balgobind" -> "बालगोविन्द").
+2. CORRECTIONS / UPDATES: If the user says e.g. "Anup singh 500 meetha ki jagah 4000 meetha hai change it" or "सन्तरम का गाँव बरईपारा कर दो":
+   - Set intent = "update_entry"
+   - Set target_tab = "Supply_Dispatch" (or "Orders" if related to payment)
+   - search_filter = { customer_name: "अनूप सिंह" }
+   - fields_to_update = { grade: "मीठा", quantity: 4000 }
+3. DELETIONS: If user asks to delete/remove an entry, set intent = "delete_entry", target_tab, and search_filter if specified.
+4. DIARY PHOTO PARSING: Parse full image as "batch_update", populating orders, dispatches, expenses, and daily_closing.
 `;
 
 // --- Webhook Endpoint ---
