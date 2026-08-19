@@ -521,7 +521,7 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
   return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: false };
 }
 
-// --- System Prompt for Gemini with Strict 6-Column Daily Closing Alignment ---
+// --- System Prompt for Gemini with Price & Correlation Engine ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
@@ -594,21 +594,30 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
   "reply_text": string
 }
 
-CRITICAL RULES:
-1. DAILY CLOSING 6-COLUMN EXACT ALIGNMENT:
+PRICE LIST BENCHMARKS (Per 2,000 Bricks / गाड़ी):
+- अव्वल (Awwal / I): ₹14,500 – ₹15,500
+- मीठा (Meetha / मी०): ₹12,500 – ₹13,500 (approx. ₹13,000 / 2,000 -> ₹6,500 per 1,000)
+- खंजड़ (Khanjad / खं०): ₹12,000 – ₹13,000
+- गोड़िया (Godiya / गो०): ₹8,500 – ₹9,000 (approx. ₹4,500 / 1,000)
+- पीला (Peela / पी०): ₹8,000
+- अव्वल रोड़ा (Awwal Roda / रोडा I): ₹5,000 – ₹5,500
+- पीला रोड़ा (Peela Roda): ₹2,500 – ₹3,000
+
+CRITICAL ORDER QUANTITY CORRELATION RULES:
+1. When quantity is NOT written in the top Cash/Order section, correlate the customer's deposited cash with the Middle Dispatch section and the Price List to deduce ordered quantity and grade:
+   - सन्तराम (बरईपारा) - ₹14,500 -> 2,000 अव्वल (₹14,500).
+   - मुकीम (इटौंजा) - ₹15,000 and dispatch has 2000 I -> 2,000 अव्वल (₹15,000).
+   - कन्धाई (पूरे काशीराम) - ₹52,000 -> 8,000 मीठा (₹52,000 @ ₹13,000/2k).
+   - नन्हेखा (सरूरपुर) - ₹10,000 and dispatch has 1000 I -> 1,000 अव्वल (₹10,000 total received).
+   - मुलायम यादव (गँडोली) - ₹11,200 and dispatch has 1000 गो०, 1000 मी० -> 1,000 गोड़िया (₹4,500) + 1,000 मीठा (₹6,700) = ₹11,200 total! Create orders for these quantities.
+2. ALL NUMBERS ARE STANDARD ENGLISH DIGITS (0-9). Do NOT read English digit "4" as Devanagari "५". "4000" is FOUR THOUSAND.
+3. DAILY CLOSING 6-COLUMN EXACT ALIGNMENT:
    - "opening_balance" = top बचत (e.g. 300).
    - "total_jama" = sum of all cash receipts (e.g. 103000).
-   - "total_kharcha" = total expenses of the day (e.g. 15100).
-   - "maalik_ko_diya" = cash given to owner/sahab (e.g. 81500).
-   - "closing_balance" = final cash in hand remaining with munshi (e.g. 6400).
-2. ALL NUMBERS ARE STANDARD ENGLISH DIGITS (0-9). Do NOT read English digit "4" as Devanagari "५". "4000" is FOUR THOUSAND.
-3. MULTIPLE UPDATES: When user asks to "Update the above entry" or "Update in orders", set intent to "update_entry" and populate the orders array.
-4. TARGETED DELETIONS:
-   - "Delete all entries" -> intent: "delete_entry", target_tabs: ["ALL"], delete_all: true
-   - "Delete the previous entry" -> intent: "delete_entry", target_tabs: ["Supply_Dispatch"], delete_all: false, search_filter: { customer_name: "" }
-   - Specific entry deletion -> intent: "delete_entry", search_filter: { customer_name: "..." }, delete_all: false
-5. TOP CASH ENTRIES TO ORDERS: In top section, log cash bookings into "orders" (e.g. सन्तराम 14500, मुकीम 15000, कन्धाई 52000, नन्हेखा 10000, मुलायम 11200).
-6. Standardize all Indian names to Hindi Devanagari.
+   - "total_kharcha" = total expenses (e.g. 15100).
+   - "maalik_ko_diya" = cash given to owner (e.g. 81500).
+   - "closing_balance" = final cash in hand remaining (e.g. 6400).
+4. Standardize all Indian names to Hindi Devanagari.
 `;
 
 // --- Webhook Endpoint ---
@@ -693,7 +702,6 @@ app.post('/webhook', async (req, res) => {
 
     const defaultDate = getISTDateOnly();
 
-    // Parallel execution of all sheets writes
     if ((parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image') && sheets) {
       const asyncTasks = [];
 
@@ -741,7 +749,6 @@ app.post('/webhook', async (req, res) => {
         );
       }
 
-      // Exactly aligns with 6 Columns: A: Date, B: Opening Balance, C: Total Jama, D: Total Kharcha, E: Maalik Ko Diya, F: Munshi Cash In Hand
       if (parsed.daily_closing && (parsed.daily_closing.total_jama || parsed.daily_closing.closing_balance)) {
         const dc = parsed.daily_closing;
         asyncTasks.push(
