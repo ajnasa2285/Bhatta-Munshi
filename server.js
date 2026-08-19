@@ -28,9 +28,8 @@ const MAX_TRACKED_IDS = 1000;
 function checkAndLockMessage(messageId) {
   if (!messageId) return false;
   if (processedMessageIds.has(messageId)) {
-    return true; // Duplicate detected
+    return true;
   }
-  // Lock immediately to prevent parallel execution
   processedMessageIds.add(messageId);
   if (processedMessageIds.size > MAX_TRACKED_IDS) {
     const oldest = processedMessageIds.values().next().value;
@@ -72,15 +71,14 @@ function getISTDateOnly() {
   return now.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }).replace(/\//g, '-');
 }
 
-// --- Sheets API Helper with Exponential Backoff Retry ---
-async function appendWithRetry(params, retries = 3, delay = 1000) {
+// --- Sheets API Helper with Retry ---
+async function appendWithRetry(params, retries = 2, delay = 800) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       return await sheets.spreadsheets.values.append(params);
     } catch (err) {
       const status = err.status || err.code || (err.response && err.response.status);
       if ((status === 503 || status === 500 || status === 429) && attempt < retries) {
-        console.warn(`[Sheets Warning] Attempt ${attempt} failed with ${status}. Retrying in ${delay}ms...`);
         await new Promise(res => setTimeout(res, delay));
         delay *= 2;
       } else {
@@ -91,14 +89,14 @@ async function appendWithRetry(params, retries = 3, delay = 1000) {
 }
 
 // --- Gemini Generate Helper with Retry Loop ---
-async function generateContentWithRetry(model, contents, retries = 3, delay = 1500) {
+async function generateContentWithRetry(model, contents, retries = 2, delay = 1000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       return await model.generateContent(contents);
     } catch (err) {
       const status = err.status || (err.response && err.response.status);
       if ((status === 503 || status === 429 || status === 500) && attempt < retries) {
-        console.warn(`[Gemini Spike] 503/429 on attempt ${attempt}. Retrying in ${delay}ms...`);
+        console.warn(`[Gemini Spike] ${status} on attempt ${attempt}. Retrying in ${delay}ms...`);
         await new Promise(res => setTimeout(res, delay));
         delay *= 2;
       } else {
@@ -110,10 +108,7 @@ async function generateContentWithRetry(model, contents, retries = 3, delay = 15
 
 // --- WhatsApp Reply Helper ---
 async function sendWhatsAppReply(recipient, text) {
-  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) {
-    console.error('[Reply Error] Missing WhatsApp gateway configuration.');
-    return;
-  }
+  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) return;
   try {
     const cleanNumber = recipient.replace('@s.whatsapp.net', '').replace('@c.us', '');
     await axios.post(
@@ -127,7 +122,7 @@ async function sendWhatsAppReply(recipient, text) {
   }
 }
 
-// --- Enhanced Hindi & English Transliteration Normalization ---
+// --- Enhanced Transliteration Normalization ---
 function normalizeHindi(str) {
   if (!str) return '';
   let s = str.toString().trim().toLowerCase();
@@ -157,9 +152,7 @@ function normalizeHindi(str) {
     [/completed|complete/g, 'कंप्लीट']
   ];
 
-  for (const [regex, hindiVal] of transMap) {
-    s = s.replace(regex, hindiVal);
-  }
+  for (const [regex, hindiVal] of transMap) s = s.replace(regex, hindiVal);
 
   return s
     .replace(/[\u0902\u0901]/g, 'न')
@@ -167,9 +160,9 @@ function normalizeHindi(str) {
     .replace(/[\s\.\-_]/g, '');
 }
 
-// --- Supply / Dispatch Update & Upsert Logic ---
-async function logOrUpdateDispatch(dateStr, dispatch) {
-  if (!sheets || !SPREADSHEET_ID) return;
+// --- Ultra-Fast Batched Dispatch Processor ---
+async function processBatchDispatches(dateStr, dispatches) {
+  if (!sheets || !SPREADSHEET_ID || !dispatches || dispatches.length === 0) return;
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -177,93 +170,102 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
   });
 
   const rows = res.data.values || [];
-  let targetRowIndex = -1;
-  let targetRow = null;
+  const rowsToAppend = [];
+  const updatesToRun = [];
 
-  const searchNameNorm = normalizeHindi(dispatch.name);
-  const targetGradeNorm = normalizeHindi(dispatch.grade);
+  for (const dispatch of dispatches) {
+    const searchNameNorm = normalizeHindi(dispatch.name);
+    const targetGradeNorm = normalizeHindi(dispatch.grade);
 
-  for (let i = 0; i < rows.length; i++) {
-    const rowCustomerNorm = normalizeHindi(rows[i][1]);
-    const rowGradeNorm = normalizeHindi(rows[i][3]);
+    let targetRowIndex = -1;
+    let targetRow = null;
 
-    if (searchNameNorm && (rowCustomerNorm.includes(searchNameNorm) || searchNameNorm.includes(rowCustomerNorm))) {
-      if (!targetGradeNorm || rowGradeNorm.includes(targetGradeNorm) || targetGradeNorm.includes(rowGradeNorm)) {
-        targetRowIndex = i + 2;
-        targetRow = rows[i];
-        break;
+    for (let i = 0; i < rows.length; i++) {
+      const rowCustomerNorm = normalizeHindi(rows[i][1]);
+      const rowGradeNorm = normalizeHindi(rows[i][3]);
+
+      if (searchNameNorm && (rowCustomerNorm.includes(searchNameNorm) || searchNameNorm.includes(rowCustomerNorm))) {
+        if (!targetGradeNorm || rowGradeNorm.includes(targetGradeNorm) || targetGradeNorm.includes(rowGradeNorm)) {
+          targetRowIndex = i + 2;
+          targetRow = rows[i];
+          break;
+        }
       }
+    }
+
+    const rawQty = dispatch.dispatched_qty;
+    const isTrolley = typeof rawQty === 'string' && (rawQty.includes('trolly') || rawQty.includes('ट्रॉली') || rawQty.includes('गाड़ी') || rawQty.includes('रोड़ा'));
+    const dispatchedQty = isTrolley ? rawQty : (Number(rawQty) || 0);
+    const newTotalOrdered = dispatch.total_ordered_qty ? (Number(dispatch.total_ordered_qty) || dispatchedQty) : dispatchedQty;
+
+    if (targetRowIndex !== -1 && targetRow) {
+      const prevDispatched = Number(targetRow[5]) || 0;
+      const finalOrdered = Math.max(newTotalOrdered, Number(targetRow[4]) || 0);
+      const finalDispatched = (typeof dispatchedQty === 'number' && typeof prevDispatched === 'number')
+        ? (prevDispatched > 0 && prevDispatched === dispatchedQty ? prevDispatched : prevDispatched + dispatchedQty)
+        : dispatchedQty;
+
+      const balanceRemaining = (typeof finalOrdered === 'number' && typeof finalDispatched === 'number')
+        ? Math.max(0, finalOrdered - finalDispatched)
+        : 0;
+
+      const newStatus = isTrolley || (typeof finalOrdered === 'number' && finalDispatched >= finalOrdered)
+        ? 'Completed'
+        : 'Partial';
+
+      updatesToRun.push(
+        sheets.spreadsheets.values.update({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `Supply_Dispatch!E${targetRowIndex}:J${targetRowIndex}`,
+          valueInputOption: 'USER_ENTERED',
+          resource: {
+            values: [[
+              finalOrdered,
+              dispatchedQty,
+              finalDispatched,
+              balanceRemaining,
+              dispatch.driver || targetRow[8] || '',
+              newStatus
+            ]]
+          }
+        })
+      );
+    } else {
+      const balanceRemaining = typeof newTotalOrdered === 'number' && typeof dispatchedQty === 'number'
+        ? Math.max(0, newTotalOrdered - dispatchedQty)
+        : 0;
+
+      let status = 'Completed';
+      if (dispatchedQty === 0 && !isTrolley) status = 'Pending';
+      else if (balanceRemaining > 0 && typeof balanceRemaining === 'number') status = 'Partial';
+
+      rowsToAppend.push([
+        dispatch.date || dateStr,
+        dispatch.name || 'नकद ग्राहक',
+        dispatch.village || '',
+        dispatch.grade || 'अव्वल',
+        newTotalOrdered,
+        dispatchedQty,
+        dispatchedQty,
+        balanceRemaining,
+        dispatch.driver || '',
+        status
+      ]);
     }
   }
 
-  const rawQty = dispatch.dispatched_qty;
-  const isTrolley = typeof rawQty === 'string' && (rawQty.includes('trolly') || rawQty.includes('ट्रॉली') || rawQty.includes('गाड़ी') || rawQty.includes('रोड़ा'));
-  const dispatchedQty = isTrolley ? rawQty : (Number(rawQty) || 0);
-  const newTotalOrdered = dispatch.total_ordered_qty ? (Number(dispatch.total_ordered_qty) || dispatchedQty) : dispatchedQty;
-
-  if (targetRowIndex !== -1 && targetRow) {
-    const prevDispatched = Number(targetRow[5]) || 0;
-    const finalOrdered = Math.max(newTotalOrdered, Number(targetRow[4]) || 0);
-    const finalDispatched = (typeof dispatchedQty === 'number' && typeof prevDispatched === 'number')
-      ? (prevDispatched > 0 && prevDispatched === dispatchedQty ? prevDispatched : prevDispatched + dispatchedQty)
-      : dispatchedQty;
-
-    const balanceRemaining = (typeof finalOrdered === 'number' && typeof finalDispatched === 'number')
-      ? Math.max(0, finalOrdered - finalDispatched)
-      : 0;
-
-    const newStatus = isTrolley || (typeof finalOrdered === 'number' && finalDispatched >= finalOrdered)
-      ? 'Completed'
-      : 'Partial';
-
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `Supply_Dispatch!E${targetRowIndex}:J${targetRowIndex}`,
-      valueInputOption: 'USER_ENTERED',
-      resource: {
-        values: [[
-          finalOrdered,
-          dispatchedQty,
-          finalDispatched,
-          balanceRemaining,
-          dispatch.driver || targetRow[8] || '',
-          newStatus
-        ]]
-      }
-    });
-    console.log(`[Supply_Dispatch] Adjusted row ${targetRowIndex} for ${dispatch.name}`);
-  } else {
-    const balanceRemaining = typeof newTotalOrdered === 'number' && typeof dispatchedQty === 'number'
-      ? Math.max(0, newTotalOrdered - dispatchedQty)
-      : 0;
-
-    let status = 'Completed';
-    if (dispatchedQty === 0 && !isTrolley) status = 'Pending';
-    else if (balanceRemaining > 0 && typeof balanceRemaining === 'number') status = 'Partial';
-
-    const rowDate = dispatch.date || dateStr;
-
-    await appendWithRetry({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'Supply_Dispatch!A:J',
-      valueInputOption: 'USER_ENTERED',
-      resource: {
-        values: [[
-          rowDate,
-          dispatch.name || 'नकद ग्राहक',
-          dispatch.village || '',
-          dispatch.grade || 'अव्वल',
-          newTotalOrdered,
-          dispatchedQty,
-          dispatchedQty,
-          balanceRemaining,
-          dispatch.driver || '',
-          status
-        ]]
-      }
-    });
-    console.log(`[Supply_Dispatch] Logged new row for ${dispatch.name}`);
+  const tasks = [...updatesToRun];
+  if (rowsToAppend.length > 0) {
+    tasks.push(
+      appendWithRetry({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'Supply_Dispatch!A:J',
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: rowsToAppend }
+      })
+    );
   }
+  await Promise.all(tasks);
 }
 
 // --- Dynamic Targeted Rectification / Update Logic ---
@@ -275,7 +277,6 @@ async function updateSheetEntry(targetTabs, filter, updates) {
     tabsToSearch = ['Orders', 'Supply_Dispatch', 'Expenses', 'Daily_Closing'];
   }
 
-  // Direct Row Number Targeting
   if (filter?.row_number && filter.row_number >= 2) {
     const tab = tabsToSearch[0] || 'Supply_Dispatch';
     const rowIndex = filter.row_number;
@@ -313,6 +314,12 @@ async function updateSheetEntry(targetTabs, filter, updates) {
           if (updates.paid_to) row[2] = updates.paid_to;
           if (updates.amount) row[3] = updates.amount;
           if (updates.remarks) row[4] = updates.remarks;
+        } else if (tab === 'Daily_Closing') {
+          if (updates.opening_balance !== undefined) row[1] = updates.opening_balance;
+          if (updates.total_jama !== undefined) row[2] = updates.total_jama;
+          if (updates.total_kharcha !== undefined) row[3] = updates.total_kharcha;
+          if (updates.maalik_ko_diya !== undefined) row[4] = updates.maalik_ko_diya;
+          if (updates.closing_balance !== undefined) row[5] = updates.closing_balance;
         }
 
         await sheets.spreadsheets.values.update({
@@ -321,7 +328,6 @@ async function updateSheetEntry(targetTabs, filter, updates) {
           valueInputOption: 'USER_ENTERED',
           resource: { values: [row] }
         });
-        console.log(`[Update Success] Rectified ${tab} row ${rowIndex}`);
         return true;
       }
     } catch (err) {
@@ -329,7 +335,6 @@ async function updateSheetEntry(targetTabs, filter, updates) {
     }
   }
 
-  // Targeted Search by Name, Payee, and Grade
   const searchNameNorm = normalizeHindi(filter?.customer_name);
   const searchPayeeNorm = normalizeHindi(filter?.paid_to);
   const searchGradeNorm = normalizeHindi(filter?.grade || updates?.grade);
@@ -337,8 +342,7 @@ async function updateSheetEntry(targetTabs, filter, updates) {
 
   for (const tab of tabsToSearch) {
     try {
-      const range = `${tab}!A2:J`;
-      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range });
+      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${tab}!A2:J` });
       const rows = res.data.values || [];
 
       let targetRowIndex = -1;
@@ -372,7 +376,6 @@ async function updateSheetEntry(targetTabs, filter, updates) {
           if (updates.quantity) targetRow[4] = updates.quantity;
           if (updates.amount_payable) targetRow[5] = updates.amount_payable;
           if (updates.amount_received !== undefined && updates.amount_received !== null) targetRow[6] = updates.amount_received;
-
           const payable = Number(targetRow[5]) || 0;
           const received = Number(targetRow[6]) || 0;
           targetRow[7] = Math.max(0, payable - received);
@@ -397,6 +400,12 @@ async function updateSheetEntry(targetTabs, filter, updates) {
           if (updates.paid_to) targetRow[2] = updates.paid_to;
           if (updates.amount) targetRow[3] = updates.amount;
           if (updates.remarks) targetRow[4] = updates.remarks;
+        } else if (tab === 'Daily_Closing') {
+          if (updates.opening_balance !== undefined) targetRow[1] = updates.opening_balance;
+          if (updates.total_jama !== undefined) targetRow[2] = updates.total_jama;
+          if (updates.total_kharcha !== undefined) targetRow[3] = updates.total_kharcha;
+          if (updates.maalik_ko_diya !== undefined) targetRow[4] = updates.maalik_ko_diya;
+          if (updates.closing_balance !== undefined) targetRow[5] = updates.closing_balance;
         }
 
         await sheets.spreadsheets.values.update({
@@ -405,8 +414,6 @@ async function updateSheetEntry(targetTabs, filter, updates) {
           valueInputOption: 'USER_ENTERED',
           resource: { values: [targetRow] }
         });
-
-        console.log(`[Update Success] Rectified ${tab} row ${targetRowIndex}`);
         updateCount++;
       }
     } catch (err) {
@@ -435,28 +442,18 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
 
   const deletedTabs = [];
 
-  // CASE 1: Full Sheet Clear
   if (deleteAll) {
-    for (const tab of tabsToProcess) {
-      try {
-        await sheets.spreadsheets.values.clear({
+    await Promise.all(
+      tabsToProcess.map(tab =>
+        sheets.spreadsheets.values.clear({
           spreadsheetId: SPREADSHEET_ID,
           range: `${tab}!A2:Z`
-        });
-        console.log(`[Clear Success] Cleared data rows from ${tab}`);
-        deletedTabs.push(tab);
-      } catch (err) {
-        console.error(`[Clear Error in ${tab}]:`, err.message);
-      }
-    }
-    return {
-      success: deletedTabs.length > 0,
-      deletedFrom: deletedTabs,
-      clearedAll: true
-    };
+        }).then(() => deletedTabs.push(tab)).catch(err => console.error(`[Clear Error in ${tab}]:`, err.message))
+      )
+    );
+    return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: true };
   }
 
-  // CASE 2: Targeted Row Deletion
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   const searchNameNorm = normalizeHindi(filter?.customer_name);
   const searchPayeeNorm = normalizeHindi(filter?.paid_to);
@@ -517,19 +514,14 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
           }]
         }
       });
-      console.log(`[Delete Success] Deleted row ${rowIndexToDelete + 1} from ${tab}`);
       deletedTabs.push(tab);
     }
   }
 
-  return {
-    success: deletedTabs.length > 0,
-    deletedFrom: deletedTabs,
-    clearedAll: false
-  };
+  return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: false };
 }
 
-// --- System Prompt for Gemini with Targeted Rectification & OCR Rules ---
+// --- System Prompt for Gemini with Strict 6-Column Daily Closing Alignment ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
@@ -597,32 +589,26 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
     "total_jama": number,
     "total_kharcha": number,
     "maalik_ko_diya": number,
-    "closing_balance": number,
-    "remarks": string
+    "closing_balance": number
   },
   "reply_text": string
 }
 
-BRICK GRADE & REGISTER ABBREVIATIONS:
-- "I" or "अ०" -> "अव्वल"
-- "II" or "दो०" -> "दोयम"
-- "III" or "सो०" -> "सोयम"
-- "मी०" -> "मीठा"
-- "गो०" -> "गोड़िया"
-- "खं०" -> "खंजड़"
-- "पी०" -> "पीला"
-- "रोड़ा पी०" or "पी० रो०" -> "पीला रोड़ा"
-- "रोड़ा" -> "रोड़ा"
-
-CRITICAL OPERATIONAL & OCR RULES:
-1. ALL NUMBERS ARE STANDARD ENGLISH/ARABIC DIGITS (0, 1, 2, 3, 4, 5, 6, 7, 8, 9). Do NOT misread English digit "4" as Devanagari "५". "4000" is FOUR THOUSAND.
-2. MULTIPLE UPDATES: When user asks to "Update the above entry" or "Update in orders", ALWAYS set intent to "update_entry" (NOT "order"). Extract all items into the orders array.
-3. TARGETED DELETIONS:
+CRITICAL RULES:
+1. DAILY CLOSING 6-COLUMN EXACT ALIGNMENT:
+   - "opening_balance" = top बचत (e.g. 300).
+   - "total_jama" = sum of all cash receipts (e.g. 103000).
+   - "total_kharcha" = total expenses of the day (e.g. 15100).
+   - "maalik_ko_diya" = cash given to owner/sahab (e.g. 81500).
+   - "closing_balance" = final cash in hand remaining with munshi (e.g. 6400).
+2. ALL NUMBERS ARE STANDARD ENGLISH DIGITS (0-9). Do NOT read English digit "4" as Devanagari "५". "4000" is FOUR THOUSAND.
+3. MULTIPLE UPDATES: When user asks to "Update the above entry" or "Update in orders", set intent to "update_entry" and populate the orders array.
+4. TARGETED DELETIONS:
    - "Delete all entries" -> intent: "delete_entry", target_tabs: ["ALL"], delete_all: true
    - "Delete the previous entry" -> intent: "delete_entry", target_tabs: ["Supply_Dispatch"], delete_all: false, search_filter: { customer_name: "" }
-   - Specific entry deletion -> intent: "delete_entry", search_filter: { customer_name: "कन्धाई" }, delete_all: false
-4. TOP CASH ENTRIES TO ORDERS: In the top section, if a customer name with cash amount appears (e.g. "सन्तराम बरईपारा - 14500"), check the middle dispatch section for their grade/quantity (e.g. "2000 I"). Create an entry in "orders".
-5. NAME STANDARDIZATION: Always normalize Indian names to standard Hindi Devanagari.
+   - Specific entry deletion -> intent: "delete_entry", search_filter: { customer_name: "..." }, delete_all: false
+5. TOP CASH ENTRIES TO ORDERS: In top section, log cash bookings into "orders" (e.g. सन्तराम 14500, मुकीम 15000, कन्धाई 52000, नन्हेखा 10000, मुलायम 11200).
+6. Standardize all Indian names to Hindi Devanagari.
 `;
 
 // --- Webhook Endpoint ---
@@ -640,13 +626,10 @@ app.post('/webhook', async (req, res) => {
     if (!cleanSenderNumber) return res.sendStatus(200);
 
     if (ALLOWED_NUMBERS.length > 0 && !ALLOWED_NUMBERS.includes(cleanSenderNumber)) {
-      console.warn(`[Security] Ignored unauthorized message from ${cleanSenderNumber}`);
       return res.sendStatus(200);
     }
 
-    // ATOMIC SYNCHRONOUS LOCK: Prevents parallel race condition duplicates
     if (checkAndLockMessage(messageId)) {
-      console.log(`[Dedup] Skipping duplicate message ${messageId}`);
       return res.sendStatus(200);
     }
 
@@ -669,7 +652,6 @@ app.post('/webhook', async (req, res) => {
 
     if (imageMessage) {
       const caption = imageMessage.caption || '';
-      console.log(`[Gemini] Processing diary image from ${sender} (Caption: "${caption}")...`);
       const base64Image = req.body?.data?.message?.base64 || '';
       if (!base64Image) return res.sendStatus(200);
       const mimeType = imageMessage.mimetype || 'image/jpeg';
@@ -677,25 +659,19 @@ app.post('/webhook', async (req, res) => {
       lastImageCache.set(cleanSenderNumber, { base64: base64Image, mimeType });
 
       const promptHeader = caption 
-        ? `${SYSTEM_PROMPT}\n\nUSER CAPTION / INSTRUCTIONS: "${caption}"\nCarefully fulfill the caption instructions and extract all diary data accurately.`
+        ? `${SYSTEM_PROMPT}\n\nUSER CAPTION / INSTRUCTIONS: "${caption}"\nFulfill caption instructions and extract all data.`
         : SYSTEM_PROMPT;
 
-      contents = [
-        promptHeader,
-        { inlineData: { mimeType: mimeType, data: base64Image } }
-      ];
+      contents = [promptHeader, { inlineData: { mimeType: mimeType, data: base64Image } }];
     } else if (text && isRecheckQuery && lastImageCache.has(cleanSenderNumber)) {
-      console.log(`[Gemini] Re-evaluating cached image against user query: "${text}"`);
       const cached = lastImageCache.get(cleanSenderNumber);
       contents = [
-        `${SYSTEM_PROMPT}\n\nUSER QUERY: "${text}"\nThe user is asking to recheck/verify against the attached register photo. Carefully extract any missing entries and return a complete "batch_update".`,
+        `${SYSTEM_PROMPT}\n\nUSER QUERY: "${text}"\nRecheck against register photo. Extract any missing entries and return complete batch_update.`,
         { inlineData: { mimeType: cached.mimeType, data: cached.base64 } }
       ];
     } else if (text) {
-      console.log(`[Incoming] Text from ${sender}: "${text}"`);
       contents = [`${SYSTEM_PROMPT}\n\nInput message: "${text}"`];
     } else if (audioMessage) {
-      console.log(`[Gemini] Processing voice note from ${sender}...`);
       const base64Audio = req.body?.data?.message?.base64 || '';
       if (!base64Audio) return res.sendStatus(200);
       contents = [
@@ -712,14 +688,15 @@ app.post('/webhook', async (req, res) => {
     });
 
     const result = await generateContentWithRetry(model, contents);
-    const responseText = result.response.text();
-    const parsed = JSON.parse(responseText.trim());
+    const parsed = JSON.parse(result.response.text().trim());
     console.log('[Parsed JSON]:', parsed);
 
     const defaultDate = getISTDateOnly();
 
-    // 1. Batch Update & Recheck Intent
+    // Parallel execution of all sheets writes
     if ((parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image') && sheets) {
+      const asyncTasks = [];
+
       if (parsed.orders && parsed.orders.length > 0) {
         const orderRows = parsed.orders.map(o => [
           o.date || defaultDate,
@@ -732,18 +709,18 @@ app.post('/webhook', async (req, res) => {
           o.pending_amount || 0,
           o.mode_of_payment || 'Cash'
         ]);
-        await appendWithRetry({
-          spreadsheetId: SPREADSHEET_ID,
-          range: 'Orders!A:I',
-          valueInputOption: 'USER_ENTERED',
-          resource: { values: orderRows }
-        });
+        asyncTasks.push(
+          appendWithRetry({
+            spreadsheetId: SPREADSHEET_ID,
+            range: 'Orders!A:I',
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: orderRows }
+          })
+        );
       }
 
       if (parsed.dispatches && parsed.dispatches.length > 0) {
-        for (const d of parsed.dispatches) {
-          await logOrUpdateDispatch(d.date || defaultDate, d);
-        }
+        asyncTasks.push(processBatchDispatches(defaultDate, parsed.dispatches));
       }
 
       if (parsed.expenses && parsed.expenses.length > 0) {
@@ -754,100 +731,89 @@ app.post('/webhook', async (req, res) => {
           e.amount || 0,
           e.remarks || ''
         ]);
-        await appendWithRetry({
-          spreadsheetId: SPREADSHEET_ID,
-          range: 'Expenses!A:E',
-          valueInputOption: 'USER_ENTERED',
-          resource: { values: expenseRows }
-        });
+        asyncTasks.push(
+          appendWithRetry({
+            spreadsheetId: SPREADSHEET_ID,
+            range: 'Expenses!A:E',
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: expenseRows }
+          })
+        );
       }
 
+      // Exactly aligns with 6 Columns: A: Date, B: Opening Balance, C: Total Jama, D: Total Kharcha, E: Maalik Ko Diya, F: Munshi Cash In Hand
       if (parsed.daily_closing && (parsed.daily_closing.total_jama || parsed.daily_closing.closing_balance)) {
         const dc = parsed.daily_closing;
-        await appendWithRetry({
-          spreadsheetId: SPREADSHEET_ID,
-          range: 'Daily_Closing!A:G',
-          valueInputOption: 'USER_ENTERED',
-          resource: {
-            values: [[
-              dc.date || defaultDate,
-              dc.opening_balance || 0,
-              dc.total_jama || 0,
-              dc.total_kharcha || 0,
-              dc.maalik_ko_diya || 0,
-              dc.closing_balance || 0,
-              dc.remarks || ''
-            ]]
-          }
-        });
+        asyncTasks.push(
+          appendWithRetry({
+            spreadsheetId: SPREADSHEET_ID,
+            range: 'Daily_Closing!A:F',
+            valueInputOption: 'USER_ENTERED',
+            resource: {
+              values: [[
+                dc.date || defaultDate,
+                dc.opening_balance || 0,
+                dc.total_jama || 0,
+                dc.total_kharcha || 0,
+                dc.maalik_ko_diya || 0,
+                dc.closing_balance || 0
+              ]]
+            }
+          })
+        );
       }
 
+      await Promise.all(asyncTasks);
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
-
-    // 2. Single or Multiple Orders Intent
     else if (parsed.intent === 'order' && sheets) {
       const ordersToProcess = (parsed.orders && parsed.orders.length > 0) ? parsed.orders : [parsed];
-      for (const order of ordersToProcess) {
-        await appendWithRetry({
-          spreadsheetId: SPREADSHEET_ID,
-          range: 'Orders!A:I',
-          valueInputOption: 'USER_ENTERED',
-          resource: {
-            values: [[
-              order.date || defaultDate,
-              order.name || 'नकद ग्राहक',
-              order.village || '',
-              order.grade || 'अव्वल',
-              order.quantity || 0,
-              order.amount_payable || (order.amount_received || 0),
-              order.amount_received || 0,
-              order.pending_amount || 0,
-              order.mode_of_payment || 'Cash'
-            ]]
-          }
-        });
-      }
+      const rows = ordersToProcess.map(o => [
+        o.date || defaultDate,
+        o.name || 'नकद ग्राहक',
+        o.village || '',
+        o.grade || 'अव्वल',
+        o.quantity || 0,
+        o.amount_payable || (o.amount_received || 0),
+        o.amount_received || 0,
+        o.pending_amount || 0,
+        o.mode_of_payment || 'Cash'
+      ]);
+      await appendWithRetry({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'Orders!A:I',
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: rows }
+      });
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
-
-    // 3. Single or Multiple Dispatches Intent
     else if (parsed.intent === 'dispatch' && sheets) {
       const dispatchesToProcess = (parsed.dispatches && parsed.dispatches.length > 0) ? parsed.dispatches : [parsed];
-      for (const dispatch of dispatchesToProcess) {
-        await logOrUpdateDispatch(dispatch.date || defaultDate, dispatch);
-      }
+      await processBatchDispatches(defaultDate, dispatchesToProcess);
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
-
-    // 4. Single or Multiple Expenses Intent
     else if (parsed.intent === 'expense' && sheets) {
       const expensesToProcess = (parsed.expenses && parsed.expenses.length > 0) ? parsed.expenses : [parsed];
-      for (const expense of expensesToProcess) {
-        await appendWithRetry({
-          spreadsheetId: SPREADSHEET_ID,
-          range: 'Expenses!A:E',
-          valueInputOption: 'USER_ENTERED',
-          resource: {
-            values: [[
-              expense.date || defaultDate,
-              expense.category || 'अन्य',
-              expense.paid_to || '',
-              expense.amount || 0,
-              expense.remarks || ''
-            ]]
-          }
-        });
-      }
+      const rows = expensesToProcess.map(e => [
+        e.date || defaultDate,
+        e.category || 'अन्य',
+        e.paid_to || '',
+        e.amount || 0,
+        e.remarks || ''
+      ]);
+      await appendWithRetry({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'Expenses!A:E',
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: rows }
+      });
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
-
-    // 5. Daily Summary Intent
     else if (parsed.intent === 'daily_summary' && sheets) {
       const dc = parsed.daily_closing || parsed;
       await appendWithRetry({
         spreadsheetId: SPREADSHEET_ID,
-        range: 'Daily_Closing!A:G',
+        range: 'Daily_Closing!A:F',
         valueInputOption: 'USER_ENTERED',
         resource: {
           values: [[
@@ -856,15 +822,12 @@ app.post('/webhook', async (req, res) => {
             dc.total_jama || 0,
             dc.total_kharcha || 0,
             dc.maalik_ko_diya || 0,
-            dc.closing_balance || 0,
-            dc.remarks || ''
+            dc.closing_balance || 0
           ]]
         }
       });
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
-
-    // 6. Targeted Rectification / Update Intent
     else if (parsed.intent === 'update_entry' && sheets) {
       if (parsed.orders && parsed.orders.length > 0) {
         let updatedAny = false;
@@ -873,20 +836,14 @@ app.post('/webhook', async (req, res) => {
           const success = await updateSheetEntry(parsed.target_tabs, filter, order);
           if (success) updatedAny = true;
         }
-        const reply = updatedAny
-          ? (parsed.reply_text || 'एंट्री सफलतापूर्वक अपडेट कर दी गई है।')
-          : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
+        const reply = updatedAny ? (parsed.reply_text || 'एंट्री सफलतापूर्वक अपडेट कर दी गई है।') : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
         await sendWhatsAppReply(sender, reply);
       } else {
         const success = await updateSheetEntry(parsed.target_tabs, parsed.search_filter, parsed.fields_to_update);
-        const reply = success
-          ? (parsed.reply_text || 'एंट्री सफलतापूर्वक अपडेट कर दी गई है।')
-          : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
+        const reply = success ? (parsed.reply_text || 'एंट्री सफलतापूर्वक अपडेट कर दी गई है।') : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
         await sendWhatsAppReply(sender, reply);
       }
     }
-
-    // 7. Targeted Deletion Intent
     else if (parsed.intent === 'delete_entry' && sheets) {
       const result = await deleteSheetEntry(parsed.target_tabs, parsed.search_filter, parsed.delete_all || false);
       if (parsed.delete_all) lastImageCache.delete(cleanSenderNumber);
@@ -902,8 +859,6 @@ app.post('/webhook', async (req, res) => {
       }
       await sendWhatsAppReply(sender, reply);
     }
-
-    // 8. Clarification / Unhandled Reply Fallback
     else if (parsed.reply_text) {
       await sendWhatsAppReply(sender, parsed.reply_text);
     }
