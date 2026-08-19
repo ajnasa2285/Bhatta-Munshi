@@ -708,6 +708,11 @@ app.post('/webhook', async (req, res) => {
     const result = await generateContentWithRetry(model, contents);
     
     // JSON cleanup to prevent markdown parsing errors
-    let rawText = result.response.text().trim();
-    if (rawText.startsWith('```')) {
-      rawText = rawText.replace(/^
+        let rawText = result.response.text().trim();
+    const firstBrace = rawText.indexOf('{');
+    const lastBrace = rawText.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1) {
+      rawText = rawText.slice(firstBrace, lastBrace + 1);
+    }
+    const parsed = JSON.parse(rawText);
+    console.log('[Parsed JSON]:', parsed);
