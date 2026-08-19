@@ -16,6 +16,9 @@ const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
 const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
 const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 
+// --- Primary Gemini Model (change here to update everywhere) ---
+const PRIMARY_MODEL = 'gemini-3.6-flash';
+
 // --- Authorized Phone Whitelist ---
 const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
   ? process.env.ALLOWED_NUMBERS.split(',').map(num => num.trim())
@@ -87,8 +90,9 @@ async function appendWithRetry(params, retries = 2, delay = 800) {
 }
 
 // --- Gemini Generate Helper with Automatic Model Failover ---
+// primaryModelName MUST be a string (e.g. 'gemini-3.6-flash'), not a model object.
 async function generateContentWithRetry(primaryModelName, contents, retries = 3, delay = 1500) {
-  const modelsToTry = [primaryModelName, 'gemini-2.0-flash', 'gemini-1.5-flash'];
+  const modelsToTry = [primaryModelName, 'gemini-3.6-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
   // Remove duplicates while preserving order
   const uniqueModels = [...new Set(modelsToTry)];
 
@@ -109,7 +113,7 @@ async function generateContentWithRetry(primaryModelName, contents, retries = 3,
       } catch (err) {
         const status = err.status || (err.response && err.response.status);
         console.warn(`[Gemini Error] ${modelName} returned ${status || err.message} on attempt ${attempt}`);
-        
+
         if ((status === 503 || status === 429 || status === 500) && attempt < retries) {
           await new Promise(res => setTimeout(res, delay));
           delay *= 1.5;
@@ -708,10 +712,10 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
     const imageMessage = message?.imageMessage;
 
     const isRecheckQuery = text && (
-      text.toLowerCase().includes('recheck') || 
-      text.toLowerCase().includes('match') || 
-      text.toLowerCase().includes('image') || 
-      text.toLowerCase().includes('photo') || 
+      text.toLowerCase().includes('recheck') ||
+      text.toLowerCase().includes('match') ||
+      text.toLowerCase().includes('image') ||
+      text.toLowerCase().includes('photo') ||
       text.toLowerCase().includes('not present') ||
       text.includes('नहीं मिला') ||
       text.includes('फोटो से') ||
@@ -723,10 +727,10 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       const base64Image = req.body?.data?.message?.base64 || '';
       if (!base64Image) return res.sendStatus(200);
       const mimeType = imageMessage.mimetype || 'image/jpeg';
-      
+
       lastImageCache.set(cleanSenderNumber, { base64: base64Image, mimeType });
 
-      const promptHeader = caption 
+      const promptHeader = caption
         ? `${SYSTEM_PROMPT}\n\nUSER CAPTION / INSTRUCTIONS: "${caption}"\nFulfill caption instructions and extract all data.`
         : SYSTEM_PROMPT;
 
@@ -750,23 +754,16 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return res.sendStatus(200);
     }
 
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-3.7-flash',
-      generationConfig: {
-        responseMimeType: 'application/json',
-        temperature: 0.0,
-        maxOutputTokens: 8192
-      }
-    });
+    // NOTE: generateContentWithRetry expects a model NAME STRING, not a model object.
+    // It builds the model internally (and handles fallback models) itself.
+    const result = await generateContentWithRetry(PRIMARY_MODEL, contents);
 
-    const result = await generateContentWithRetry(model, contents);
-    
     let rawText = result.response.text().trim();
     const firstBrace = rawText.indexOf('{');
     if (firstBrace !== -1) {
       rawText = rawText.slice(firstBrace);
     }
-    
+
     let parsed;
     try {
       parsed = JSON.parse(rawText);
