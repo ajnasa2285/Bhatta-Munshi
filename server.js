@@ -55,6 +55,12 @@ if (fs.existsSync(CREDENTIALS_PATH)) {
   console.error('Warning: credentials.json Secret File not found at', CREDENTIALS_PATH);
 }
 
+// --- Date Formatter Helper (Only Date, No Time) ---
+function getISTDateOnly() {
+  const now = new Date();
+  return now.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }).replace(/\//g, '-'); // Returns DD-MM-YYYY
+}
+
 // --- Sheets API Helper with Exponential Backoff Retry ---
 async function appendWithRetry(params, retries = 3, delay = 1000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -180,8 +186,8 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
   if (targetRowIndex !== -1 && targetRow) {
     const prevDispatched = Number(targetRow[5]) || 0;
     const finalOrdered = Math.max(newTotalOrdered, Number(targetRow[4]) || 0);
-    const finalDispatched = (typeof dispatchedQty === 'number' && typeof prevDispatched === 'number') 
-      ? (prevDispatched > 0 && prevDispatched === dispatchedQty ? prevDispatched : prevDispatched + dispatchedQty) 
+    const finalDispatched = (typeof dispatchedQty === 'number' && typeof prevDispatched === 'number')
+      ? (prevDispatched > 0 && prevDispatched === dispatchedQty ? prevDispatched : prevDispatched + dispatchedQty)
       : dispatchedQty;
 
     const balanceRemaining = (typeof finalOrdered === 'number' && typeof finalDispatched === 'number')
@@ -217,13 +223,15 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
     if (dispatchedQty === 0 && !isTrolley) status = 'Pending';
     else if (balanceRemaining > 0 && typeof balanceRemaining === 'number') status = 'Partial';
 
+    const rowDate = dispatch.date || dateStr;
+
     await appendWithRetry({
       spreadsheetId: SPREADSHEET_ID,
       range: 'Supply_Dispatch!A:J',
       valueInputOption: 'USER_ENTERED',
       resource: {
         values: [[
-          dateStr,
+          rowDate,
           dispatch.name || 'नकद ग्राहक',
           dispatch.village || '',
           dispatch.grade || 'अव्वल',
@@ -244,7 +252,6 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
 async function updateSheetEntry(targetTab, filter, updates) {
   if (!sheets || !SPREADSHEET_ID) return false;
 
-  // Direct Row Index targeting if specified
   if (filter?.row_number && filter.row_number >= 2) {
     const tab = targetTab || 'Supply_Dispatch';
     const rowIndex = filter.row_number;
@@ -254,6 +261,7 @@ async function updateSheetEntry(targetTab, filter, updates) {
     });
     const row = res.data.values?.[0];
     if (row) {
+      if (updates.date) row[0] = updates.date;
       if (updates.quantity) {
         row[4] = updates.quantity;
         row[7] = Math.max(0, Number(updates.quantity) - (Number(row[5]) || 0));
@@ -309,13 +317,15 @@ async function updateSheetEntry(targetTab, filter, updates) {
       }
 
       if (rowIndex !== -1 && targetRow) {
+        if (updates.date) targetRow[0] = updates.date;
+
         if (tab === 'Orders') {
           if (updates.village) targetRow[2] = updates.village;
           if (updates.grade) targetRow[3] = updates.grade;
           if (updates.quantity) targetRow[4] = updates.quantity;
           if (updates.amount_payable) targetRow[5] = updates.amount_payable;
           if (updates.amount_received) targetRow[6] = updates.amount_received;
-          
+
           const payable = Number(targetRow[5]) || 0;
           const received = Number(targetRow[6]) || 0;
           targetRow[7] = Math.max(0, payable - received);
@@ -395,7 +405,7 @@ async function deleteSheetEntry(targetTab, filter) {
     let rowIndexToDelete = -1;
 
     if (isDeleteLast) {
-      rowIndexToDelete = rows.length; // points to latest data row
+      rowIndexToDelete = rows.length;
     } else {
       for (let i = rows.length - 1; i >= 0; i--) {
         const row = rows[i];
@@ -406,7 +416,7 @@ async function deleteSheetEntry(targetTab, filter) {
         const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
 
         if (matchName || matchPayee) {
-          rowIndexToDelete = i + 1; // 0-based for batchUpdate
+          rowIndexToDelete = i + 1;
           break;
         }
       }
@@ -439,7 +449,7 @@ async function deleteSheetEntry(targetTab, filter) {
   };
 }
 
-// --- System Prompt for Gemini ---
+// --- System Prompt for Gemini with Explicit Date Parsing ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
@@ -453,6 +463,7 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
     "row_number": number
   },
   "fields_to_update": {
+    "date": string,
     "village": string,
     "grade": string,
     "quantity": string | number,
@@ -467,6 +478,7 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
   },
   "orders": [
     {
+      "date": string,
       "name": string,
       "village": string,
       "grade": string,
@@ -479,6 +491,7 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
   ],
   "dispatches": [
     {
+      "date": string,
       "name": string,
       "village": string,
       "grade": string,
@@ -489,6 +502,7 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
   ],
   "expenses": [
     {
+      "date": string,
       "category": string,
       "paid_to": string,
       "amount": number,
@@ -496,6 +510,7 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
     }
   ],
   "daily_closing": {
+    "date": string,
     "opening_balance": number,
     "total_jama": number,
     "total_kharcha": number,
@@ -521,16 +536,17 @@ BRICK GRADE & TERMINOLOGY STANDARDIZATION:
 - "चाटका" (Chatka)
 
 CRITICAL OPERATIONAL RULES:
-1. NAME STANDARDIZATION: Always normalize Indian customer and vendor names to standard Hindi Devanagari in search_filter (e.g. "Anup Singh" -> "अनूप सिंह", "Balgobind" -> "बालगोविन्द", "Kanhai" / "Kanahi" -> "कन्धाई").
-2. CORRECTIONS & UPDATES:
-   - If user asks to update quantity, grade, driver, or village, set intent = "update_entry", target_tab = "Supply_Dispatch", search_filter = { customer_name: "..." }, and fields_to_update with values.
-   - If user asks to update status (e.g. "delivery status pending nahi completed hai", "status completed kar do"), set intent = "update_entry", target_tab = "Supply_Dispatch", and fields_to_update.status = "Completed".
-   - If user specifies a row (e.g. "row 7 of dispatch"), set search_filter.row_number = 7.
-3. DELETIONS:
+1. DATE HANDLING:
+   - If the user explicitly mentions a date (e.g. "17-08-2026 ko order kiya thaa", "17 tareekh ko", "17 August"), extract and populate the "date" field in orders, dispatches, expenses, or fields_to_update as "DD-MM-YYYY".
+   - If no date is mentioned, leave "date" as null.
+   - In diary photos, extract the written date from the register page.
+2. NAME STANDARDIZATION: Always normalize Indian customer and vendor names to standard Hindi Devanagari in search_filter (e.g. "Anup Singh" -> "अनूप सिंह", "Balgobind" -> "बालगोविन्द", "Kanhai" / "Kanahi" -> "कन्धाई").
+3. CORRECTIONS & UPDATES:
+   - Set intent = "update_entry" when modifying quantities, dates, status, or driver.
+4. DELETIONS:
    - If user asks to delete an entry from both Order and Dispatch (e.g. "order aur dispatch dono delete karna hai"), set intent = "delete_entry", target_tab = "BOTH", and search_filter = { customer_name: "कन्धाई" }.
-   - If user asks "delete previous entry", set intent = "delete_entry", target_tab = "Supply_Dispatch", search_filter = { customer_name: "" }.
-4. CLARIFICATIONS: If message is ambiguous or missing key info, set intent = "clarification" and ask a polite clarifying question in "reply_text".
-5. DIARY PHOTO: When a diary page photo is sent, set intent = "batch_update", populate all 4 sections, and generate an itemized summary in "reply_text".
+5. CLARIFICATIONS: If message is ambiguous, set intent = "clarification" and ask a polite clarifying question in "reply_text".
+6. DIARY PHOTO: When a diary page photo is sent, set intent = "batch_update", populate all 4 sections, and generate an itemized summary in "reply_text".
 `;
 
 // --- Webhook Endpoint ---
@@ -589,13 +605,13 @@ app.post('/webhook', async (req, res) => {
     const parsed = JSON.parse(responseText.trim());
     console.log('[Parsed JSON]:', parsed);
 
-    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const defaultDate = getISTDateOnly(); // Clean DD-MM-YYYY without time
 
     // 1. Batch Update (Diary Photos)
     if (parsed.intent === 'batch_update' && sheets) {
       if (parsed.orders && parsed.orders.length > 0) {
         const orderRows = parsed.orders.map(o => [
-          timestamp,
+          o.date || defaultDate,
           o.name || 'नकद ग्राहक',
           o.village || '',
           o.grade || 'अव्वल',
@@ -615,13 +631,13 @@ app.post('/webhook', async (req, res) => {
 
       if (parsed.dispatches && parsed.dispatches.length > 0) {
         for (const d of parsed.dispatches) {
-          await logOrUpdateDispatch(timestamp, d);
+          await logOrUpdateDispatch(d.date || defaultDate, d);
         }
       }
 
       if (parsed.expenses && parsed.expenses.length > 0) {
         const expenseRows = parsed.expenses.map(e => [
-          timestamp,
+          e.date || defaultDate,
           e.category || 'अन्य',
           e.paid_to || '',
           e.amount || 0,
@@ -643,7 +659,7 @@ app.post('/webhook', async (req, res) => {
           valueInputOption: 'USER_ENTERED',
           resource: {
             values: [[
-              timestamp,
+              dc.date || defaultDate,
               dc.opening_balance || 0,
               dc.total_jama || 0,
               dc.total_kharcha || 0,
@@ -667,7 +683,7 @@ app.post('/webhook', async (req, res) => {
         valueInputOption: 'USER_ENTERED',
         resource: {
           values: [[
-            timestamp,
+            order.date || defaultDate,
             order.name || 'नकद ग्राहक',
             order.village || '',
             order.grade || 'अव्वल',
@@ -685,7 +701,7 @@ app.post('/webhook', async (req, res) => {
     // 3. Single Dispatch Intent
     else if (parsed.intent === 'dispatch' && sheets) {
       const dispatch = parsed.dispatches?.[0] || parsed;
-      await logOrUpdateDispatch(timestamp, dispatch);
+      await logOrUpdateDispatch(dispatch.date || defaultDate, dispatch);
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
 
@@ -698,7 +714,7 @@ app.post('/webhook', async (req, res) => {
         valueInputOption: 'USER_ENTERED',
         resource: {
           values: [[
-            timestamp,
+            expense.date || defaultDate,
             expense.category || 'अन्य',
             expense.paid_to || '',
             expense.amount || 0,
@@ -718,7 +734,7 @@ app.post('/webhook', async (req, res) => {
         valueInputOption: 'USER_ENTERED',
         resource: {
           values: [[
-            timestamp,
+            dc.date || defaultDate,
             dc.opening_balance || 0,
             dc.total_jama || 0,
             dc.total_kharcha || 0,
@@ -734,7 +750,7 @@ app.post('/webhook', async (req, res) => {
     // 6. Update Entry Intent
     else if (parsed.intent === 'update_entry' && sheets) {
       const success = await updateSheetEntry(parsed.target_tab, parsed.search_filter, parsed.fields_to_update);
-      const reply = success 
+      const reply = success
         ? (parsed.reply_text || 'एंट्री सफलतापूर्वक अपडेट कर दी गई है।')
         : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
       await sendWhatsAppReply(sender, reply);
@@ -753,7 +769,7 @@ app.post('/webhook', async (req, res) => {
       await sendWhatsAppReply(sender, reply);
     }
 
-    // 8. Clarification / Questions / Any Remaining Fallback (Always delivers reply_text)
+    // 8. Clarification / Questions / Any Remaining Fallback
     else if (parsed.reply_text) {
       await sendWhatsAppReply(sender, parsed.reply_text);
     }
