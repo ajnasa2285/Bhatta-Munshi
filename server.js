@@ -116,11 +116,11 @@ function normalizeHindi(str) {
   let s = str.toString().trim().toLowerCase();
 
   const transMap = [
+    [/kanhai|kanahi|kandhai|कन्हाई|कनहाई/g, 'कन्धाई'],
     [/anup|anoop/g, 'अनूप'],
     [/singh/g, 'सिंह'],
     [/balgobind|balgovind/g, 'बालगोविन्द'],
     [/blooming|bird/g, 'ब्लूमिंग'],
-    [/kandhai/g, 'कन्धाई'],
     [/meetha|mitha/g, 'मीठा'],
     [/awwal|awal/g, 'अव्वल'],
     [/peela|pila/g, 'पीला'],
@@ -157,52 +157,60 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
   let targetRow = null;
 
   const searchNameNorm = normalizeHindi(dispatch.name);
+  const targetGradeNorm = normalizeHindi(dispatch.grade);
 
   for (let i = 0; i < rows.length; i++) {
     const rowCustomerNorm = normalizeHindi(rows[i][1]);
-    const rowStatus = rows[i][9] || '';
-    if (searchNameNorm && rowCustomerNorm.includes(searchNameNorm) && rowStatus !== 'Completed') {
-      targetRowIndex = i + 2;
-      targetRow = rows[i];
-      break;
+    const rowGradeNorm = normalizeHindi(rows[i][3]);
+
+    if (searchNameNorm && (rowCustomerNorm.includes(searchNameNorm) || searchNameNorm.includes(rowCustomerNorm))) {
+      if (!targetGradeNorm || rowGradeNorm.includes(targetGradeNorm) || targetGradeNorm.includes(rowGradeNorm)) {
+        targetRowIndex = i + 2;
+        targetRow = rows[i];
+        break;
+      }
     }
   }
 
   const rawQty = dispatch.dispatched_qty;
   const isTrolley = typeof rawQty === 'string' && (rawQty.includes('trolly') || rawQty.includes('ट्रॉली') || rawQty.includes('गाड़ी'));
   const dispatchedQty = isTrolley ? rawQty : (Number(rawQty) || 0);
+  const newTotalOrdered = dispatch.total_ordered_qty ? (Number(dispatch.total_ordered_qty) || dispatchedQty) : dispatchedQty;
 
   if (targetRowIndex !== -1 && targetRow) {
-    const totalOrdered = targetRow[4] || dispatchedQty;
-    const prevDispatched = Number(targetRow[6]) || 0;
-    const newTotalDispatched = typeof dispatchedQty === 'number' ? (prevDispatched + dispatchedQty) : dispatchedQty;
-    const balanceRemaining = typeof totalOrdered === 'number' && typeof newTotalDispatched === 'number' 
-      ? Math.max(0, totalOrdered - newTotalDispatched) 
+    const prevDispatched = Number(targetRow[5]) || 0;
+    const finalOrdered = Math.max(newTotalOrdered, Number(targetRow[4]) || 0);
+    const finalDispatched = (typeof dispatchedQty === 'number' && typeof prevDispatched === 'number') 
+      ? (prevDispatched > 0 && prevDispatched === dispatchedQty ? prevDispatched : prevDispatched + dispatchedQty) 
+      : dispatchedQty;
+
+    const balanceRemaining = (typeof finalOrdered === 'number' && typeof finalDispatched === 'number')
+      ? Math.max(0, finalOrdered - finalDispatched)
       : 0;
 
-    const newStatus = isTrolley || (typeof totalOrdered === 'number' && newTotalDispatched >= totalOrdered) 
-      ? 'Completed' 
+    const newStatus = isTrolley || (typeof finalOrdered === 'number' && finalDispatched >= finalOrdered)
+      ? 'Completed'
       : 'Partial';
 
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
-      range: `Supply_Dispatch!F${targetRowIndex}:J${targetRowIndex}`,
+      range: `Supply_Dispatch!E${targetRowIndex}:J${targetRowIndex}`,
       valueInputOption: 'USER_ENTERED',
       resource: {
         values: [[
+          finalOrdered,
           dispatchedQty,
-          newTotalDispatched,
+          finalDispatched,
           balanceRemaining,
           dispatch.driver || targetRow[8] || '',
           newStatus
         ]]
       }
     });
-    console.log(`[Supply_Dispatch] Updated row ${targetRowIndex} for ${dispatch.name}`);
+    console.log(`[Supply_Dispatch] Adjusted row ${targetRowIndex} for ${dispatch.name}`);
   } else {
-    const totalOrdered = dispatch.total_ordered_qty || dispatchedQty;
-    const balanceRemaining = typeof totalOrdered === 'number' && typeof dispatchedQty === 'number'
-      ? Math.max(0, totalOrdered - dispatchedQty)
+    const balanceRemaining = typeof newTotalOrdered === 'number' && typeof dispatchedQty === 'number'
+      ? Math.max(0, newTotalOrdered - dispatchedQty)
       : 0;
 
     let status = 'Completed';
@@ -219,7 +227,7 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
           dispatch.name || 'नकद ग्राहक',
           dispatch.village || '',
           dispatch.grade || 'अव्वल',
-          totalOrdered,
+          newTotalOrdered,
           dispatchedQty,
           dispatchedQty,
           balanceRemaining,
@@ -235,6 +243,35 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
 // --- Dynamic Row Update Logic Across All Tabs ---
 async function updateSheetEntry(targetTab, filter, updates) {
   if (!sheets || !SPREADSHEET_ID) return false;
+
+  // Direct Row Index targeting if specified
+  if (filter?.row_number && filter.row_number >= 2) {
+    const tab = targetTab || 'Supply_Dispatch';
+    const rowIndex = filter.row_number;
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${tab}!A${rowIndex}:J${rowIndex}`
+    });
+    const row = res.data.values?.[0];
+    if (row) {
+      if (updates.quantity) {
+        row[4] = updates.quantity;
+        row[7] = Math.max(0, Number(updates.quantity) - (Number(row[5]) || 0));
+        row[9] = row[7] === 0 ? 'Completed' : 'Partial';
+      }
+      if (updates.status) row[9] = updates.status;
+      if (updates.grade) row[3] = updates.grade;
+      if (updates.driver) row[8] = updates.driver;
+
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${tab}!A${rowIndex}:J${rowIndex}`,
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: [row] }
+      });
+      return true;
+    }
+  }
 
   const tabsToSearch = targetTab ? [targetTab, 'Supply_Dispatch', 'Orders', 'Expenses'] : ['Supply_Dispatch', 'Orders', 'Expenses', 'Daily_Closing'];
   const uniqueTabs = [...new Set(tabsToSearch)];
@@ -286,9 +323,13 @@ async function updateSheetEntry(targetTab, filter, updates) {
           if (updates.village) targetRow[2] = updates.village;
           if (updates.grade) targetRow[3] = updates.grade;
           if (updates.quantity) {
-            targetRow[4] = updates.quantity;
-            targetRow[5] = updates.quantity;
-            targetRow[6] = updates.quantity;
+            const cleanQty = (typeof updates.quantity === 'string' && (updates.quantity.includes('trolly') || updates.quantity.includes('गाड़ी')))
+              ? updates.quantity
+              : Number(updates.quantity) || updates.quantity;
+
+            targetRow[4] = cleanQty;
+            targetRow[5] = cleanQty;
+            targetRow[6] = cleanQty;
             targetRow[7] = 0;
             targetRow[9] = 'Completed';
           }
@@ -319,16 +360,27 @@ async function updateSheetEntry(targetTab, filter, updates) {
   return false;
 }
 
-// --- Dynamic Row Delete Logic Across All Tabs ---
+// --- Enhanced Multi-Tab Dynamic Delete Logic ---
 async function deleteSheetEntry(targetTab, filter) {
-  if (!sheets || !SPREADSHEET_ID) return false;
+  if (!sheets || !SPREADSHEET_ID) return { success: false, deletedFrom: [] };
 
-  const tabsToSearch = targetTab ? [targetTab, 'Supply_Dispatch', 'Orders', 'Expenses'] : ['Supply_Dispatch', 'Orders', 'Expenses', 'Daily_Closing'];
-  const uniqueTabs = [...new Set(tabsToSearch)];
+  let tabsToSearch = [];
+  if (targetTab === 'BOTH' || targetTab === 'ALL') {
+    tabsToSearch = ['Supply_Dispatch', 'Orders', 'Expenses', 'Daily_Closing'];
+  } else if (targetTab) {
+    tabsToSearch = [targetTab];
+  } else {
+    tabsToSearch = ['Supply_Dispatch', 'Orders', 'Expenses', 'Daily_Closing'];
+  }
 
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+  const searchNameNorm = normalizeHindi(filter?.customer_name);
+  const searchPayeeNorm = normalizeHindi(filter?.paid_to);
+  const isDeleteLast = !searchNameNorm && !searchPayeeNorm;
 
-  for (const tab of uniqueTabs) {
+  const deletedTabs = [];
+
+  for (const tab of tabsToSearch) {
     const sheetMeta = meta.data.sheets.find(s => s.properties.title === tab);
     if (!sheetMeta) continue;
     const sheetId = sheetMeta.properties.sheetId;
@@ -341,25 +393,23 @@ async function deleteSheetEntry(targetTab, filter) {
     if (rows.length === 0) continue;
 
     let rowIndexToDelete = -1;
-    const searchNameNorm = normalizeHindi(filter?.customer_name);
-    const searchPayeeNorm = normalizeHindi(filter?.paid_to);
 
-    if (searchNameNorm || searchPayeeNorm) {
+    if (isDeleteLast) {
+      rowIndexToDelete = rows.length; // points to latest data row
+    } else {
       for (let i = rows.length - 1; i >= 0; i--) {
         const row = rows[i];
         const rowNameNorm = normalizeHindi(row[1]);
         const rowPayeeNorm = normalizeHindi(row[2]);
-        
+
         const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
         const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
-        
+
         if (matchName || matchPayee) {
-          rowIndexToDelete = i + 1;
+          rowIndexToDelete = i + 1; // 0-based for batchUpdate
           break;
         }
       }
-    } else {
-      rowIndexToDelete = rows.length;
     }
 
     if (rowIndexToDelete !== -1) {
@@ -378,13 +428,15 @@ async function deleteSheetEntry(targetTab, filter) {
           }]
         }
       });
-
-      console.log(`[Delete Success] Deleted row ${rowIndexToDelete + 1} from ${tab}`);
-      return true;
+      console.log(`[Delete Success] Deleted row from ${tab}`);
+      deletedTabs.push(tab);
     }
   }
 
-  return false;
+  return {
+    success: deletedTabs.length > 0,
+    deletedFrom: deletedTabs
+  };
 }
 
 // --- System Prompt for Gemini ---
@@ -394,10 +446,11 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
 
 {
   "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "update_entry" | "delete_entry" | "clarification" | "ignore",
-  "target_tab": "Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing",
+  "target_tab": "Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "BOTH" | "ALL",
   "search_filter": {
     "customer_name": string,
-    "paid_to": string
+    "paid_to": string,
+    "row_number": number
   },
   "fields_to_update": {
     "village": string,
@@ -468,13 +521,16 @@ BRICK GRADE & TERMINOLOGY STANDARDIZATION:
 - "चाटका" (Chatka)
 
 CRITICAL OPERATIONAL RULES:
-1. NAME STANDARDIZATION: Always normalize Indian customer and vendor names to standard Hindi Devanagari in search_filter (e.g. "Anup Singh" -> "अनूप सिंह", "Balgobind" -> "बालगोविन्द").
+1. NAME STANDARDIZATION: Always normalize Indian customer and vendor names to standard Hindi Devanagari in search_filter (e.g. "Anup Singh" -> "अनूप सिंह", "Balgobind" -> "बालगोविन्द", "Kanhai" / "Kanahi" -> "कन्धाई").
 2. CORRECTIONS & UPDATES:
-   - If user asks to update quantity, grade, driver, or village (e.g. "Anup singh 500 meetha ki jagah 4000 meetha hai change it"), set intent = "update_entry", target_tab = "Supply_Dispatch", search_filter = { customer_name: "अनूप सिंह" }, and fields_to_update with values.
+   - If user asks to update quantity, grade, driver, or village, set intent = "update_entry", target_tab = "Supply_Dispatch", search_filter = { customer_name: "..." }, and fields_to_update with values.
    - If user asks to update status (e.g. "delivery status pending nahi completed hai", "status completed kar do"), set intent = "update_entry", target_tab = "Supply_Dispatch", and fields_to_update.status = "Completed".
-3. AMBIGUITY & QUESTIONS: If the message is unclear, vague, or missing names/numbers (e.g. "Pending hee dikha raha hai abhee bhee"), set intent = "clarification" and ask a polite, precise clarification in "reply_text".
-4. DELETIONS: For deletion requests, set intent = "delete_entry", identify target_tab, and set search_filter.
-5. DIARY SCAN: When a diary page photo is sent, set intent = "batch_update", populate all 4 sections, and generate an itemized Hindi summary in "reply_text".
+   - If user specifies a row (e.g. "row 7 of dispatch"), set search_filter.row_number = 7.
+3. DELETIONS:
+   - If user asks to delete an entry from both Order and Dispatch (e.g. "order aur dispatch dono delete karna hai"), set intent = "delete_entry", target_tab = "BOTH", and search_filter = { customer_name: "कन्धाई" }.
+   - If user asks "delete previous entry", set intent = "delete_entry", target_tab = "Supply_Dispatch", search_filter = { customer_name: "" }.
+4. CLARIFICATIONS: If message is ambiguous or missing key info, set intent = "clarification" and ask a polite clarifying question in "reply_text".
+5. DIARY PHOTO: When a diary page photo is sent, set intent = "batch_update", populate all 4 sections, and generate an itemized summary in "reply_text".
 `;
 
 // --- Webhook Endpoint ---
@@ -684,16 +740,20 @@ app.post('/webhook', async (req, res) => {
       await sendWhatsAppReply(sender, reply);
     }
 
-    // 7. Delete Entry Intent
+    // 7. Delete Entry Intent (Multi-tab support)
     else if (parsed.intent === 'delete_entry' && sheets) {
-      const success = await deleteSheetEntry(parsed.target_tab, parsed.search_filter);
-      const reply = success 
-        ? (parsed.reply_text || 'एंट्री सफलतापूर्वक डिलीट कर दी गई है।')
-        : 'माफ कीजिए, डिलीट करने के लिए एंट्री नहीं मिली।';
+      const result = await deleteSheetEntry(parsed.target_tab, parsed.search_filter);
+      let reply;
+      if (result.success) {
+        const tabsJoined = result.deletedFrom.join(' और ');
+        reply = parsed.reply_text || `✅ ${tabsJoined} से संबंधित प्रविष्टि सफलतापूर्वक हटा दी गई है।`;
+      } else {
+        reply = 'माफ कीजिए, डिलीट करने के लिए कोई संबंधित एंट्री नहीं मिली।';
+      }
       await sendWhatsAppReply(sender, reply);
     }
 
-    // 8. Clarification / Questions / Unhandled Reply Fallback (Ensures nothing is dropped)
+    // 8. Clarification / Questions / Any Remaining Fallback (Always delivers reply_text)
     else if (parsed.reply_text) {
       await sendWhatsAppReply(sender, parsed.reply_text);
     }
