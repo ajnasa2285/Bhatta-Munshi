@@ -16,6 +16,11 @@ const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
 const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
 const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 
+// --- Authorized Phone Whitelist ---
+const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
+  ? process.env.ALLOWED_NUMBERS.split(',').map(num => num.trim())
+  : ['919277078095']; // Add authorized Munshi/Owner numbers here
+
 // --- Deduplication Cache ---
 const processedMessageIds = new Set();
 const MAX_TRACKED_IDS = 500;
@@ -58,7 +63,7 @@ if (fs.existsSync(CREDENTIALS_PATH)) {
 // --- Date Formatter Helper (Only Date, No Time) ---
 function getISTDateOnly() {
   const now = new Date();
-  return now.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }).replace(/\//g, '-'); // Returns DD-MM-YYYY
+  return now.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }).replace(/\//g, '-');
 }
 
 // --- Sheets API Helper with Exponential Backoff Retry ---
@@ -370,25 +375,47 @@ async function updateSheetEntry(targetTab, filter, updates) {
   return false;
 }
 
-// --- Enhanced Multi-Tab Dynamic Delete Logic ---
-async function deleteSheetEntry(targetTab, filter) {
+// --- Enhanced Multi-Tab & Full Sheet Delete/Clear Logic ---
+async function deleteSheetEntry(targetTab, filter, deleteAll = false) {
   if (!sheets || !SPREADSHEET_ID) return { success: false, deletedFrom: [] };
 
   let tabsToSearch = [];
-  if (targetTab === 'BOTH' || targetTab === 'ALL') {
-    tabsToSearch = ['Supply_Dispatch', 'Orders', 'Expenses', 'Daily_Closing'];
-  } else if (targetTab) {
-    tabsToSearch = [targetTab];
+  if (targetTab === 'BOTH') {
+    tabsToSearch = ['Supply_Dispatch', 'Orders'];
+  } else if (targetTab === 'ALL' || !targetTab) {
+    tabsToSearch = ['Orders', 'Supply_Dispatch', 'Expenses', 'Daily_Closing'];
   } else {
-    tabsToSearch = ['Supply_Dispatch', 'Orders', 'Expenses', 'Daily_Closing'];
+    tabsToSearch = [targetTab];
   }
 
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   const searchNameNorm = normalizeHindi(filter?.customer_name);
   const searchPayeeNorm = normalizeHindi(filter?.paid_to);
-  const isDeleteLast = !searchNameNorm && !searchPayeeNorm;
-
   const deletedTabs = [];
+
+  // CASE 1: Wipe all entries across requested tabs (e.g. "delete all entries", "sab clear karo")
+  if (deleteAll || (targetTab === 'ALL' && !searchNameNorm && !searchPayeeNorm)) {
+    for (const tab of tabsToSearch) {
+      try {
+        await sheets.spreadsheets.values.clear({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `${tab}!A2:Z`
+        });
+        console.log(`[Clear Success] Cleared all data rows from ${tab}`);
+        deletedTabs.push(tab);
+      } catch (err) {
+        console.error(`[Clear Error in ${tab}]:`, err.message);
+      }
+    }
+    return {
+      success: deletedTabs.length > 0,
+      deletedFrom: deletedTabs,
+      clearedAll: true
+    };
+  }
+
+  // CASE 2: Delete by specific Name/Payee OR Delete the single latest entry
+  const isDeleteLast = !searchNameNorm && !searchPayeeNorm;
 
   for (const tab of tabsToSearch) {
     const sheetMeta = meta.data.sheets.find(s => s.properties.title === tab);
@@ -405,7 +432,7 @@ async function deleteSheetEntry(targetTab, filter) {
     let rowIndexToDelete = -1;
 
     if (isDeleteLast) {
-      rowIndexToDelete = rows.length;
+      rowIndexToDelete = rows.length; // Points to latest row
     } else {
       for (let i = rows.length - 1; i >= 0; i--) {
         const row = rows[i];
@@ -438,18 +465,19 @@ async function deleteSheetEntry(targetTab, filter) {
           }]
         }
       });
-      console.log(`[Delete Success] Deleted row from ${tab}`);
+      console.log(`[Delete Success] Deleted row ${rowIndexToDelete + 1} from ${tab}`);
       deletedTabs.push(tab);
     }
   }
 
   return {
     success: deletedTabs.length > 0,
-    deletedFrom: deletedTabs
+    deletedFrom: deletedTabs,
+    clearedAll: false
   };
 }
 
-// --- System Prompt for Gemini with Explicit Date Parsing ---
+// --- System Prompt for Gemini ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
@@ -457,6 +485,7 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
 {
   "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "update_entry" | "delete_entry" | "clarification" | "ignore",
   "target_tab": "Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "BOTH" | "ALL",
+  "delete_all": boolean,
   "search_filter": {
     "customer_name": string,
     "paid_to": string,
@@ -537,16 +566,20 @@ BRICK GRADE & TERMINOLOGY STANDARDIZATION:
 
 CRITICAL OPERATIONAL RULES:
 1. DATE HANDLING:
-   - If the user explicitly mentions a date (e.g. "17-08-2026 ko order kiya thaa", "17 tareekh ko", "17 August"), extract and populate the "date" field in orders, dispatches, expenses, or fields_to_update as "DD-MM-YYYY".
-   - If no date is mentioned, leave "date" as null.
-   - In diary photos, extract the written date from the register page.
-2. NAME STANDARDIZATION: Always normalize Indian customer and vendor names to standard Hindi Devanagari in search_filter (e.g. "Anup Singh" -> "अनूप सिंह", "Balgobind" -> "बालगोविन्द", "Kanhai" / "Kanahi" -> "कन्धाई").
-3. CORRECTIONS & UPDATES:
-   - Set intent = "update_entry" when modifying quantities, dates, status, or driver.
-4. DELETIONS:
-   - If user asks to delete an entry from both Order and Dispatch (e.g. "order aur dispatch dono delete karna hai"), set intent = "delete_entry", target_tab = "BOTH", and search_filter = { customer_name: "कन्धाई" }.
-5. CLARIFICATIONS: If message is ambiguous, set intent = "clarification" and ask a polite clarifying question in "reply_text".
-6. DIARY PHOTO: When a diary page photo is sent, set intent = "batch_update", populate all 4 sections, and generate an itemized summary in "reply_text".
+   - If the user mentions a date (e.g. "17-08-2026 ko order kiya thaa"), extract it in "DD-MM-YYYY". Otherwise set null.
+2. NAME STANDARDIZATION: Always normalize Indian customer and vendor names to standard Hindi Devanagari (e.g. "Anup Singh" -> "अनूप सिंह", "Kanhai" / "Kanahi" -> "कन्धाई").
+3. DELETIONS & CLEARING:
+   - If user asks to delete all entries (e.g. "delete all entries from all pages", "sab entry delete karo", "sheet clear karo"):
+     * intent: "delete_entry"
+     * target_tab: "ALL"
+     * delete_all: true
+     * reply_text: "सभी पेजों से सभी एंट्रियां सफलतापूर्वक हटा (क्लियर) दी गई हैं।"
+   - If user asks to delete previous/last entry without name:
+     * intent: "delete_entry"
+     * target_tab: "Supply_Dispatch" (or specified tab)
+     * delete_all: false
+4. CORRECTIONS: Set intent = "update_entry" with search_filter and fields_to_update.
+5. CLARIFICATIONS: If message is ambiguous, set intent = "clarification" and ask in "reply_text".
 `;
 
 // --- Webhook Endpoint ---
@@ -558,12 +591,23 @@ app.post('/webhook', async (req, res) => {
     const sender = data.key?.remoteJid || '';
     const messageId = data.key?.id || '';
 
+    // 1. Skip Groups
+    if (sender.includes('@g.us')) return res.sendStatus(200);
+
+    // 2. Clean sender number
+    const cleanSenderNumber = sender.replace('@s.whatsapp.net', '').replace('@c.us', '').trim();
+
+    // 3. Deduplication Check
     if (isDuplicateMessage(messageId)) {
       console.log(`[Dedup] Skipping duplicate message ${messageId}`);
       return res.sendStatus(200);
     }
 
-    if (sender.includes('@g.us')) return res.sendStatus(200);
+    // 4. Whitelist Authorization Check
+    if (ALLOWED_NUMBERS.length > 0 && !ALLOWED_NUMBERS.includes(cleanSenderNumber)) {
+      console.warn(`[Security] Ignored unauthorized message from ${cleanSenderNumber}`);
+      return res.sendStatus(200);
+    }
 
     let contents = [];
     const message = data.message;
@@ -605,7 +649,7 @@ app.post('/webhook', async (req, res) => {
     const parsed = JSON.parse(responseText.trim());
     console.log('[Parsed JSON]:', parsed);
 
-    const defaultDate = getISTDateOnly(); // Clean DD-MM-YYYY without time
+    const defaultDate = getISTDateOnly();
 
     // 1. Batch Update (Diary Photos)
     if (parsed.intent === 'batch_update' && sheets) {
@@ -756,20 +800,22 @@ app.post('/webhook', async (req, res) => {
       await sendWhatsAppReply(sender, reply);
     }
 
-    // 7. Delete Entry Intent (Multi-tab support)
+    // 7. Delete Entry Intent (Supports Full Clear and Single/Multi Row Deletes)
     else if (parsed.intent === 'delete_entry' && sheets) {
-      const result = await deleteSheetEntry(parsed.target_tab, parsed.search_filter);
+      const result = await deleteSheetEntry(parsed.target_tab, parsed.search_filter, parsed.delete_all || false);
       let reply;
       if (result.success) {
         const tabsJoined = result.deletedFrom.join(' और ');
-        reply = parsed.reply_text || `✅ ${tabsJoined} से संबंधित प्रविष्टि सफलतापूर्वक हटा दी गई है।`;
+        reply = parsed.reply_text || (result.clearedAll 
+          ? `✅ ${tabsJoined} के सभी डेटा को सफलतापूर्वक साफ (क्लियर) कर दिया गया है।`
+          : `✅ ${tabsJoined} से संबंधित प्रविष्टि सफलतापूर्वक हटा दी गई है।`);
       } else {
         reply = 'माफ कीजिए, डिलीट करने के लिए कोई संबंधित एंट्री नहीं मिली।';
       }
       await sendWhatsAppReply(sender, reply);
     }
 
-    // 8. Clarification / Questions / Any Remaining Fallback
+    // 8. Clarification / Questions Fallback
     else if (parsed.reply_text) {
       await sendWhatsAppReply(sender, parsed.reply_text);
     }
