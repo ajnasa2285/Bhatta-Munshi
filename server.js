@@ -167,6 +167,40 @@ function parseTotalQty(val) {
   return numbers.reduce((sum, n) => sum + Number(n), 0);
 }
 
+// --- Helper to Auto-repair Cutoff / Truncated JSON ---
+function repairTruncatedJSON(jsonStr) {
+  let openBraces = 0;
+  let openBrackets = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < jsonStr.length; i++) {
+    const char = jsonStr[i];
+    if (char === '\\' && inString) {
+      escaped = !escaped;
+      continue;
+    }
+    if (char === '"' && !escaped) {
+      inString = !inString;
+    }
+    if (!inString) {
+      if (char === '{') openBraces++;
+      else if (char === '}') openBraces = Math.max(0, openBraces - 1);
+      else if (char === '[') openBrackets++;
+      else if (char === ']') openBrackets = Math.max(0, openBrackets - 1);
+    }
+    escaped = false;
+  }
+
+  if (inString) jsonStr += '"';
+  jsonStr = jsonStr.replace(/,\s*$/, '');
+
+  while (openBrackets > 0) { jsonStr += ']'; openBrackets--; }
+  while (openBraces > 0) { jsonStr += '}'; openBraces--; }
+
+  return jsonStr;
+}
+
 // --- Batched Dispatch Processor with Single Row Mixed Support ---
 async function processBatchDispatches(dateStr, dispatches) {
   if (!sheets || !SPREADSHEET_ID || !dispatches || dispatches.length === 0) return;
@@ -625,8 +659,8 @@ CRITICAL CONSOLIDATION & CORRELATION RULES:
 6. Standardize all Indian names to Hindi Devanagari.
 `;
 
-// --- Webhook Endpoint ---
-app.post('/webhook', async (req, res) => {
+// --- Webhook Endpoint (Supports all Evolution API route patterns) ---
+app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res) => {
   try {
     const data = req.body?.data;
     if (!data) return res.sendStatus(200);
@@ -676,7 +710,7 @@ app.post('/webhook', async (req, res) => {
         ? `${SYSTEM_PROMPT}\n\nUSER CAPTION / INSTRUCTIONS: "${caption}"\nFulfill caption instructions and extract all data.`
         : SYSTEM_PROMPT;
 
-      contents = [promptHeader, { inlineData: { mimeType, data: base64Image } }];
+      contents = [promptHeader, { inlineData: { mimeType: mimeType, data: base64Image } }];
     } else if (text && isRecheckQuery && lastImageCache.has(cleanSenderNumber)) {
       const cached = lastImageCache.get(cleanSenderNumber);
       contents = [
@@ -697,11 +731,11 @@ app.post('/webhook', async (req, res) => {
     }
 
     const model = genAI.getGenerativeModel({
-      model: 'gemini-3.6-flash',
+      model: 'gemini-2.5-flash',
       generationConfig: {
         responseMimeType: 'application/json',
         temperature: 0.0,
-        maxOutputTokens: 4000
+        maxOutputTokens: 8192
       }
     });
 
@@ -709,12 +743,17 @@ app.post('/webhook', async (req, res) => {
     
     let rawText = result.response.text().trim();
     const firstBrace = rawText.indexOf('{');
-    const lastBrace = rawText.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1) {
-      rawText = rawText.slice(firstBrace, lastBrace + 1);
+    if (firstBrace !== -1) {
+      rawText = rawText.slice(firstBrace);
     }
     
-    const parsed = JSON.parse(rawText);
+    let parsed;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch (err) {
+      console.warn('[JSON Parse Warning] Repairing output text...');
+      parsed = JSON.parse(repairTruncatedJSON(rawText));
+    }
     console.log('[Parsed JSON]:', parsed);
 
     const defaultDate = getISTDateOnly();
