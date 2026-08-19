@@ -1,12 +1,10 @@
 const { resolveMediaToTempFile, cleanupTempFile } = require("./mediaDownload");
-// If your file is named geminiAudio.js:
 const { transcribeVoiceNote } = require("./geminiAudio");
-// If your file is named geminiVision.js:
 const { extractLedgerTextFromImage } = require("./geminiVision");
-// If your file is named geminiExtract.js:
 const { extractLedgerData } = require("./geminiExtract");
 const {
   ensureAllTabs,
+  routeParsedVisionData,
   logSale,
   logExpense,
   logDailyClosing,
@@ -24,10 +22,40 @@ async function handleIncomingMessage(normalized) {
     return;
   }
 
-  let rawText;
   let tempFileToCleanup = null;
 
   try {
+    // 1. IMAGE FLOW: Multi-tab register parser (Orders, Dispatch, Expenses, Closing)
+    if (type === "image") {
+      const ext = (normalized.mimeType || "image/jpeg").includes("png") ? "png" : "jpg";
+      const { tmpPath } = await resolveMediaToTempFile(normalized, ext);
+      tempFileToCleanup = tmpPath;
+
+      const parsedData = await extractLedgerTextFromImage(tmpPath, normalized.mimeType || "image/jpeg");
+
+      await routeParsedVisionData(parsedData);
+
+      const orderCount = parsedData.orders?.length || 0;
+      const dispatchCount = parsedData.supply_dispatch?.length || 0;
+      const expenseCount = parsedData.expenses?.length || 0;
+      const totalKharcha = parsedData.daily_closing?.total_kharcha || 0;
+      const closingBachat = parsedData.daily_closing?.closing_balance || 0;
+
+      const reply = 
+        `✅ *डायरी पेज सफलतापूर्वक दर्ज हो गया!*\n\n` +
+        `📅 *तारीख:* ${parsedData.date || "आज"}\n` +
+        `📦 *वसूली/ऑर्डर:* ${orderCount} प्रविष्टियां\n` +
+        `🚚 *गाड़ी डिस्पैच:* ${dispatchCount} लोड\n` +
+        `💸 *खर्चा:* ${expenseCount} मद (कुल ₹${totalKharcha})\n` +
+        `💼 *मुंशी अंतिम बचत:* ₹${closingBachat}`;
+
+      await gateway.sendText(from, reply);
+      return;
+    }
+
+    // 2. AUDIO & TEXT FLOW: Single entry parsing via voice/text notes
+    let rawText = "";
+
     if (type === "text") {
       rawText = normalized.text || "";
       if (!rawText.trim()) {
@@ -38,11 +66,6 @@ async function handleIncomingMessage(normalized) {
       const { tmpPath } = await resolveMediaToTempFile(normalized, "ogg");
       tempFileToCleanup = tmpPath;
       rawText = await transcribeVoiceNote(tmpPath);
-    } else if (type === "image") {
-      const ext = (normalized.mimeType || "image/jpeg").includes("png") ? "png" : "jpg";
-      const { tmpPath } = await resolveMediaToTempFile(normalized, ext);
-      tempFileToCleanup = tmpPath;
-      rawText = await extractLedgerTextFromImage(tmpPath, normalized.mimeType || "image/jpeg");
     } else {
       await gateway.sendText(from, "Yeh message format support nahi karta.");
       return;
@@ -55,8 +78,8 @@ async function handleIncomingMessage(normalized) {
       return;
     }
 
-    if (data.entry_type === "SALE") {
-      await logSale(data.sale_data);
+    if (data.entry_type === "SALE" || data.entry_type === "ORDER") {
+      await logSale(data.sale_data || data.order_data);
     } else if (data.entry_type === "EXPENSE") {
       await logExpense(data.expense_data);
     } else if (data.entry_type === "DAILY_CLOSING") {
