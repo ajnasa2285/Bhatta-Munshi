@@ -1,174 +1,800 @@
-const path = require("path");
-const fs = require("fs");
-const { google } = require("googleapis");
-const { config } = require("./config");
+require('dotenv').config();
+const fs = require('fs');
+const express = require('express');
+const axios = require('axios');
+const { google } = require('googleapis');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-const ORDERS_TAB = "Orders";
-const DISPATCH_TAB = "Supply_Dispatch";
-const EXPENSES_TAB = "Expenses";
-const CLOSING_TAB = "Daily_Closing";
+const app = express();
+app.use(express.json({ limit: '50mb' }));
 
-// Tab schema columns map
-const TAB_COLUMNS = {
-  [ORDERS_TAB]: {
-    range: "A:I",
-    colMap: { customer_name: 1, village: 2, grade: 3, quantity: 4, amount_payable: 5, amount_received: 6, pending_amount: 7, mode: 8 }
-  },
-  [DISPATCH_TAB]: {
-    range: "A:F",
-    colMap: { customer_name: 1, village: 2, grade: 3, dispatched_quantity: 4, quantity: 4, driver_name: 5 }
-  },
-  [EXPENSES_TAB]: {
-    range: "A:D",
-    colMap: { paid_to: 1, category: 1, amount: 2, remarks: 3 }
-  },
-  [CLOSING_TAB]: {
-    range: "A:I",
-    colMap: { date: 1, opening_balance: 2, total_jama: 3, total_cash: 4, total_kharcha: 5, subtotal: 6, maalik_ko_diya: 7, closing_balance: 8 }
-  }
-};
+// --- Environment Variables ---
+const PORT = process.env.PORT || 10000;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
+const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
+const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 
-async function getSheetsClient() {
-  const localCredsPath = path.join(__dirname, "credentials.json");
-  const secretCredsPath = "/etc/secrets/google-credentials.json";
-  let keyFileToUse = fs.existsSync(localCredsPath) ? localCredsPath : (fs.existsSync(secretCredsPath) ? secretCredsPath : null);
+// --- Authorized Phone Whitelist ---
+const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
+  ? process.env.ALLOWED_NUMBERS.split(',').map(num => num.trim())
+  : ['919277078095'];
 
-  if (!keyFileToUse) throw new Error("Credentials file not found.");
+// --- Deduplication Cache ---
+const processedMessageIds = new Set();
+const MAX_TRACKED_IDS = 500;
 
-  const auth = new google.auth.GoogleAuth({
-    keyFile: keyFileToUse,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-  });
-  return google.sheets({ version: "v4", auth });
+function isDuplicateMessage(messageId) {
+  if (!messageId) return false;
+  return processedMessageIds.has(messageId);
 }
 
-// ----------------------------------------------------
-// 1. UNIVERSAL CORRECTION FUNCTION ACROSS ALL 4 TABS
-// ----------------------------------------------------
-async function applyUniversalCorrection(correction) {
-  const sheets = await getSheetsClient();
-  const target = (correction?.target_name || correction?.target_customer || correction?.target_keyword || "").toLowerCase().trim();
-  const fieldToUpdate = (correction?.field_to_update || "").toLowerCase().trim();
-  const correctedValue = correction?.corrected_value;
+function markMessageProcessed(messageId) {
+  if (!messageId) return;
+  processedMessageIds.add(messageId);
+  if (processedMessageIds.size > MAX_TRACKED_IDS) {
+    const oldest = processedMessageIds.values().next().value;
+    processedMessageIds.delete(oldest);
+  }
+}
 
-  // Determine tabs to search (target specific tab or search all)
-  const tabPriority = correction?.target_tab ? [correction.target_tab] : [DISPATCH_TAB, ORDERS_TAB, EXPENSES_TAB, CLOSING_TAB];
+// --- Initialize Gemini Client ---
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || '');
 
-  for (const tabName of tabPriority) {
-    const configData = TAB_COLUMNS[tabName];
-    if (!configData) continue;
+// --- Initialize Google Sheets API ---
+let auth = null;
+let sheets = null;
+const CREDENTIALS_PATH = '/etc/secrets/credentials.json';
 
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: config.googleSheetId,
-      range: `${tabName}!${configData.range}`,
+if (fs.existsSync(CREDENTIALS_PATH)) {
+  try {
+    const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+    auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
-    const rows = res.data.values || [];
+    sheets = google.sheets({ version: 'v4', auth });
+    console.log('Google Sheets credentials loaded successfully.');
+  } catch (err) {
+    console.error('Failed to load credentials.json:', err.message);
+  }
+} else {
+  console.error('Warning: credentials.json Secret File not found at', CREDENTIALS_PATH);
+}
 
-    for (let i = rows.length - 1; i >= 1; i--) {
-      const row = rows[i];
-      const matchKey = (row[1] || "").toLowerCase().trim(); // Column B (Name / Paid To / Date)
-      const secondaryKey = (row[2] || "").toLowerCase().trim(); // Column C (Village / Remarks)
+// --- Date Formatter Helper ---
+function getISTDateOnly() {
+  const now = new Date();
+  return now.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }).replace(/\//g, '-');
+}
 
-      // Match target identifier or latest entry for Daily_Closing
-      if (tabName === CLOSING_TAB || matchKey.includes(target) || target.includes(matchKey) || secondaryKey.includes(target)) {
-        const rowIndex = i + 1;
-
-        // Find which column index to update
-        let targetColIndex = -1;
-        for (const [colName, idx] of Object.entries(configData.colMap)) {
-          if (fieldToUpdate.includes(colName) || colName.includes(fieldToUpdate)) {
-            targetColIndex = idx;
-            break;
-          }
-        }
-
-        // Fallback column defaults if AI sends generic names
-        if (targetColIndex === -1) {
-          if (fieldToUpdate.includes("मात्रा") || fieldToUpdate.includes("quantity") || fieldToUpdate.includes("qty")) {
-            targetColIndex = (tabName === ORDERS_TAB || tabName === DISPATCH_TAB) ? 4 : -1;
-          } else if (fieldToUpdate.includes("रुपए") || fieldToUpdate.includes("amount") || fieldToUpdate.includes("rate")) {
-            targetColIndex = tabName === EXPENSES_TAB ? 2 : (tabName === ORDERS_TAB ? 5 : -1);
-          } else if (fieldToUpdate.includes("ड्राइवर") || fieldToUpdate.includes("driver")) {
-            targetColIndex = tabName === DISPATCH_TAB ? 5 : -1;
-          } else if (fieldToUpdate.includes("ग्रेड") || fieldToUpdate.includes("grade")) {
-            targetColIndex = 3;
-          }
-        }
-
-        if (targetColIndex !== -1) {
-          row[targetColIndex] = correctedValue;
-
-          // Auto-recalculate Pending Amount if updating Orders Amount
-          if (tabName === ORDERS_TAB && (targetColIndex === 5 || targetColIndex === 6)) {
-            const payable = parseFloat(row[5]) || 0;
-            const received = parseFloat(row[6]) || 0;
-            row[7] = Math.max(0, payable - received);
-          }
-
-          // Append correction audit stamp in Column B
-          if (tabName !== CLOSING_TAB && !row[1].includes("[संशोधित]")) {
-            row[1] = `${row[1]} [संशोधित]`;
-          }
-
-          await sheets.spreadsheets.values.update({
-            spreadsheetId: config.googleSheetId,
-            range: `${tabName}!A${rowIndex}:${String.fromCharCode(65 + row.length)}${rowIndex}`,
-            valueInputOption: "USER_ENTERED",
-            requestBody: { values: [row] },
-          });
-
-          return { success: true, tab: tabName, row: rowIndex, message: `${tabName} में ${fieldToUpdate} को बदल कर ${correctedValue} कर दिया गया है।` };
-        }
+// --- Sheets API Helper with Exponential Backoff Retry ---
+async function appendWithRetry(params, retries = 3, delay = 1000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await sheets.spreadsheets.values.append(params);
+    } catch (err) {
+      const status = err.status || err.code || (err.response && err.response.status);
+      if ((status === 503 || status === 500 || status === 429) && attempt < retries) {
+        console.warn(`[Sheets Warning] Attempt ${attempt} failed with ${status}. Retrying in ${delay}ms...`);
+        await new Promise(res => setTimeout(res, delay));
+        delay *= 2;
+      } else {
+        throw err;
       }
     }
   }
-  return { success: false, message: "सुधार के लिए संबंधित रिकॉर्ड नहीं मिला।" };
 }
 
-// ----------------------------------------------------
-// 2. UNIVERSAL DELETION FUNCTION ACROSS ALL 4 TABS
-// ----------------------------------------------------
-async function applyUniversalDeletion(deletion) {
-  const sheets = await getSheetsClient();
-  const target = (deletion?.target_name || deletion?.target_keyword || "").toLowerCase().trim();
-  const isDeleteLast = deletion?.delete_last === true || target.includes("last") || target.includes("पिछली");
+// --- Gemini Generate Helper with Retry Loop ---
+async function generateContentWithRetry(model, contents, retries = 3, delay = 1500) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await model.generateContent(contents);
+    } catch (err) {
+      const status = err.status || (err.response && err.response.status);
+      if ((status === 503 || status === 429 || status === 500) && attempt < retries) {
+        console.warn(`[Gemini Spike] 503/429 on attempt ${attempt}. Retrying in ${delay}ms...`);
+        await new Promise(res => setTimeout(res, delay));
+        delay *= 2;
+      } else {
+        throw err;
+      }
+    }
+  }
+}
 
-  const tabPriority = deletion?.target_tab ? [deletion.target_tab] : [DISPATCH_TAB, ORDERS_TAB, EXPENSES_TAB, CLOSING_TAB];
+// --- WhatsApp Reply Helper ---
+async function sendWhatsAppReply(recipient, text) {
+  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) {
+    console.error('[Reply Error] Missing WhatsApp gateway configuration.');
+    return;
+  }
+  try {
+    const cleanNumber = recipient.replace('@s.whatsapp.net', '').replace('@c.us', '');
+    await axios.post(
+      `${WHATSAPP_GATEWAY_BASE_URL}/message/sendText/${WHATSAPP_GATEWAY_TYPE}`,
+      { number: cleanNumber, text: text },
+      { headers: { apikey: WHATSAPP_GATEWAY_KEY } }
+    );
+    console.log(`[Reply] Sent to ${cleanNumber}`);
+  } catch (error) {
+    console.error('[Reply Error]:', JSON.stringify(error.response?.data || error.message, null, 2));
+  }
+}
 
-  for (const tabName of tabPriority) {
-    const configData = TAB_COLUMNS[tabName];
-    if (!configData) continue;
+// --- Enhanced Hindi & English Transliteration Normalization ---
+function normalizeHindi(str) {
+  if (!str) return '';
+  let s = str.toString().trim().toLowerCase();
 
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: config.googleSheetId,
-      range: `${tabName}!${configData.range}`,
+  const transMap = [
+    [/kanhai|kanahi|kandhai|कन्हाई|कनहाई/g, 'कन्धाई'],
+    [/anup|anoop/g, 'अनूप'],
+    [/singh/g, 'सिंह'],
+    [/balgobind|balgovind/g, 'बालगोविन्द'],
+    [/blooming|bird/g, 'ब्लूमिंग'],
+    [/meetha|mitha/g, 'मीठा'],
+    [/awwal|awal/g, 'अव्वल'],
+    [/peela|pila/g, 'पीला'],
+    [/roda|rodda/g, 'रोड़ा'],
+    [/bindha|vindha/g, 'विन्धा'],
+    [/chintu/g, 'चिन्टू'],
+    [/suraj/g, 'सूरज'],
+    [/diesel/g, 'डीजल'],
+    [/pending/g, 'पेंडिंग'],
+    [/completed|complete/g, 'कंप्लीट']
+  ];
+
+  for (const [regex, hindiVal] of transMap) {
+    s = s.replace(regex, hindiVal);
+  }
+
+  return s
+    .replace(/[\u0902\u0901]/g, 'न')
+    .replace(/[\u093E\u093F\u0940\u0941\u0942\u0943\u0947\u0948\u094B\u094C\u094D]/g, '')
+    .replace(/[\s\.\-_]/g, '');
+}
+
+// --- Supply / Dispatch Update & Upsert Logic ---
+async function logOrUpdateDispatch(dateStr, dispatch) {
+  if (!sheets || !SPREADSHEET_ID) return;
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: 'Supply_Dispatch!A2:J'
+  });
+
+  const rows = res.data.values || [];
+  let targetRowIndex = -1;
+  let targetRow = null;
+
+  const searchNameNorm = normalizeHindi(dispatch.name);
+  const targetGradeNorm = normalizeHindi(dispatch.grade);
+
+  for (let i = 0; i < rows.length; i++) {
+    const rowCustomerNorm = normalizeHindi(rows[i][1]);
+    const rowGradeNorm = normalizeHindi(rows[i][3]);
+
+    if (searchNameNorm && (rowCustomerNorm.includes(searchNameNorm) || searchNameNorm.includes(rowCustomerNorm))) {
+      if (!targetGradeNorm || rowGradeNorm.includes(targetGradeNorm) || targetGradeNorm.includes(rowGradeNorm)) {
+        targetRowIndex = i + 2;
+        targetRow = rows[i];
+        break;
+      }
+    }
+  }
+
+  const rawQty = dispatch.dispatched_qty;
+  const isTrolley = typeof rawQty === 'string' && (rawQty.includes('trolly') || rawQty.includes('ट्रॉली') || rawQty.includes('गाड़ी'));
+  const dispatchedQty = isTrolley ? rawQty : (Number(rawQty) || 0);
+  const newTotalOrdered = dispatch.total_ordered_qty ? (Number(dispatch.total_ordered_qty) || dispatchedQty) : dispatchedQty;
+
+  if (targetRowIndex !== -1 && targetRow) {
+    const prevDispatched = Number(targetRow[5]) || 0;
+    const finalOrdered = Math.max(newTotalOrdered, Number(targetRow[4]) || 0);
+    const finalDispatched = (typeof dispatchedQty === 'number' && typeof prevDispatched === 'number')
+      ? (prevDispatched > 0 && prevDispatched === dispatchedQty ? prevDispatched : prevDispatched + dispatchedQty)
+      : dispatchedQty;
+
+    const balanceRemaining = (typeof finalOrdered === 'number' && typeof finalDispatched === 'number')
+      ? Math.max(0, finalOrdered - finalDispatched)
+      : 0;
+
+    const newStatus = isTrolley || (typeof finalOrdered === 'number' && finalDispatched >= finalOrdered)
+      ? 'Completed'
+      : 'Partial';
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `Supply_Dispatch!E${targetRowIndex}:J${targetRowIndex}`,
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [[
+          finalOrdered,
+          dispatchedQty,
+          finalDispatched,
+          balanceRemaining,
+          dispatch.driver || targetRow[8] || '',
+          newStatus
+        ]]
+      }
     });
-    const rows = res.data.values || [];
-    if (rows.length <= 1) continue; // Skip if only headers exist
+    console.log(`[Supply_Dispatch] Adjusted row ${targetRowIndex} for ${dispatch.name}`);
+  } else {
+    const balanceRemaining = typeof newTotalOrdered === 'number' && typeof dispatchedQty === 'number'
+      ? Math.max(0, newTotalOrdered - dispatchedQty)
+      : 0;
 
-    for (let i = rows.length - 1; i >= 1; i--) {
-      const matchKey = (rows[i][1] || "").toLowerCase().trim();
-      const secondaryKey = (rows[i][2] || "").toLowerCase().trim();
+    let status = 'Completed';
+    if (dispatchedQty === 0 && !isTrolley) status = 'Pending';
+    else if (balanceRemaining > 0 && typeof balanceRemaining === 'number') status = 'Partial';
 
-      if (isDeleteLast || matchKey.includes(target) || target.includes(matchKey) || secondaryKey.includes(target)) {
-        const rowIndex = i + 1;
+    const rowDate = dispatch.date || dateStr;
 
-        // Clear the row content
-        await sheets.spreadsheets.values.clear({
-          spreadsheetId: config.googleSheetId,
-          range: `${tabName}!A${rowIndex}:${String.fromCharCode(65 + rows[i].length)}${rowIndex}`,
+    await appendWithRetry({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Supply_Dispatch!A:J',
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [[
+          rowDate,
+          dispatch.name || 'नकद ग्राहक',
+          dispatch.village || '',
+          dispatch.grade || 'अव्वल',
+          newTotalOrdered,
+          dispatchedQty,
+          dispatchedQty,
+          balanceRemaining,
+          dispatch.driver || '',
+          status
+        ]]
+      }
+    });
+    console.log(`[Supply_Dispatch] Logged new row for ${dispatch.name}`);
+  }
+}
+
+// --- Dynamic Row Update Logic Across All Tabs ---
+async function updateSheetEntry(targetTabs, filter, updates) {
+  if (!sheets || !SPREADSHEET_ID) return false;
+
+  let tabsToSearch = Array.isArray(targetTabs) ? targetTabs : (targetTabs ? [targetTabs] : []);
+  if (tabsToSearch.length === 0 || tabsToSearch.includes('ALL')) {
+    tabsToSearch = ['Supply_Dispatch', 'Orders', 'Expenses', 'Daily_Closing'];
+  }
+
+  const searchNameNorm = normalizeHindi(filter?.customer_name);
+  const searchPayeeNorm = normalizeHindi(filter?.paid_to);
+  const targetGradeNorm = normalizeHindi(updates?.grade);
+
+  for (const tab of tabsToSearch) {
+    try {
+      const range = `${tab}!A2:J`;
+      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range });
+      const rows = res.data.values || [];
+
+      let rowIndex = -1;
+      let targetRow = null;
+
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const row = rows[i];
+        const rowNameNorm = normalizeHindi(row[1]);
+        const rowPayeeNorm = normalizeHindi(row[2]);
+        const rowGradeNorm = normalizeHindi(row[3]);
+
+        const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
+        const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
+
+        if (matchName || matchPayee) {
+          if (targetGradeNorm && rowGradeNorm && !rowGradeNorm.includes(targetGradeNorm) && !targetGradeNorm.includes(rowGradeNorm)) {
+            continue;
+          }
+          rowIndex = i + 2;
+          targetRow = [...row];
+          break;
+        }
+      }
+
+      if (rowIndex !== -1 && targetRow) {
+        if (updates.date) targetRow[0] = updates.date;
+
+        if (tab === 'Orders') {
+          if (updates.village) targetRow[2] = updates.village;
+          if (updates.grade) targetRow[3] = updates.grade;
+          if (updates.quantity) targetRow[4] = updates.quantity;
+          if (updates.amount_payable) targetRow[5] = updates.amount_payable;
+          if (updates.amount_received) targetRow[6] = updates.amount_received;
+
+          const payable = Number(targetRow[5]) || 0;
+          const received = Number(targetRow[6]) || 0;
+          targetRow[7] = Math.max(0, payable - received);
+        } else if (tab === 'Supply_Dispatch') {
+          if (updates.village) targetRow[2] = updates.village;
+          if (updates.grade) targetRow[3] = updates.grade;
+          if (updates.quantity) {
+            const cleanQty = (typeof updates.quantity === 'string' && (updates.quantity.includes('trolly') || updates.quantity.includes('गाड़ी')))
+              ? updates.quantity
+              : Number(updates.quantity) || updates.quantity;
+
+            targetRow[4] = cleanQty;
+            targetRow[5] = cleanQty;
+            targetRow[6] = cleanQty;
+            targetRow[7] = 0;
+            targetRow[9] = 'Completed';
+          }
+          if (updates.driver) targetRow[8] = updates.driver;
+          if (updates.status) targetRow[9] = updates.status;
+        } else if (tab === 'Expenses') {
+          if (updates.category) targetRow[1] = updates.category;
+          if (updates.paid_to) targetRow[2] = updates.paid_to;
+          if (updates.amount) targetRow[3] = updates.amount;
+          if (updates.remarks) targetRow[4] = updates.remarks;
+        }
+
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `${tab}!A${rowIndex}:J${rowIndex}`,
+          valueInputOption: 'USER_ENTERED',
+          resource: { values: [targetRow] }
         });
 
-        return { success: true, tab: tabName, row: rowIndex, message: `${tabName} से "${rows[i][1] || 'अंतिम प्रविष्टि'}" को हटा (डिलीट) दिया गया है।` };
+        console.log(`[Update Success] Updated ${tab} row ${rowIndex}`);
+        return true;
       }
+    } catch (err) {
+      console.error(`[Update Error in ${tab}]:`, err.message);
     }
   }
-  return { success: false, message: "डिलीट करने के लिए कोई संबंधित एंट्री नहीं मिली।" };
+
+  return false;
 }
 
-module.exports = {
-  // ... other exports ...
-  applyUniversalCorrection,
-  applyUniversalDeletion,
-  applyCorrection: applyUniversalCorrection // Backward compatibility alias
-};
+// --- Direct Multi-Tab Clear & Delete Logic ---
+async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
+  if (!sheets || !SPREADSHEET_ID) return { success: false, deletedFrom: [] };
+
+  const allTabs = ['Orders', 'Supply_Dispatch', 'Expenses', 'Daily_Closing'];
+  let tabsToProcess = [];
+
+  if (Array.isArray(targetTabs)) {
+    if (targetTabs.includes('ALL')) tabsToProcess = allTabs;
+    else tabsToProcess = targetTabs;
+  } else if (targetTabs === 'ALL' || !targetTabs) {
+    tabsToProcess = allTabs;
+  } else {
+    tabsToProcess = [targetTabs];
+  }
+
+  const searchNameNorm = normalizeHindi(filter?.customer_name);
+  const searchPayeeNorm = normalizeHindi(filter?.paid_to);
+  const deletedTabs = [];
+
+  // CLEAR ENTIRE TAB DATA (Preserves Row 1 Headers)
+  if (deleteAll || (!searchNameNorm && !searchPayeeNorm)) {
+    for (const tab of tabsToProcess) {
+      try {
+        await sheets.spreadsheets.values.clear({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `${tab}!A2:Z`
+        });
+        console.log(`[Clear Success] Cleared data rows from ${tab}`);
+        deletedTabs.push(tab);
+      } catch (err) {
+        console.error(`[Clear Error in ${tab}]:`, err.message);
+      }
+    }
+    return {
+      success: deletedTabs.length > 0,
+      deletedFrom: deletedTabs,
+      clearedAll: true
+    };
+  }
+
+  // DELETE MATCHING ROW ONLY
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+
+  for (const tab of tabsToProcess) {
+    const sheetMeta = meta.data.sheets.find(s => s.properties.title === tab);
+    if (!sheetMeta) continue;
+    const sheetId = sheetMeta.properties.sheetId;
+
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${tab}!A2:J`
+    });
+    const rows = res.data.values || [];
+    if (rows.length === 0) continue;
+
+    let rowIndexToDelete = -1;
+
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      const rowNameNorm = normalizeHindi(row[1]);
+      const rowPayeeNorm = normalizeHindi(row[2]);
+
+      const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
+      const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
+
+      if (matchName || matchPayee) {
+        rowIndexToDelete = i + 1;
+        break;
+      }
+    }
+
+    if (rowIndexToDelete !== -1) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: SPREADSHEET_ID,
+        resource: {
+          requests: [{
+            deleteDimension: {
+              range: {
+                sheetId: sheetId,
+                dimension: 'ROWS',
+                startIndex: rowIndexToDelete,
+                endIndex: rowIndexToDelete + 1
+              }
+            }
+          }]
+        }
+      });
+      console.log(`[Delete Success] Deleted row ${rowIndexToDelete + 1} from ${tab}`);
+      deletedTabs.push(tab);
+    }
+  }
+
+  return {
+    success: deletedTabs.length > 0,
+    deletedFrom: deletedTabs,
+    clearedAll: false
+  };
+}
+
+// --- System Prompt for Gemini ---
+const SYSTEM_PROMPT = `
+You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
+Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
+
+{
+  "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "update_entry" | "delete_entry" | "clarification" | "ignore",
+  "target_tabs": ["Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "ALL"],
+  "delete_all": boolean,
+  "search_filter": {
+    "customer_name": string,
+    "paid_to": string,
+    "row_number": number
+  },
+  "fields_to_update": {
+    "date": string,
+    "village": string,
+    "grade": string,
+    "quantity": string | number,
+    "amount_payable": number,
+    "amount_received": number,
+    "driver": string,
+    "category": string,
+    "paid_to": string,
+    "amount": number,
+    "remarks": string,
+    "status": "Completed" | "Pending" | "Partial"
+  },
+  "orders": [
+    {
+      "date": string,
+      "name": string,
+      "village": string,
+      "grade": string,
+      "quantity": number,
+      "amount_payable": number,
+      "amount_received": number,
+      "pending_amount": number,
+      "mode_of_payment": "Cash" | "UPI" | "Online"
+    }
+  ],
+  "dispatches": [
+    {
+      "date": string,
+      "name": string,
+      "village": string,
+      "grade": string,
+      "total_ordered_qty": string | number,
+      "dispatched_qty": string | number,
+      "driver": string
+    }
+  ],
+  "expenses": [
+    {
+      "date": string,
+      "category": string,
+      "paid_to": string,
+      "amount": number,
+      "remarks": string
+    }
+  ],
+  "daily_closing": {
+    "date": string,
+    "opening_balance": number,
+    "total_jama": number,
+    "total_kharcha": number,
+    "maalik_ko_diya": number,
+    "closing_balance": number,
+    "remarks": string
+  },
+  "reply_text": string
+}
+
+BRICK GRADE & TERMINOLOGY STANDARDIZATION:
+- "अव्वल" (अ० / I / Avwal)
+- "दोयम" (दो० / II / Doyam)
+- "सोयम" (सो० / III / Soyam)
+- "मीठा" (मी० / Meetha)
+- "गोड़िया" (गो० / Godiya)
+- "खंजड़" (खं० / Khanjjad / Khangar)
+- "पीला" (पी० / Peela)
+- "अव्वल रोड़ा" (अ० रो०)
+- "पीला रोड़ा" (पी० रो०)
+- "रोड़ा" (रो० / Roda / Trolley)
+- "गुम्मा" (Gumma)
+- "चाटका" (Chatka)
+
+CRITICAL OPERATIONAL RULES:
+1. DATE HANDLING: If a specific date is mentioned (e.g. "17-08-2026 ko"), format it as "DD-MM-YYYY". Otherwise set null.
+2. NAME STANDARDIZATION: Standardize Indian names in Hindi Devanagari in search_filter (e.g. "Anup Singh" -> "अनूप सिंह", "Kanhai" / "Kanahi" -> "कन्धाई").
+3. DELETIONS & CLEARING:
+   - "Delete all entries" -> intent: "delete_entry", target_tabs: ["ALL"], delete_all: true
+   - "Delete all entries from dispatch and expenses" -> intent: "delete_entry", target_tabs: ["Supply_Dispatch", "Expenses"], delete_all: true
+   - "Kanhai ka order aur dispatch delete karo" -> intent: "delete_entry", target_tabs: ["Orders", "Supply_Dispatch"], search_filter: { customer_name: "कन्धाई" }, delete_all: false
+4. CORRECTIONS: Set intent = "update_entry" with target_tabs, search_filter, and fields_to_update.
+5. CLARIFICATIONS: If message is ambiguous, set intent = "clarification" and ask clearly in "reply_text".
+`;
+
+// --- Webhook Endpoint ---
+app.post('/webhook', async (req, res) => {
+  try {
+    const data = req.body?.data;
+    if (!data) return res.sendStatus(200);
+
+    const sender = data.key?.remoteJid || '';
+    const messageId = data.key?.id || '';
+
+    // Ignore empty pings or group chats
+    if (!sender || sender.includes('@g.us')) return res.sendStatus(200);
+
+    const cleanSenderNumber = sender.replace('@s.whatsapp.net', '').replace('@c.us', '').trim();
+    if (!cleanSenderNumber) return res.sendStatus(200);
+
+    // Whitelist Authorization Check
+    if (ALLOWED_NUMBERS.length > 0 && !ALLOWED_NUMBERS.includes(cleanSenderNumber)) {
+      console.warn(`[Security] Ignored unauthorized message from ${cleanSenderNumber}`);
+      return res.sendStatus(200);
+    }
+
+    // Deduplication Check
+    if (isDuplicateMessage(messageId)) {
+      console.log(`[Dedup] Skipping duplicate message ${messageId}`);
+      return res.sendStatus(200);
+    }
+
+    let contents = [];
+    const message = data.message;
+    const text = message?.conversation || message?.extendedTextMessage?.text;
+    const audioMessage = message?.audioMessage;
+    const imageMessage = message?.imageMessage;
+
+    if (text) {
+      console.log(`[Incoming] Text from ${sender}: "${text}"`);
+      contents = [`${SYSTEM_PROMPT}\n\nInput message: "${text}"`];
+    } else if (audioMessage) {
+      console.log(`[Gemini] Processing voice note from ${sender}...`);
+      const base64Audio = req.body?.data?.message?.base64 || '';
+      if (!base64Audio) return res.sendStatus(200);
+      contents = [
+        SYSTEM_PROMPT,
+        { inlineData: { mimeType: 'audio/ogg; codecs=opus', data: base64Audio } }
+      ];
+    } else if (imageMessage) {
+      console.log(`[Gemini] Processing diary image from ${sender}...`);
+      const base64Image = req.body?.data?.message?.base64 || '';
+      if (!base64Image) return res.sendStatus(200);
+      const mimeType = imageMessage.mimetype || 'image/jpeg';
+      contents = [
+        SYSTEM_PROMPT,
+        { inlineData: { mimeType: mimeType, data: base64Image } }
+      ];
+    } else {
+      return res.sendStatus(200);
+    }
+
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-3.6-flash',
+      generationConfig: { responseMimeType: 'application/json' }
+    });
+
+    const result = await generateContentWithRetry(model, contents);
+    const responseText = result.response.text();
+    const parsed = JSON.parse(responseText.trim());
+    console.log('[Parsed JSON]:', parsed);
+
+    markMessageProcessed(messageId);
+    const defaultDate = getISTDateOnly();
+
+    // 1. Batch Update (Diary Photos)
+    if (parsed.intent === 'batch_update' && sheets) {
+      if (parsed.orders && parsed.orders.length > 0) {
+        const orderRows = parsed.orders.map(o => [
+          o.date || defaultDate,
+          o.name || 'नकद ग्राहक',
+          o.village || '',
+          o.grade || 'अव्वल',
+          o.quantity || 0,
+          o.amount_payable || (o.amount_received || 0),
+          o.amount_received || 0,
+          o.pending_amount || 0,
+          o.mode_of_payment || 'Cash'
+        ]);
+        await appendWithRetry({
+          spreadsheetId: SPREADSHEET_ID,
+          range: 'Orders!A:I',
+          valueInputOption: 'USER_ENTERED',
+          resource: { values: orderRows }
+        });
+      }
+
+      if (parsed.dispatches && parsed.dispatches.length > 0) {
+        for (const d of parsed.dispatches) {
+          await logOrUpdateDispatch(d.date || defaultDate, d);
+        }
+      }
+
+      if (parsed.expenses && parsed.expenses.length > 0) {
+        const expenseRows = parsed.expenses.map(e => [
+          e.date || defaultDate,
+          e.category || 'अन्य',
+          e.paid_to || '',
+          e.amount || 0,
+          e.remarks || ''
+        ]);
+        await appendWithRetry({
+          spreadsheetId: SPREADSHEET_ID,
+          range: 'Expenses!A:E',
+          valueInputOption: 'USER_ENTERED',
+          resource: { values: expenseRows }
+        });
+      }
+
+      if (parsed.daily_closing && (parsed.daily_closing.total_jama || parsed.daily_closing.closing_balance)) {
+        const dc = parsed.daily_closing;
+        await appendWithRetry({
+          spreadsheetId: SPREADSHEET_ID,
+          range: 'Daily_Closing!A:G',
+          valueInputOption: 'USER_ENTERED',
+          resource: {
+            values: [[
+              dc.date || defaultDate,
+              dc.opening_balance || 0,
+              dc.total_jama || 0,
+              dc.total_kharcha || 0,
+              dc.maalik_ko_diya || 0,
+              dc.closing_balance || 0,
+              dc.remarks || ''
+            ]]
+          }
+        });
+      }
+
+      if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+    }
+
+    // 2. Single Order Intent
+    else if (parsed.intent === 'order' && sheets) {
+      const order = parsed.orders?.[0] || parsed;
+      await appendWithRetry({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'Orders!A:I',
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: [[
+            order.date || defaultDate,
+            order.name || 'नकद ग्राहक',
+            order.village || '',
+            order.grade || 'अव्वल',
+            order.quantity || 0,
+            order.amount_payable || (order.amount_received || 0),
+            order.amount_received || 0,
+            order.pending_amount || 0,
+            order.mode_of_payment || 'Cash'
+          ]]
+        }
+      });
+      if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+    }
+
+    // 3. Single Dispatch Intent
+    else if (parsed.intent === 'dispatch' && sheets) {
+      const dispatch = parsed.dispatches?.[0] || parsed;
+      await logOrUpdateDispatch(dispatch.date || defaultDate, dispatch);
+      if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+    }
+
+    // 4. Single Expense Intent
+    else if (parsed.intent === 'expense' && sheets) {
+      const expense = parsed.expenses?.[0] || parsed;
+      await appendWithRetry({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'Expenses!A:E',
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: [[
+            expense.date || defaultDate,
+            expense.category || 'अन्य',
+            expense.paid_to || '',
+            expense.amount || 0,
+            expense.remarks || ''
+          ]]
+        }
+      });
+      if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+    }
+
+    // 5. Single Daily Closing Intent
+    else if (parsed.intent === 'daily_summary' && sheets) {
+      const dc = parsed.daily_closing || parsed;
+      await appendWithRetry({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'Daily_Closing!A:G',
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: [[
+            dc.date || defaultDate,
+            dc.opening_balance || 0,
+            dc.total_jama || 0,
+            dc.total_kharcha || 0,
+            dc.maalik_ko_diya || 0,
+            dc.closing_balance || 0,
+            dc.remarks || ''
+          ]]
+        }
+      });
+      if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+    }
+
+    // 6. Update Entry Intent
+    else if (parsed.intent === 'update_entry' && sheets) {
+      const success = await updateSheetEntry(parsed.target_tabs, parsed.search_filter, parsed.fields_to_update);
+      const reply = success
+        ? (parsed.reply_text || 'एंट्री सफलतापूर्वक अपडेट कर दी गई है।')
+        : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
+      await sendWhatsAppReply(sender, reply);
+    }
+
+    // 7. Delete Entry Intent (Full Clear & Multi-Tab Support)
+    else if (parsed.intent === 'delete_entry' && sheets) {
+      const result = await deleteSheetEntry(parsed.target_tabs, parsed.search_filter, parsed.delete_all || false);
+      let reply;
+      if (result.success) {
+        const tabsJoined = result.deletedFrom.join(' और ');
+        reply = parsed.reply_text || (result.clearedAll
+          ? `✅ ${tabsJoined} के सभी डेटा को सफलतापूर्वक साफ (क्लियर) कर दिया गया है।`
+          : `✅ ${tabsJoined} से संबंधित प्रविष्टि सफलतापूर्वक हटा दी गई है।`);
+      } else {
+        reply = 'माफ कीजिए, डिलीट करने के लिए कोई संबंधित एंट्री नहीं मिली।';
+      }
+      await sendWhatsAppReply(sender, reply);
+    }
+
+    // 8. Clarification / Unhandled Reply Fallback
+    else if (parsed.reply_text) {
+      await sendWhatsAppReply(sender, parsed.reply_text);
+    }
+
+    return res.sendStatus(200);
+  } catch (error) {
+    console.error('[Webhook Error]:', error);
+    return res.sendStatus(500);
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Munshi server running on port ${PORT}`);
+});
