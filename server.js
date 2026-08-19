@@ -21,22 +21,22 @@ const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
   ? process.env.ALLOWED_NUMBERS.split(',').map(num => num.trim())
   : ['919277078095'];
 
-// --- Deduplication Cache ---
+// --- Immediate Synchronous Deduplication Lock ---
 const processedMessageIds = new Set();
-const MAX_TRACKED_IDS = 500;
+const MAX_TRACKED_IDS = 1000;
 
-function isDuplicateMessage(messageId) {
+function checkAndLockMessage(messageId) {
   if (!messageId) return false;
-  return processedMessageIds.has(messageId);
-}
-
-function markMessageProcessed(messageId) {
-  if (!messageId) return;
+  if (processedMessageIds.has(messageId)) {
+    return true; // Duplicate detected
+  }
+  // Lock immediately to prevent parallel execution
   processedMessageIds.add(messageId);
   if (processedMessageIds.size > MAX_TRACKED_IDS) {
     const oldest = processedMessageIds.values().next().value;
     processedMessageIds.delete(oldest);
   }
+  return false;
 }
 
 // --- In-Memory Image Cache for Cross-Verification ---
@@ -275,7 +275,7 @@ async function updateSheetEntry(targetTabs, filter, updates) {
     tabsToSearch = ['Orders', 'Supply_Dispatch', 'Expenses', 'Daily_Closing'];
   }
 
-  // 1. Direct Row Number Targeted Update
+  // Direct Row Number Targeting
   if (filter?.row_number && filter.row_number >= 2) {
     const tab = tabsToSearch[0] || 'Supply_Dispatch';
     const rowIndex = filter.row_number;
@@ -329,7 +329,7 @@ async function updateSheetEntry(targetTabs, filter, updates) {
     }
   }
 
-  // 2. Targeted Search by Name, Payee, and Grade/Village
+  // Targeted Search by Name, Payee, and Grade
   const searchNameNorm = normalizeHindi(filter?.customer_name);
   const searchPayeeNorm = normalizeHindi(filter?.paid_to);
   const searchGradeNorm = normalizeHindi(filter?.grade || updates?.grade);
@@ -435,7 +435,7 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
 
   const deletedTabs = [];
 
-  // CASE 1: Explicit Full Clear of entire sheet data
+  // CASE 1: Full Sheet Clear
   if (deleteAll) {
     for (const tab of tabsToProcess) {
       try {
@@ -456,7 +456,7 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
     };
   }
 
-  // CASE 2: Targeted Row Deletion by Specific Filter (Name, Payee, Grade, Row Number)
+  // CASE 2: Targeted Row Deletion
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   const searchNameNorm = normalizeHindi(filter?.customer_name);
   const searchPayeeNorm = normalizeHindi(filter?.paid_to);
@@ -478,7 +478,7 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
     let rowIndexToDelete = -1;
 
     if (targetRowNumber && targetRowNumber >= 2 && targetRowNumber <= rows.length + 1) {
-      rowIndexToDelete = targetRowNumber - 1; // 0-based for batchUpdate
+      rowIndexToDelete = targetRowNumber - 1;
     } else if (searchNameNorm || searchPayeeNorm) {
       for (let i = rows.length - 1; i >= 0; i--) {
         const row = rows[i];
@@ -493,12 +493,11 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
           if (searchGradeNorm && rowGradeNorm && !rowGradeNorm.includes(searchGradeNorm) && !searchGradeNorm.includes(rowGradeNorm)) {
             continue;
           }
-          rowIndexToDelete = i + 1; // 0-based for API
+          rowIndexToDelete = i + 1;
           break;
         }
       }
     } else {
-      // Single previous row deletion (only last row)
       rowIndexToDelete = rows.length;
     }
 
@@ -530,7 +529,7 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
   };
 }
 
-// --- System Prompt for Gemini with Targeted Rectification & Deletion Rules ---
+// --- System Prompt for Gemini with Targeted Rectification & OCR Rules ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
@@ -615,28 +614,15 @@ BRICK GRADE & REGISTER ABBREVIATIONS:
 - "रोड़ा पी०" or "पी० रो०" -> "पीला रोड़ा"
 - "रोड़ा" -> "रोड़ा"
 
-CRITICAL TARGETED RECTIFICATION & DELETION RULES:
-1. RECTIFICATIONS & UPDATES:
-   - When user asks to change, fix, correct, adjust, or update any entry (e.g. "सन्तराम का गाँव बरईपारा कर दो", "अनूप सिंह का 500 मीठा की जगह 4000 मीठा कर दो", "डीजल का खर्चा 2500 करो", "Update the above entry in orders"):
-     * intent: "update_entry"
-     * search_filter: extract target customer_name, paid_to, grade, or row_number (standardized to Hindi Devanagari).
-     * fields_to_update: set new updated values.
-     * If multiple orders/items are provided to be updated, populate the orders array with the updated objects and keep intent as "update_entry".
-2. TARGETED DELETIONS:
-   - When user asks to delete a specific entry (e.g. "कन्धाई की एंट्री हटाओ", "मुलायम यादव का डिस्पैच डिलीट करो", "सूरज का खर्चा डिलीट करो"):
-     * intent: "delete_entry"
-     * delete_all: false
-     * search_filter: { customer_name: "कन्धाई" (or paid_to: "सूरज") }
-     * target_tabs: ["Orders", "Supply_Dispatch"] or specified tab.
-   - When user asks "Delete the previous entry" or "पिछली एंट्री हटाओ":
-     * intent: "delete_entry"
-     * delete_all: false
-     * target_tabs: ["Supply_Dispatch"] (or active tab)
-     * search_filter: { customer_name: "" }
-   - Only set delete_all: true when user explicitly commands "Delete all entries", "Sab clear karo", or "Sheet poori saaf karo".
-3. DIARY PHOTO RULES:
-   - Always parse top cash bookings into orders and dispatches accurately.
-   - Standardize all names to Hindi Devanagari.
+CRITICAL OPERATIONAL & OCR RULES:
+1. ALL NUMBERS ARE STANDARD ENGLISH/ARABIC DIGITS (0, 1, 2, 3, 4, 5, 6, 7, 8, 9). Do NOT misread English digit "4" as Devanagari "५". "4000" is FOUR THOUSAND.
+2. MULTIPLE UPDATES: When user asks to "Update the above entry" or "Update in orders", ALWAYS set intent to "update_entry" (NOT "order"). Extract all items into the orders array.
+3. TARGETED DELETIONS:
+   - "Delete all entries" -> intent: "delete_entry", target_tabs: ["ALL"], delete_all: true
+   - "Delete the previous entry" -> intent: "delete_entry", target_tabs: ["Supply_Dispatch"], delete_all: false, search_filter: { customer_name: "" }
+   - Specific entry deletion -> intent: "delete_entry", search_filter: { customer_name: "कन्धाई" }, delete_all: false
+4. TOP CASH ENTRIES TO ORDERS: In the top section, if a customer name with cash amount appears (e.g. "सन्तराम बरईपारा - 14500"), check the middle dispatch section for their grade/quantity (e.g. "2000 I"). Create an entry in "orders".
+5. NAME STANDARDIZATION: Always normalize Indian names to standard Hindi Devanagari.
 `;
 
 // --- Webhook Endpoint ---
@@ -658,7 +644,8 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    if (isDuplicateMessage(messageId)) {
+    // ATOMIC SYNCHRONOUS LOCK: Prevents parallel race condition duplicates
+    if (checkAndLockMessage(messageId)) {
       console.log(`[Dedup] Skipping duplicate message ${messageId}`);
       return res.sendStatus(200);
     }
@@ -729,7 +716,6 @@ app.post('/webhook', async (req, res) => {
     const parsed = JSON.parse(responseText.trim());
     console.log('[Parsed JSON]:', parsed);
 
-    markMessageProcessed(messageId);
     const defaultDate = getISTDateOnly();
 
     // 1. Batch Update & Recheck Intent
