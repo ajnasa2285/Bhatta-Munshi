@@ -10,11 +10,30 @@ app.use(express.json({ limit: '50mb' }));
 
 // --- Environment Variables ---
 const PORT = process.env.PORT || 10000;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
 const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
 const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
+
+// --- Primary Gemini Model ---
+const PRIMARY_MODEL = 'gemini-3.6-flash';
+
+// --- API Key Setup with Automatic Rotation for Rate Limits (429) ---
+const rawKeys = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '';
+const API_KEYS = rawKeys.split(',').map(k => k.trim()).filter(Boolean);
+let currentKeyIndex = 0;
+
+function getGenAIClient() {
+  const activeKey = API_KEYS[currentKeyIndex] || '';
+  return new GoogleGenerativeAI(activeKey);
+}
+
+function rotateApiKey() {
+  if (API_KEYS.length > 1) {
+    currentKeyIndex = (currentKeyIndex + 1) % API_KEYS.length;
+    console.log(`[API Key Rotation] Switched to Key #${currentKeyIndex + 1}`);
+  }
+}
 
 // --- Authorized Phone Whitelist ---
 const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
@@ -38,9 +57,6 @@ function checkAndLockMessage(messageId) {
 
 // --- In-Memory Image Cache for Cross-Verification ---
 const lastImageCache = new Map();
-
-// --- Initialize Gemini Client ---
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || '');
 
 // --- Initialize Google Sheets API ---
 let auth = null;
@@ -86,52 +102,52 @@ async function appendWithRetry(params, retries = 2, delay = 800) {
   }
 }
 
-// --- Gemini Generate Helper with Automatic Model Failover ---
-// --- Primary Gemini Model ---
-const PRIMARY_MODEL = 'gemini-3.6-flash';
-
-// --- Gemini Generate Helper with Active Model Failover ---
+// --- Gemini Generate Helper with Active Model Failover & Key Rotation ---
 async function generateContentWithRetry(primaryModelName, contents, retries = 2, delay = 2000) {
-  // Use currently active Gemini models (removed retired 1.5 & 2.0)
   const modelsToTry = [primaryModelName, 'gemini-3.7-flash', 'gemini-3.6-pro'];
   const uniqueModels = [...new Set(modelsToTry)];
 
-  for (const modelName of uniqueModels) {
-    const model = genAI.getGenerativeModel({
-      model: modelName,
-      generationConfig: {
-        responseMimeType: 'application/json',
-        temperature: 0.0,
-        maxOutputTokens: 8192
-      }
-    });
+  for (let keyAttempt = 0; keyAttempt < Math.max(1, API_KEYS.length); keyAttempt++) {
+    const genAIClient = getGenAIClient();
 
-    for (let attempt = 1; attempt <= retries; attempt++) {
-      try {
-        console.log(`[Gemini] Requesting ${modelName} (Attempt ${attempt})...`);
-        return await model.generateContent(contents);
-      } catch (err) {
-        const status = err.status || (err.response && err.response.status);
-        console.warn(`[Gemini Error] ${modelName} returned ${status || err.message} on attempt ${attempt}`);
-
-        // If rate limited (429), switch immediately to the next model
-        if (status === 429) {
-          console.warn(`[Gemini Rate Limit] 429 on ${modelName}. Switching to backup model immediately...`);
-          break;
+    for (const modelName of uniqueModels) {
+      const model = genAIClient.getGenerativeModel({
+        model: modelName,
+        generationConfig: {
+          responseMimeType: 'application/json',
+          temperature: 0.0,
+          maxOutputTokens: 8192
         }
+      });
 
-        // If server spike (503/500), wait and retry once before switching
-        if ((status === 503 || status === 500) && attempt < retries) {
-          await new Promise(res => setTimeout(res, delay));
-          delay *= 1.5;
-        } else {
-          break;
+      for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+          console.log(`[Gemini] Requesting ${modelName} (Key #${currentKeyIndex + 1}, Attempt ${attempt})...`);
+          return await model.generateContent(contents);
+        } catch (err) {
+          const status = err.status || (err.response && err.response.status);
+          console.warn(`[Gemini Error] ${modelName} returned ${status || err.message} on attempt ${attempt}`);
+
+          // If rate-limited (429), rotate key immediately and retry
+          if (status === 429) {
+            console.warn(`[Gemini Rate Limit] 429 on Key #${currentKeyIndex + 1}. Rotating API key...`);
+            rotateApiKey();
+            break;
+          }
+
+          // If server error (503/500), wait and retry
+          if ((status === 503 || status === 500) && attempt < retries) {
+            await new Promise(res => setTimeout(res, delay));
+            delay *= 1.5;
+          } else {
+            break;
+          }
         }
       }
     }
-    console.warn(`[Gemini Failover] Trying next available model in stack...`);
+    console.warn(`[Gemini Failover] Trying next available model or rotated key in stack...`);
   }
-  throw new Error('All Gemini model endpoints failed after retries.');
+  throw new Error('All Gemini model endpoints and API keys failed after retries.');
 }
 
 // --- WhatsApp Reply Helper ---
@@ -687,31 +703,35 @@ CRITICAL CONSOLIDATION & CORRELATION RULES:
    - "maalik_ko_diya" = cash given to owner (e.g. 81500).
    - "closing_balance" = final cash in hand remaining (e.g. 6400).
 6. Standardize all Indian names to Hindi Devanagari.
+7. Always convert Roman numerals or abbreviations like "I", "1", "रोडा I" to standard Hindi "अव्वल" or "अव्वल रोड़ा". Never output raw English/Roman numeral "I".
 `;
 
 // --- Webhook Endpoint (Supports all Evolution API route patterns) ---
 app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res) => {
+  // 1. Immediately acknowledge Evolution API to prevent timeout duplicate retries
+  res.sendStatus(200);
+
   try {
     const data = req.body?.data;
-    if (!data) return res.sendStatus(200);
+    if (!data) return;
+
+    // 2. Ignore messages sent BY the bot itself (prevents infinite reply loops)
+    if (data.key?.fromMe) return;
 
     const sender = data.key?.remoteJid || '';
     const messageId = data.key?.id || '';
 
-    // Ignore messages sent BY the bot itself (prevents reply-feedback loops)
-    if (data.key?.fromMe) return res.sendStatus(200);
-
-    if (!sender || sender.includes('@g.us')) return res.sendStatus(200);
+    if (!sender || sender.includes('@g.us')) return;
 
     const cleanSenderNumber = sender.replace('@s.whatsapp.net', '').replace('@c.us', '').trim();
-    if (!cleanSenderNumber) return res.sendStatus(200);
+    if (!cleanSenderNumber) return;
 
     if (ALLOWED_NUMBERS.length > 0 && !ALLOWED_NUMBERS.includes(cleanSenderNumber)) {
-      return res.sendStatus(200);
+      return;
     }
 
     if (checkAndLockMessage(messageId)) {
-      return res.sendStatus(200);
+      return;
     }
 
     let contents = [];
@@ -734,7 +754,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
     if (imageMessage) {
       const caption = imageMessage.caption || '';
       const base64Image = req.body?.data?.message?.base64 || '';
-      if (!base64Image) return res.sendStatus(200);
+      if (!base64Image) return;
       const mimeType = imageMessage.mimetype || 'image/jpeg';
 
       lastImageCache.set(cleanSenderNumber, { base64: base64Image, mimeType });
@@ -754,17 +774,16 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       contents = [`${SYSTEM_PROMPT}\n\nInput message: "${text}"`];
     } else if (audioMessage) {
       const base64Audio = req.body?.data?.message?.base64 || '';
-      if (!base64Audio) return res.sendStatus(200);
+      if (!base64Audio) return;
       contents = [
         SYSTEM_PROMPT,
         { inlineData: { mimeType: 'audio/ogg; codecs=opus', data: base64Audio } }
       ];
     } else {
-      return res.sendStatus(200);
+      return;
     }
 
-    // Pass the model NAME (string) — generateContentWithRetry builds the model object itself.
-    const result = await generateContentWithRetry('gemini-3.6-flash', contents);
+    const result = await generateContentWithRetry(PRIMARY_MODEL, contents);
 
     let rawText = result.response.text().trim();
     const firstBrace = rawText.indexOf('{');
@@ -950,11 +969,8 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
     else if (parsed.reply_text) {
       await sendWhatsAppReply(sender, parsed.reply_text);
     }
-
-    return res.sendStatus(200);
   } catch (error) {
     console.error('[Webhook Error]:', error);
-    return res.sendStatus(500);
   }
 });
 
