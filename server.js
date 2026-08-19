@@ -27,9 +27,7 @@ const MAX_TRACKED_IDS = 1000;
 
 function checkAndLockMessage(messageId) {
   if (!messageId) return false;
-  if (processedMessageIds.has(messageId)) {
-    return true;
-  }
+  if (processedMessageIds.has(messageId)) return true;
   processedMessageIds.add(messageId);
   if (processedMessageIds.size > MAX_TRACKED_IDS) {
     const oldest = processedMessageIds.values().next().value;
@@ -160,7 +158,16 @@ function normalizeHindi(str) {
     .replace(/[\s\.\-_]/g, '');
 }
 
-// --- Ultra-Fast Batched Dispatch Processor ---
+// --- Helper to parse numeric sum from mixed strings ---
+function parseTotalQty(val) {
+  if (typeof val === 'number') return val;
+  if (!val) return 0;
+  const numbers = val.toString().match(/\d+/g);
+  if (!numbers) return 0;
+  return numbers.reduce((sum, n) => sum + Number(n), 0);
+}
+
+// --- Batched Dispatch Processor with Single Row Mixed Support ---
 async function processBatchDispatches(dateStr, dispatches) {
   if (!sheets || !SPREADSHEET_ID || !dispatches || dispatches.length === 0) return;
 
@@ -194,59 +201,45 @@ async function processBatchDispatches(dateStr, dispatches) {
     }
 
     const rawQty = dispatch.dispatched_qty;
-    const isTrolley = typeof rawQty === 'string' && (rawQty.includes('trolly') || rawQty.includes('ट्रॉली') || rawQty.includes('गाड़ी') || rawQty.includes('रोड़ा'));
-    const dispatchedQty = isTrolley ? rawQty : (Number(rawQty) || 0);
-    const newTotalOrdered = dispatch.total_ordered_qty ? (Number(dispatch.total_ordered_qty) || dispatchedQty) : dispatchedQty;
+    const numericDispatched = parseTotalQty(rawQty);
+    const numericOrdered = parseTotalQty(dispatch.total_ordered_qty || rawQty);
 
     if (targetRowIndex !== -1 && targetRow) {
-      const prevDispatched = Number(targetRow[5]) || 0;
-      const finalOrdered = Math.max(newTotalOrdered, Number(targetRow[4]) || 0);
-      const finalDispatched = (typeof dispatchedQty === 'number' && typeof prevDispatched === 'number')
-        ? (prevDispatched > 0 && prevDispatched === dispatchedQty ? prevDispatched : prevDispatched + dispatchedQty)
-        : dispatchedQty;
-
-      const balanceRemaining = (typeof finalOrdered === 'number' && typeof finalDispatched === 'number')
-        ? Math.max(0, finalOrdered - finalDispatched)
-        : 0;
-
-      const newStatus = isTrolley || (typeof finalOrdered === 'number' && finalDispatched >= finalOrdered)
-        ? 'Completed'
-        : 'Partial';
+      const prevDispatchedNum = parseTotalQty(targetRow[6]) || 0;
+      const finalDispatchedNum = prevDispatchedNum + numericDispatched;
+      const balanceRemaining = Math.max(0, numericOrdered - finalDispatchedNum);
+      const status = balanceRemaining === 0 ? 'Completed' : 'Partial';
 
       updatesToRun.push(
         sheets.spreadsheets.values.update({
           spreadsheetId: SPREADSHEET_ID,
-          range: `Supply_Dispatch!E${targetRowIndex}:J${targetRowIndex}`,
+          range: `Supply_Dispatch!D${targetRowIndex}:J${targetRowIndex}`,
           valueInputOption: 'USER_ENTERED',
           resource: {
             values: [[
-              finalOrdered,
-              dispatchedQty,
-              finalDispatched,
+              dispatch.grade || targetRow[3],
+              dispatch.total_ordered_qty || targetRow[4],
+              rawQty,
+              finalDispatchedNum,
               balanceRemaining,
               dispatch.driver || targetRow[8] || '',
-              newStatus
+              status
             ]]
           }
         })
       );
     } else {
-      const balanceRemaining = typeof newTotalOrdered === 'number' && typeof dispatchedQty === 'number'
-        ? Math.max(0, newTotalOrdered - dispatchedQty)
-        : 0;
-
-      let status = 'Completed';
-      if (dispatchedQty === 0 && !isTrolley) status = 'Pending';
-      else if (balanceRemaining > 0 && typeof balanceRemaining === 'number') status = 'Partial';
+      const balanceRemaining = Math.max(0, numericOrdered - numericDispatched);
+      const status = balanceRemaining === 0 ? 'Completed' : 'Partial';
 
       rowsToAppend.push([
         dispatch.date || dateStr,
         dispatch.name || 'नकद ग्राहक',
         dispatch.village || '',
         dispatch.grade || 'अव्वल',
-        newTotalOrdered,
-        dispatchedQty,
-        dispatchedQty,
+        dispatch.total_ordered_qty || rawQty,
+        rawQty,
+        numericDispatched,
         balanceRemaining,
         dispatch.driver || '',
         status
@@ -303,7 +296,7 @@ async function updateSheetEntry(targetTabs, filter, updates) {
           if (updates.quantity) {
             row[4] = updates.quantity;
             row[5] = updates.quantity;
-            row[6] = updates.quantity;
+            row[6] = parseTotalQty(updates.quantity);
             row[7] = 0;
             row[9] = 'Completed';
           }
@@ -383,13 +376,9 @@ async function updateSheetEntry(targetTabs, filter, updates) {
           if (updates.village) targetRow[2] = updates.village;
           if (updates.grade) targetRow[3] = updates.grade;
           if (updates.quantity) {
-            const cleanQty = (typeof updates.quantity === 'string' && (updates.quantity.includes('trolly') || updates.quantity.includes('गाड़ी') || updates.quantity.includes('रोड़ा')))
-              ? updates.quantity
-              : Number(updates.quantity) || updates.quantity;
-
-            targetRow[4] = cleanQty;
-            targetRow[5] = cleanQty;
-            targetRow[6] = cleanQty;
+            targetRow[4] = updates.quantity;
+            targetRow[5] = updates.quantity;
+            targetRow[6] = parseTotalQty(updates.quantity);
             targetRow[7] = 0;
             targetRow[9] = 'Completed';
           }
@@ -521,7 +510,7 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
   return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: false };
 }
 
-// --- System Prompt for Gemini with Price & Correlation Engine ---
+// --- System Prompt for Gemini with Correlation & Mixed-Item Formatting ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
@@ -556,7 +545,7 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
       "name": string,
       "village": string,
       "grade": string,
-      "quantity": number,
+      "quantity": string | number,
       "amount_payable": number,
       "amount_received": number,
       "pending_amount": number,
@@ -603,21 +592,37 @@ PRICE LIST BENCHMARKS (Per 2,000 Bricks / गाड़ी):
 - अव्वल रोड़ा (Awwal Roda / रोडा I): ₹5,000 – ₹5,500
 - पीला रोड़ा (Peela Roda): ₹2,500 – ₹3,000
 
-CRITICAL ORDER QUANTITY CORRELATION RULES:
-1. When quantity is NOT written in the top Cash/Order section, correlate the customer's deposited cash with the Middle Dispatch section and the Price List to deduce ordered quantity and grade:
-   - सन्तराम (बरईपारा) - ₹14,500 -> 2,000 अव्वल (₹14,500).
-   - मुकीम (इटौंजा) - ₹15,000 and dispatch has 2000 I -> 2,000 अव्वल (₹15,000).
-   - कन्धाई (पूरे काशीराम) - ₹52,000 -> 8,000 मीठा (₹52,000 @ ₹13,000/2k).
-   - नन्हेखा (सरूरपुर) - ₹10,000 and dispatch has 1000 I -> 1,000 अव्वल (₹10,000 total received).
-   - मुलायम यादव (गँडोली) - ₹11,200 and dispatch has 1000 गो०, 1000 मी० -> 1,000 गोड़िया (₹4,500) + 1,000 मीठा (₹6,700) = ₹11,200 total! Create orders for these quantities.
-2. ALL NUMBERS ARE STANDARD ENGLISH DIGITS (0-9). Do NOT read English digit "4" as Devanagari "५". "4000" is FOUR THOUSAND.
-3. DAILY CLOSING 6-COLUMN EXACT ALIGNMENT:
+CRITICAL CONSOLIDATION & CORRELATION RULES:
+1. SINGLE ROW PER CUSTOMER FOR MIXED ORDERS (DO NOT GENERATE MULTIPLE ENTRIES):
+   - When a customer purchases multiple grades in one transaction (e.g. मुलायम यादव - ₹11,200 for 1000 गोड़िया & 1000 मीठा), create EXACTLY ONE order row:
+     * name: "मुलायम यादव"
+     * village: "गँडोली"
+     * grade: "गोड़िया & मीठा"
+     * quantity: "1000 गोड़िया / 1000 मीठा"
+     * amount_payable: 11200
+     * amount_received: 11200
+     * pending_amount: 0
+2. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES:
+   - For mixed dispatches on the same trip:
+     * name: "मुलायम यादव"
+     * village: "गँडोली"
+     * grade: "गोड़िया & मीठा"
+     * total_ordered_qty: "1000 गो०, 1000 मी०"
+     * dispatched_qty: "1000 गो०, 1000 मी०"
+     * driver: "चिन्टू"
+3. DEDUCING ORDER QUANTITIES FROM CASH & DISPATCH:
+   - सन्तराम (बरईपारा) - ₹14,500 -> 2,000 अव्वल.
+   - मुकीम (इटौंजा) - ₹15,000 -> 2,000 अव्वल.
+   - कन्धाई (पूरे काशीराम) - ₹52,000 -> 8,000 मीठा.
+   - नन्हेखा (सरूरपुर) - ₹10,000 -> 1,000 अव्वल.
+4. ALL NUMBERS ARE STANDARD ENGLISH DIGITS (0-9). Do NOT read English digit "4" as Devanagari "५".
+5. DAILY CLOSING 6-COLUMN EXACT ALIGNMENT:
    - "opening_balance" = top बचत (e.g. 300).
    - "total_jama" = sum of all cash receipts (e.g. 103000).
    - "total_kharcha" = total expenses (e.g. 15100).
    - "maalik_ko_diya" = cash given to owner (e.g. 81500).
    - "closing_balance" = final cash in hand remaining (e.g. 6400).
-4. Standardize all Indian names to Hindi Devanagari.
+6. Standardize all Indian names to Hindi Devanagari.
 `;
 
 // --- Webhook Endpoint ---
@@ -671,7 +676,7 @@ app.post('/webhook', async (req, res) => {
         ? `${SYSTEM_PROMPT}\n\nUSER CAPTION / INSTRUCTIONS: "${caption}"\nFulfill caption instructions and extract all data.`
         : SYSTEM_PROMPT;
 
-      contents = [promptHeader, { inlineData: { mimeType: mimeType, data: base64Image } }];
+      contents = [promptHeader, { inlineData: { mimeType, data: base64Image } }];
     } else if (text && isRecheckQuery && lastImageCache.has(cleanSenderNumber)) {
       const cached = lastImageCache.get(cleanSenderNumber);
       contents = [
@@ -693,7 +698,11 @@ app.post('/webhook', async (req, res) => {
 
     const model = genAI.getGenerativeModel({
       model: 'gemini-3.6-flash',
-      generationConfig: { responseMimeType: 'application/json' }
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0.1,
+        maxOutputTokens: 2000
+      }
     });
 
     const result = await generateContentWithRetry(model, contents);
