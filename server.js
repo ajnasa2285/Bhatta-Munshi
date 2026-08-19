@@ -19,7 +19,7 @@ const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 // --- Authorized Phone Whitelist ---
 const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
   ? process.env.ALLOWED_NUMBERS.split(',').map(num => num.trim())
-  : ['919277078095']; // Add authorized Munshi/Owner numbers here
+  : ['919277078095'];
 
 // --- Deduplication Cache ---
 const processedMessageIds = new Set();
@@ -27,13 +27,16 @@ const MAX_TRACKED_IDS = 500;
 
 function isDuplicateMessage(messageId) {
   if (!messageId) return false;
-  if (processedMessageIds.has(messageId)) return true;
+  return processedMessageIds.has(messageId);
+}
+
+function markMessageProcessed(messageId) {
+  if (!messageId) return;
   processedMessageIds.add(messageId);
   if (processedMessageIds.size > MAX_TRACKED_IDS) {
     const oldest = processedMessageIds.values().next().value;
     processedMessageIds.delete(oldest);
   }
-  return false;
 }
 
 // --- Initialize Gemini Client ---
@@ -60,7 +63,7 @@ if (fs.existsSync(CREDENTIALS_PATH)) {
   console.error('Warning: credentials.json Secret File not found at', CREDENTIALS_PATH);
 }
 
-// --- Date Formatter Helper (Only Date, No Time) ---
+// --- Date Formatter Helper ---
 function getISTDateOnly() {
   const now = new Date();
   return now.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }).replace(/\//g, '-');
@@ -130,8 +133,9 @@ function normalizeHindi(str) {
     [/kanhai|kanahi|kandhai|कन्हाई|कनहाई/g, 'कन्धाई'],
     [/anup|anoop/g, 'अनूप'],
     [/singh/g, 'सिंह'],
-    [/balgobind|balgovind/g, 'बालगोविन्द'],
+    [/balgobind|balgovind|balgovinda/g, 'बालगोविन्द'],
     [/blooming|bird/g, 'ब्लूमिंग'],
+    [/mahulara|mahulada/g, 'महुलारा'],
     [/meetha|mitha/g, 'मीठा'],
     [/awwal|awal/g, 'अव्वल'],
     [/peela|pila/g, 'पीला'],
@@ -184,7 +188,7 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
   }
 
   const rawQty = dispatch.dispatched_qty;
-  const isTrolley = typeof rawQty === 'string' && (rawQty.includes('trolly') || rawQty.includes('ट्रॉली') || rawQty.includes('गाड़ी'));
+  const isTrolley = typeof rawQty === 'string' && (rawQty.includes('trolly') || rawQty.includes('ट्रॉली') || rawQty.includes('गाड़ी') || rawQty.includes('रोड़ा'));
   const dispatchedQty = isTrolley ? rawQty : (Number(rawQty) || 0);
   const newTotalOrdered = dispatch.total_ordered_qty ? (Number(dispatch.total_ordered_qty) || dispatchedQty) : dispatchedQty;
 
@@ -254,46 +258,19 @@ async function logOrUpdateDispatch(dateStr, dispatch) {
 }
 
 // --- Dynamic Row Update Logic Across All Tabs ---
-async function updateSheetEntry(targetTab, filter, updates) {
+async function updateSheetEntry(targetTabs, filter, updates) {
   if (!sheets || !SPREADSHEET_ID) return false;
 
-  if (filter?.row_number && filter.row_number >= 2) {
-    const tab = targetTab || 'Supply_Dispatch';
-    const rowIndex = filter.row_number;
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${tab}!A${rowIndex}:J${rowIndex}`
-    });
-    const row = res.data.values?.[0];
-    if (row) {
-      if (updates.date) row[0] = updates.date;
-      if (updates.quantity) {
-        row[4] = updates.quantity;
-        row[7] = Math.max(0, Number(updates.quantity) - (Number(row[5]) || 0));
-        row[9] = row[7] === 0 ? 'Completed' : 'Partial';
-      }
-      if (updates.status) row[9] = updates.status;
-      if (updates.grade) row[3] = updates.grade;
-      if (updates.driver) row[8] = updates.driver;
-
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `${tab}!A${rowIndex}:J${rowIndex}`,
-        valueInputOption: 'USER_ENTERED',
-        resource: { values: [row] }
-      });
-      return true;
-    }
+  let tabsToSearch = Array.isArray(targetTabs) ? targetTabs : (targetTabs ? [targetTabs] : []);
+  if (tabsToSearch.length === 0 || tabsToSearch.includes('ALL')) {
+    tabsToSearch = ['Supply_Dispatch', 'Orders', 'Expenses', 'Daily_Closing'];
   }
-
-  const tabsToSearch = targetTab ? [targetTab, 'Supply_Dispatch', 'Orders', 'Expenses'] : ['Supply_Dispatch', 'Orders', 'Expenses', 'Daily_Closing'];
-  const uniqueTabs = [...new Set(tabsToSearch)];
 
   const searchNameNorm = normalizeHindi(filter?.customer_name);
   const searchPayeeNorm = normalizeHindi(filter?.paid_to);
   const targetGradeNorm = normalizeHindi(updates?.grade);
 
-  for (const tab of uniqueTabs) {
+  for (const tab of tabsToSearch) {
     try {
       const range = `${tab}!A2:J`;
       const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range });
@@ -338,7 +315,7 @@ async function updateSheetEntry(targetTab, filter, updates) {
           if (updates.village) targetRow[2] = updates.village;
           if (updates.grade) targetRow[3] = updates.grade;
           if (updates.quantity) {
-            const cleanQty = (typeof updates.quantity === 'string' && (updates.quantity.includes('trolly') || updates.quantity.includes('गाड़ी')))
+            const cleanQty = (typeof updates.quantity === 'string' && (updates.quantity.includes('trolly') || updates.quantity.includes('गाड़ी') || updates.quantity.includes('रोड़ा')))
               ? updates.quantity
               : Number(updates.quantity) || updates.quantity;
 
@@ -375,33 +352,34 @@ async function updateSheetEntry(targetTab, filter, updates) {
   return false;
 }
 
-// --- Enhanced Multi-Tab & Full Sheet Delete/Clear Logic ---
-async function deleteSheetEntry(targetTab, filter, deleteAll = false) {
+// --- Direct Multi-Tab Clear & Delete Logic ---
+async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
   if (!sheets || !SPREADSHEET_ID) return { success: false, deletedFrom: [] };
 
-  let tabsToSearch = [];
-  if (targetTab === 'BOTH') {
-    tabsToSearch = ['Supply_Dispatch', 'Orders'];
-  } else if (targetTab === 'ALL' || !targetTab) {
-    tabsToSearch = ['Orders', 'Supply_Dispatch', 'Expenses', 'Daily_Closing'];
+  const allTabs = ['Orders', 'Supply_Dispatch', 'Expenses', 'Daily_Closing'];
+  let tabsToProcess = [];
+
+  if (Array.isArray(targetTabs)) {
+    if (targetTabs.includes('ALL')) tabsToProcess = allTabs;
+    else tabsToProcess = targetTabs;
+  } else if (targetTabs === 'ALL' || !targetTabs) {
+    tabsToProcess = allTabs;
   } else {
-    tabsToSearch = [targetTab];
+    tabsToProcess = [targetTabs];
   }
 
-  const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   const searchNameNorm = normalizeHindi(filter?.customer_name);
   const searchPayeeNorm = normalizeHindi(filter?.paid_to);
   const deletedTabs = [];
 
-  // CASE 1: Wipe all entries across requested tabs (e.g. "delete all entries", "sab clear karo")
-  if (deleteAll || (targetTab === 'ALL' && !searchNameNorm && !searchPayeeNorm)) {
-    for (const tab of tabsToSearch) {
+  if (deleteAll || (!searchNameNorm && !searchPayeeNorm)) {
+    for (const tab of tabsToProcess) {
       try {
         await sheets.spreadsheets.values.clear({
           spreadsheetId: SPREADSHEET_ID,
           range: `${tab}!A2:Z`
         });
-        console.log(`[Clear Success] Cleared all data rows from ${tab}`);
+        console.log(`[Clear Success] Cleared data rows from ${tab}`);
         deletedTabs.push(tab);
       } catch (err) {
         console.error(`[Clear Error in ${tab}]:`, err.message);
@@ -414,10 +392,9 @@ async function deleteSheetEntry(targetTab, filter, deleteAll = false) {
     };
   }
 
-  // CASE 2: Delete by specific Name/Payee OR Delete the single latest entry
-  const isDeleteLast = !searchNameNorm && !searchPayeeNorm;
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
 
-  for (const tab of tabsToSearch) {
+  for (const tab of tabsToProcess) {
     const sheetMeta = meta.data.sheets.find(s => s.properties.title === tab);
     if (!sheetMeta) continue;
     const sheetId = sheetMeta.properties.sheetId;
@@ -431,21 +408,17 @@ async function deleteSheetEntry(targetTab, filter, deleteAll = false) {
 
     let rowIndexToDelete = -1;
 
-    if (isDeleteLast) {
-      rowIndexToDelete = rows.length; // Points to latest row
-    } else {
-      for (let i = rows.length - 1; i >= 0; i--) {
-        const row = rows[i];
-        const rowNameNorm = normalizeHindi(row[1]);
-        const rowPayeeNorm = normalizeHindi(row[2]);
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      const rowNameNorm = normalizeHindi(row[1]);
+      const rowPayeeNorm = normalizeHindi(row[2]);
 
-        const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
-        const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
+      const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
+      const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
 
-        if (matchName || matchPayee) {
-          rowIndexToDelete = i + 1;
-          break;
-        }
+      if (matchName || matchPayee) {
+        rowIndexToDelete = i + 1;
+        break;
       }
     }
 
@@ -477,14 +450,14 @@ async function deleteSheetEntry(targetTab, filter, deleteAll = false) {
   };
 }
 
-// --- System Prompt for Gemini ---
+// --- System Prompt for Gemini with Complete Register Page Correlation ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
 
 {
   "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "update_entry" | "delete_entry" | "clarification" | "ignore",
-  "target_tab": "Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "BOTH" | "ALL",
+  "target_tabs": ["Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "ALL"],
   "delete_all": boolean,
   "search_filter": {
     "customer_name": string,
@@ -550,36 +523,30 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
   "reply_text": string
 }
 
-BRICK GRADE & TERMINOLOGY STANDARDIZATION:
-- "अव्वल" (अ० / I / Avwal)
-- "दोयम" (दो० / II / Doyam)
-- "सोयम" (सो० / III / Soyam)
-- "मीठा" (मी० / Meetha)
-- "गोड़िया" (गो० / Godiya)
-- "खंजड़" (खं० / Khanjjad / Khangar)
-- "पीला" (पी० / Peela)
-- "अव्वल रोड़ा" (अ० रो०)
-- "पीला रोड़ा" (पी० रो०)
-- "रोड़ा" (रो० / Roda / Trolley)
-- "गुम्मा" (Gumma)
-- "चाटका" (Chatka)
+BRICK GRADE & REGISTER ABBREVIATIONS:
+- "I" or "अ०" -> "अव्वल"
+- "II" or "दो०" -> "दोयम"
+- "III" or "सो०" -> "सोयम"
+- "मी०" -> "मीठा"
+- "गो०" -> "गोड़िया"
+- "खं०" -> "खंजड़"
+- "पी०" -> "पीला"
+- "रोड़ा पी०" or "पी० रो०" -> "पीला रोड़ा"
+- "रोड़ा" -> "रोड़ा"
 
-CRITICAL OPERATIONAL RULES:
-1. DATE HANDLING:
-   - If the user mentions a date (e.g. "17-08-2026 ko order kiya thaa"), extract it in "DD-MM-YYYY". Otherwise set null.
-2. NAME STANDARDIZATION: Always normalize Indian customer and vendor names to standard Hindi Devanagari (e.g. "Anup Singh" -> "अनूप सिंह", "Kanhai" / "Kanahi" -> "कन्धाई").
-3. DELETIONS & CLEARING:
-   - If user asks to delete all entries (e.g. "delete all entries from all pages", "sab entry delete karo", "sheet clear karo"):
-     * intent: "delete_entry"
-     * target_tab: "ALL"
-     * delete_all: true
-     * reply_text: "सभी पेजों से सभी एंट्रियां सफलतापूर्वक हटा (क्लियर) दी गई हैं।"
-   - If user asks to delete previous/last entry without name:
-     * intent: "delete_entry"
-     * target_tab: "Supply_Dispatch" (or specified tab)
-     * delete_all: false
-4. CORRECTIONS: Set intent = "update_entry" with search_filter and fields_to_update.
-5. CLARIFICATIONS: If message is ambiguous, set intent = "clarification" and ask in "reply_text".
+CRITICAL DIARY PHOTO RULES:
+1. TOP CASH ENTRIES TO ORDERS: In the top section, if a customer name with cash amount appears (e.g. "बाल गोविन्द महुलारा - 15500"), check the middle dispatch section for their grade/quantity (e.g. "2000 I"). Create an entry in "orders" with:
+   - name: "बालगोविन्द"
+   - village: "महुलारा"
+   - grade: "अव्वल"
+   - quantity: 2000
+   - amount_payable: 15500
+   - amount_received: 15500
+   - pending_amount: 0
+2. DISPATCHES: Log all lines under "बिक्री" in "dispatches" with their respective driver and grade.
+3. EXPENSES: Log all items under "खर्चा" (e.g. सूरज 500, डीजल 2000, 6 पर्ची चिन्टू विन्धा 1800) in "expenses".
+4. DAILY CLOSING: Extract opening_balance (top बचत), total_jama (कुल), total_kharcha (खर्चा), maalik_ko_diya (साहब को दिया), and closing_balance (bottom बचत).
+5. NAME STANDARDIZATION: Always normalize Indian names to standard Hindi Devanagari (e.g. "बाल गोविन्द" -> "बालगोविन्द", "Kanhai" -> "कन्धाई").
 `;
 
 // --- Webhook Endpoint ---
@@ -591,21 +558,18 @@ app.post('/webhook', async (req, res) => {
     const sender = data.key?.remoteJid || '';
     const messageId = data.key?.id || '';
 
-    // 1. Skip Groups
-    if (sender.includes('@g.us')) return res.sendStatus(200);
+    if (!sender || sender.includes('@g.us')) return res.sendStatus(200);
 
-    // 2. Clean sender number
     const cleanSenderNumber = sender.replace('@s.whatsapp.net', '').replace('@c.us', '').trim();
+    if (!cleanSenderNumber) return res.sendStatus(200);
 
-    // 3. Deduplication Check
-    if (isDuplicateMessage(messageId)) {
-      console.log(`[Dedup] Skipping duplicate message ${messageId}`);
+    if (ALLOWED_NUMBERS.length > 0 && !ALLOWED_NUMBERS.includes(cleanSenderNumber)) {
+      console.warn(`[Security] Ignored unauthorized message from ${cleanSenderNumber}`);
       return res.sendStatus(200);
     }
 
-    // 4. Whitelist Authorization Check
-    if (ALLOWED_NUMBERS.length > 0 && !ALLOWED_NUMBERS.includes(cleanSenderNumber)) {
-      console.warn(`[Security] Ignored unauthorized message from ${cleanSenderNumber}`);
+    if (isDuplicateMessage(messageId)) {
+      console.log(`[Dedup] Skipping duplicate message ${messageId}`);
       return res.sendStatus(200);
     }
 
@@ -649,6 +613,7 @@ app.post('/webhook', async (req, res) => {
     const parsed = JSON.parse(responseText.trim());
     console.log('[Parsed JSON]:', parsed);
 
+    markMessageProcessed(messageId);
     const defaultDate = getISTDateOnly();
 
     // 1. Batch Update (Diary Photos)
@@ -793,20 +758,20 @@ app.post('/webhook', async (req, res) => {
 
     // 6. Update Entry Intent
     else if (parsed.intent === 'update_entry' && sheets) {
-      const success = await updateSheetEntry(parsed.target_tab, parsed.search_filter, parsed.fields_to_update);
+      const success = await updateSheetEntry(parsed.target_tabs, parsed.search_filter, parsed.fields_to_update);
       const reply = success
         ? (parsed.reply_text || 'एंट्री सफलतापूर्वक अपडेट कर दी गई है।')
         : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
       await sendWhatsAppReply(sender, reply);
     }
 
-    // 7. Delete Entry Intent (Supports Full Clear and Single/Multi Row Deletes)
+    // 7. Delete Entry Intent
     else if (parsed.intent === 'delete_entry' && sheets) {
-      const result = await deleteSheetEntry(parsed.target_tab, parsed.search_filter, parsed.delete_all || false);
+      const result = await deleteSheetEntry(parsed.target_tabs, parsed.search_filter, parsed.delete_all || false);
       let reply;
       if (result.success) {
         const tabsJoined = result.deletedFrom.join(' और ');
-        reply = parsed.reply_text || (result.clearedAll 
+        reply = parsed.reply_text || (result.clearedAll
           ? `✅ ${tabsJoined} के सभी डेटा को सफलतापूर्वक साफ (क्लियर) कर दिया गया है।`
           : `✅ ${tabsJoined} से संबंधित प्रविष्टि सफलतापूर्वक हटा दी गई है।`);
       } else {
