@@ -87,10 +87,13 @@ async function appendWithRetry(params, retries = 2, delay = 800) {
 }
 
 // --- Gemini Generate Helper with Automatic Model Failover ---
-// NOTE: primaryModelName must be a STRING (e.g. 'gemini-3.6-flash'), never a model object.
-async function generateContentWithRetry(primaryModelName, contents, retries = 3, delay = 1500) {
-  const modelsToTry = [primaryModelName, 'gemini-3.7-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
-  // Remove duplicates while preserving order
+// --- Primary Gemini Model ---
+const PRIMARY_MODEL = 'gemini-3.6-flash';
+
+// --- Gemini Generate Helper with Active Model Failover ---
+async function generateContentWithRetry(primaryModelName, contents, retries = 2, delay = 2000) {
+  // Use currently active Gemini models (removed retired 1.5 & 2.0)
+  const modelsToTry = [primaryModelName, 'gemini-3.7-flash', 'gemini-3.6-pro'];
   const uniqueModels = [...new Set(modelsToTry)];
 
   for (const modelName of uniqueModels) {
@@ -111,16 +114,22 @@ async function generateContentWithRetry(primaryModelName, contents, retries = 3,
         const status = err.status || (err.response && err.response.status);
         console.warn(`[Gemini Error] ${modelName} returned ${status || err.message} on attempt ${attempt}`);
 
-        if ((status === 503 || status === 429 || status === 500) && attempt < retries) {
+        // If rate limited (429), switch immediately to the next model
+        if (status === 429) {
+          console.warn(`[Gemini Rate Limit] 429 on ${modelName}. Switching to backup model immediately...`);
+          break;
+        }
+
+        // If server spike (503/500), wait and retry once before switching
+        if ((status === 503 || status === 500) && attempt < retries) {
           await new Promise(res => setTimeout(res, delay));
           delay *= 1.5;
         } else {
-          // Break out of inner loop to switch to the next fallback model immediately
           break;
         }
       }
     }
-    console.warn(`[Gemini Failover] Switching to backup model...`);
+    console.warn(`[Gemini Failover] Trying next available model in stack...`);
   }
   throw new Error('All Gemini model endpoints failed after retries.');
 }
