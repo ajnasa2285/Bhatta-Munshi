@@ -453,7 +453,7 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
   };
 }
 
-// --- System Prompt for Gemini with Complete Register Page Correlation ---
+// --- System Prompt for Gemini with Explicit Numeral OCR Disambiguation ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
@@ -526,31 +526,26 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
   "reply_text": string
 }
 
-BRICK GRADE & REGISTER ABBREVIATIONS:
-- "I" or "अ०" -> "अव्वल"
-- "II" or "दो०" -> "दोयम"
-- "III" or "सो०" -> "सोयम"
-- "मी०" -> "मीठा"
-- "गो०" -> "गोड़िया"
-- "खं०" -> "खंजड़"
-- "पी०" -> "पीला"
-- "रोड़ा पी०" or "पी० रो०" -> "पीला रोड़ा"
-- "रोड़ा" -> "रोड़ा"
-
-CRITICAL DIARY PHOTO & CROSS-VERIFICATION RULES:
-1. TOP CASH ENTRIES TO ORDERS: In the top section, if a customer name with cash amount appears (e.g. "बाल गोविन्द महुलारा - 15500"), check the middle dispatch section for their grade/quantity (e.g. "2000 I"). Create an entry in "orders" with:
-   - name: "बालगोविन्द"
-   - village: "महुलारा"
-   - grade: "अव्वल"
-   - quantity: 2000
-   - amount_payable: 15500
-   - amount_received: 15500
-   - pending_amount: 0
-2. RECHECK / MATCH WITH IMAGE: If the user asks to recheck, match with image, or complains that an entry is missing from the photo (e.g. "recheck with image", "Order of balgovind is not present", "photo se milan karo"), set intent = "recheck_with_image".
-3. DISPATCHES: Log all lines under "बिक्री" in "dispatches" with their respective driver and grade.
-4. EXPENSES: Log all items under "खर्चा" (e.g. सूरज 500, डीजल 2000, 6 पर्ची चिन्टू विन्धा 1800) in "expenses".
-5. DAILY CLOSING: Extract opening_balance (top बचत), total_jama (कुल), total_kharcha (खर्चा), maalik_ko_diya (साहब को दिया), and closing_balance (bottom बचत).
-6. NAME STANDARDIZATION: Always normalize Indian names to standard Hindi Devanagari (e.g. "बाल गोविन्द" -> "बालगोविन्द", "Kanhai" -> "कन्धाई").
+CRITICAL HANDWRITTEN NUMERAL & OCR RULES:
+1. ALL NUMBERS ARE STANDARD ENGLISH/ARABIC NUMERALS (0, 1, 2, 3, 4, 5, 6, 7, 8, 9):
+   - The Munshi writes numbers in English digits, NOT Devanagari numerals.
+   - STRICT RULE: Do NOT misread English digit "4" as Devanagari numeral "५" (which means 5).
+   - "4000" or "4000 मी०" is FOUR THOUSAND (4000), NEVER five hundred (500) or five thousand.
+   - "2000" or "2000 I" is TWO THOUSAND (2000).
+   - "500" is FIVE HUNDRED (e.g. सूरज 500).
+2. BRICK GRADE & REGISTER ABBREVIATIONS:
+   - "I" or "अ०" -> "अव्वल"
+   - "II" or "दो०" -> "दोयम"
+   - "III" or "सो०" -> "सोयम"
+   - "मी०" -> "मीठा"
+   - "गो०" -> "गोड़िया"
+   - "खं०" -> "खंजड़"
+   - "पी०" -> "पीला"
+   - "रोड़ा पी०" or "पी० रो०" -> "पीला रोड़ा"
+   - "रोड़ा" -> "रोड़ा"
+3. TOP CASH ENTRIES TO ORDERS: If a customer name appears with cash in the top jama section (e.g. "बाल गोविन्द महुलारा - 15500"), cross-reference the dispatch section for quantity/grade (e.g. 2000 अव्वल) and create an entry in "orders" with name: "बालगोविन्द", village: "महुलारा", grade: "अव्वल", quantity: 2000, amount_payable: 15500, amount_received: 15500, pending_amount: 0.
+4. RECHECK / MATCH WITH IMAGE: If user asks to recheck/match with photo, set intent = "recheck_with_image" and ensure all entries are extracted accurately.
+5. NAME STANDARDIZATION: Always normalize Indian names to standard Hindi Devanagari (e.g. "बालगोविन्द", "अनूप सिंह", "कन्धाई").
 `;
 
 // --- Webhook Endpoint ---
@@ -583,35 +578,39 @@ app.post('/webhook', async (req, res) => {
     const audioMessage = message?.audioMessage;
     const imageMessage = message?.imageMessage;
 
-    // Check if user is asking to recheck with image
     const isRecheckQuery = text && (
       text.toLowerCase().includes('recheck') || 
       text.toLowerCase().includes('match') || 
       text.toLowerCase().includes('image') || 
       text.toLowerCase().includes('photo') || 
       text.toLowerCase().includes('not present') ||
-      text.includes('महिं मिला') ||
-      text.includes('फोटो से')
+      text.includes('नहीं मिला') ||
+      text.includes('फोटो से') ||
+      text.includes('चेक करो')
     );
 
     if (imageMessage) {
-      console.log(`[Gemini] Processing and caching diary image from ${sender}...`);
+      const caption = imageMessage.caption || '';
+      console.log(`[Gemini] Processing diary image from ${sender} (Caption: "${caption}")...`);
       const base64Image = req.body?.data?.message?.base64 || '';
       if (!base64Image) return res.sendStatus(200);
       const mimeType = imageMessage.mimetype || 'image/jpeg';
       
-      // Cache image for this sender
       lastImageCache.set(cleanSenderNumber, { base64: base64Image, mimeType });
 
+      const promptHeader = caption 
+        ? `${SYSTEM_PROMPT}\n\nUSER CAPTION / INSTRUCTIONS: "${caption}"\nCarefully fulfill the caption instructions and extract all diary data accurately.`
+        : SYSTEM_PROMPT;
+
       contents = [
-        SYSTEM_PROMPT,
+        promptHeader,
         { inlineData: { mimeType: mimeType, data: base64Image } }
       ];
     } else if (text && isRecheckQuery && lastImageCache.has(cleanSenderNumber)) {
       console.log(`[Gemini] Re-evaluating cached image against user query: "${text}"`);
       const cached = lastImageCache.get(cleanSenderNumber);
       contents = [
-        `${SYSTEM_PROMPT}\n\nUSER QUERY: "${text}"\nThe user is asking to recheck/verify against the attached register photo. Carefully extract any missing entries (especially from top cash / jama section) and return a complete "batch_update" or missing items.`,
+        `${SYSTEM_PROMPT}\n\nUSER QUERY: "${text}"\nThe user is asking to recheck/verify against the attached register photo. Carefully extract any missing entries (especially from top cash / jama section) and return a complete "batch_update".`,
         { inlineData: { mimeType: cached.mimeType, data: cached.base64 } }
       ];
     } else if (text) {
