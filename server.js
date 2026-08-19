@@ -86,22 +86,42 @@ async function appendWithRetry(params, retries = 2, delay = 800) {
   }
 }
 
-// --- Gemini Generate Helper with Retry Loop ---
-async function generateContentWithRetry(model, contents, retries = 2, delay = 1000) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await model.generateContent(contents);
-    } catch (err) {
-      const status = err.status || (err.response && err.response.status);
-      if ((status === 503 || status === 429 || status === 500) && attempt < retries) {
-        console.warn(`[Gemini Spike] ${status} on attempt ${attempt}. Retrying in ${delay}ms...`);
-        await new Promise(res => setTimeout(res, delay));
-        delay *= 2;
-      } else {
-        throw err;
+// --- Gemini Generate Helper with Automatic Model Failover ---
+async function generateContentWithRetry(primaryModelName, contents, retries = 3, delay = 1500) {
+  const modelsToTry = [primaryModelName, 'gemini-2.0-flash', 'gemini-1.5-flash'];
+  // Remove duplicates while preserving order
+  const uniqueModels = [...new Set(modelsToTry)];
+
+  for (const modelName of uniqueModels) {
+    const model = genAI.getGenerativeModel({
+      model: modelName,
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0.0,
+        maxOutputTokens: 8192
+      }
+    });
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        console.log(`[Gemini] Requesting ${modelName} (Attempt ${attempt})...`);
+        return await model.generateContent(contents);
+      } catch (err) {
+        const status = err.status || (err.response && err.response.status);
+        console.warn(`[Gemini Error] ${modelName} returned ${status || err.message} on attempt ${attempt}`);
+        
+        if ((status === 503 || status === 429 || status === 500) && attempt < retries) {
+          await new Promise(res => setTimeout(res, delay));
+          delay *= 1.5;
+        } else {
+          // Break out of inner loop to switch to the next fallback model immediately
+          break;
+        }
       }
     }
+    console.warn(`[Gemini Failover] Switching to backup model...`);
   }
+  throw new Error('All Gemini model endpoints failed after retries.');
 }
 
 // --- WhatsApp Reply Helper ---
