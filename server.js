@@ -16,9 +16,6 @@ const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
 const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
 const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 
-// --- Primary Gemini Model (change here to update everywhere) ---
-const PRIMARY_MODEL = 'gemini-3.6-flash';
-
 // --- Authorized Phone Whitelist ---
 const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
   ? process.env.ALLOWED_NUMBERS.split(',').map(num => num.trim())
@@ -90,9 +87,9 @@ async function appendWithRetry(params, retries = 2, delay = 800) {
 }
 
 // --- Gemini Generate Helper with Automatic Model Failover ---
-// primaryModelName MUST be a string (e.g. 'gemini-3.6-flash'), not a model object.
+// NOTE: primaryModelName must be a STRING (e.g. 'gemini-3.6-flash'), never a model object.
 async function generateContentWithRetry(primaryModelName, contents, retries = 3, delay = 1500) {
-  const modelsToTry = [primaryModelName, 'gemini-3.6-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+  const modelsToTry = [primaryModelName, 'gemini-3.7-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
   // Remove duplicates while preserving order
   const uniqueModels = [...new Set(modelsToTry)];
 
@@ -692,6 +689,9 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
     const sender = data.key?.remoteJid || '';
     const messageId = data.key?.id || '';
 
+    // Ignore messages sent BY the bot itself (prevents reply-feedback loops)
+    if (data.key?.fromMe) return res.sendStatus(200);
+
     if (!sender || sender.includes('@g.us')) return res.sendStatus(200);
 
     const cleanSenderNumber = sender.replace('@s.whatsapp.net', '').replace('@c.us', '').trim();
@@ -754,9 +754,8 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return res.sendStatus(200);
     }
 
-    // NOTE: generateContentWithRetry expects a model NAME STRING, not a model object.
-    // It builds the model internally (and handles fallback models) itself.
-    const result = await generateContentWithRetry(PRIMARY_MODEL, contents);
+    // Pass the model NAME (string) — generateContentWithRetry builds the model object itself.
+    const result = await generateContentWithRetry('gemini-3.6-flash', contents);
 
     let rawText = result.response.text().trim();
     const firstBrace = rawText.indexOf('{');
