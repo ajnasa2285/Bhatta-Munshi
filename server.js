@@ -10,30 +10,14 @@ app.use(express.json({ limit: '50mb' }));
 
 // --- Environment Variables ---
 const PORT = process.env.PORT || 10000;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
 const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
 const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 
-// --- Primary Gemini Model ---
-const PRIMARY_MODEL = 'gemini-3.6-flash';
-
-// --- API Key Setup with Automatic Rotation for Rate Limits (429) ---
-const rawKeys = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '';
-const API_KEYS = rawKeys.split(',').map(k => k.trim()).filter(Boolean);
-let currentKeyIndex = 0;
-
-function getGenAIClient() {
-  const activeKey = API_KEYS[currentKeyIndex] || '';
-  return new GoogleGenerativeAI(activeKey);
-}
-
-function rotateApiKey() {
-  if (API_KEYS.length > 1) {
-    currentKeyIndex = (currentKeyIndex + 1) % API_KEYS.length;
-    console.log(`[API Key Rotation] Switched to Key #${currentKeyIndex + 1}`);
-  }
-}
+// --- Primary Model ---
+const MODEL_NAME = 'gemini-3.6-flash';
 
 // --- Authorized Phone Whitelist ---
 const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
@@ -57,6 +41,9 @@ function checkAndLockMessage(messageId) {
 
 // --- In-Memory Image Cache for Cross-Verification ---
 const lastImageCache = new Map();
+
+// --- Initialize Gemini Client ---
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || '');
 
 // --- Initialize Google Sheets API ---
 let auth = null;
@@ -102,52 +89,31 @@ async function appendWithRetry(params, retries = 2, delay = 800) {
   }
 }
 
-// --- Gemini Generate Helper with Active Model Failover & Key Rotation ---
-async function generateContentWithRetry(primaryModelName, contents, retries = 2, delay = 2000) {
-  const modelsToTry = [primaryModelName, 'gemini-3.7-flash', 'gemini-3.6-pro'];
-  const uniqueModels = [...new Set(modelsToTry)];
+// --- Gemini Content Generation Helper ---
+async function generateContentWithRetry(contents, retries = 3, delay = 1500) {
+  const model = genAI.getGenerativeModel({
+    model: MODEL_NAME,
+    generationConfig: {
+      responseMimeType: 'application/json',
+      temperature: 0.0,
+      maxOutputTokens: 8192
+    }
+  });
 
-  for (let keyAttempt = 0; keyAttempt < Math.max(1, API_KEYS.length); keyAttempt++) {
-    const genAIClient = getGenAIClient();
-
-    for (const modelName of uniqueModels) {
-      const model = genAIClient.getGenerativeModel({
-        model: modelName,
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.0,
-          maxOutputTokens: 8192
-        }
-      });
-
-      for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-          console.log(`[Gemini] Requesting ${modelName} (Key #${currentKeyIndex + 1}, Attempt ${attempt})...`);
-          return await model.generateContent(contents);
-        } catch (err) {
-          const status = err.status || (err.response && err.response.status);
-          console.warn(`[Gemini Error] ${modelName} returned ${status || err.message} on attempt ${attempt}`);
-
-          // If rate-limited (429), rotate key immediately and retry
-          if (status === 429) {
-            console.warn(`[Gemini Rate Limit] 429 on Key #${currentKeyIndex + 1}. Rotating API key...`);
-            rotateApiKey();
-            break;
-          }
-
-          // If server error (503/500), wait and retry
-          if ((status === 503 || status === 500) && attempt < retries) {
-            await new Promise(res => setTimeout(res, delay));
-            delay *= 1.5;
-          } else {
-            break;
-          }
-        }
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await model.generateContent(contents);
+    } catch (err) {
+      const status = err.status || (err.response && err.response.status);
+      console.warn(`[Gemini Attempt ${attempt}] Status: ${status || err.message}`);
+      if ((status === 503 || status === 429 || status === 500) && attempt < retries) {
+        await new Promise(res => setTimeout(res, delay));
+        delay *= 2;
+      } else {
+        throw err;
       }
     }
-    console.warn(`[Gemini Failover] Trying next available model or rotated key in stack...`);
   }
-  throw new Error('All Gemini model endpoints and API keys failed after retries.');
 }
 
 // --- WhatsApp Reply Helper ---
@@ -247,7 +213,7 @@ function repairTruncatedJSON(jsonStr) {
   return jsonStr;
 }
 
-// --- Batched Dispatch Processor with Single Row Mixed Support ---
+// --- Batched Dispatch Processor with Cumulative Tracking ---
 async function processBatchDispatches(dateStr, dispatches) {
   if (!sheets || !SPREADSHEET_ID || !dispatches || dispatches.length === 0) return;
 
@@ -341,161 +307,129 @@ async function processBatchDispatches(dateStr, dispatches) {
   await Promise.all(tasks);
 }
 
-// --- Dynamic Targeted Rectification / Update Logic ---
-async function updateSheetEntry(targetTabs, filter, updates) {
-  if (!sheets || !SPREADSHEET_ID) return false;
+// --- Dynamic Row-by-Row Update Core ---
+async function updateSingleRow(tab, rowIndex, updates) {
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${tab}!A${rowIndex}:J${rowIndex}`
+    });
+    const row = res.data.values?.[0] || [];
+    while (row.length < 10) row.push('');
 
-  let tabsToSearch = Array.isArray(targetTabs) ? targetTabs : (targetTabs ? [targetTabs] : []);
-  if (tabsToSearch.length === 0 || tabsToSearch.includes('ALL')) {
-    tabsToSearch = ['Orders', 'Supply_Dispatch', 'Expenses', 'Daily_Closing'];
-  }
+    if (updates.date) row[0] = updates.date;
 
-  if (filter?.row_number && filter.row_number >= 2) {
-    const tab = tabsToSearch[0] || 'Supply_Dispatch';
-    const rowIndex = filter.row_number;
-    try {
-      const res = await sheets.spreadsheets.values.get({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `${tab}!A${rowIndex}:J${rowIndex}`
-      });
-      const row = res.data.values?.[0];
-      if (row) {
-        if (updates.date) row[0] = updates.date;
-        if (tab === 'Orders') {
-          if (updates.village) row[2] = updates.village;
-          if (updates.grade) row[3] = updates.grade;
-          if (updates.quantity) row[4] = updates.quantity;
-          if (updates.amount_payable) row[5] = updates.amount_payable;
-          if (updates.amount_received) row[6] = updates.amount_received;
-          const payable = Number(row[5]) || 0;
-          const received = Number(row[6]) || 0;
-          row[7] = Math.max(0, payable - received);
-        } else if (tab === 'Supply_Dispatch') {
-          if (updates.village) row[2] = updates.village;
-          if (updates.grade) row[3] = updates.grade;
-          if (updates.quantity) {
-            row[4] = updates.quantity;
-            row[5] = updates.quantity;
-            row[6] = parseTotalQty(updates.quantity);
-            row[7] = 0;
-            row[9] = 'Completed';
-          }
-          if (updates.driver) row[8] = updates.driver;
-          if (updates.status) row[9] = updates.status;
-        } else if (tab === 'Expenses') {
-          if (updates.category) row[1] = updates.category;
-          if (updates.paid_to) row[2] = updates.paid_to;
-          if (updates.amount) row[3] = updates.amount;
-          if (updates.remarks) row[4] = updates.remarks;
-        } else if (tab === 'Daily_Closing') {
-          if (updates.opening_balance !== undefined) row[1] = updates.opening_balance;
-          if (updates.total_jama !== undefined) row[2] = updates.total_jama;
-          if (updates.total_kharcha !== undefined) row[3] = updates.total_kharcha;
-          if (updates.maalik_ko_diya !== undefined) row[4] = updates.maalik_ko_diya;
-          if (updates.closing_balance !== undefined) row[5] = updates.closing_balance;
-        }
-
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: SPREADSHEET_ID,
-          range: `${tab}!A${rowIndex}:J${rowIndex}`,
-          valueInputOption: 'USER_ENTERED',
-          resource: { values: [row] }
-        });
-        return true;
+    if (tab === 'Orders') {
+      if (updates.customer_name || updates.name) row[1] = updates.customer_name || updates.name;
+      if (updates.village) row[2] = updates.village;
+      if (updates.grade) row[3] = updates.grade;
+      if (updates.quantity !== undefined) row[4] = updates.quantity;
+      if (updates.amount_payable !== undefined) row[5] = updates.amount_payable;
+      if (updates.amount_received !== undefined) row[6] = updates.amount_received;
+      const payable = Number(row[5]) || 0;
+      const received = Number(row[6]) || 0;
+      row[7] = Math.max(0, payable - received);
+      if (updates.mode_of_payment) row[8] = updates.mode_of_payment;
+    } else if (tab === 'Supply_Dispatch') {
+      if (updates.customer_name || updates.name) row[1] = updates.customer_name || updates.name;
+      if (updates.village) row[2] = updates.village;
+      if (updates.grade) row[3] = updates.grade;
+      if (updates.total_ordered_qty !== undefined) row[4] = updates.total_ordered_qty;
+      if (updates.dispatched_qty !== undefined || updates.quantity !== undefined) {
+        row[5] = updates.dispatched_qty || updates.quantity;
       }
-    } catch (err) {
-      console.error(`[Row Update Error in ${tab}]:`, err.message);
+      if (updates.total_dispatched !== undefined) {
+        row[6] = Number(updates.total_dispatched) || parseTotalQty(updates.total_dispatched);
+      } else if (updates.dispatched_qty !== undefined || updates.quantity !== undefined) {
+        row[6] = parseTotalQty(row[5]);
+      }
+      const orderedNum = parseTotalQty(row[4]);
+      const dispatchedNum = Number(row[6]) || 0;
+      row[7] = Math.max(0, orderedNum - dispatchedNum);
+      if (updates.driver !== undefined) row[8] = updates.driver;
+      row[9] = row[7] === 0 ? 'Completed' : 'Partial';
+      if (updates.status) row[9] = updates.status;
+    } else if (tab === 'Expenses') {
+      if (updates.category) row[1] = updates.category;
+      if (updates.paid_to) row[2] = updates.paid_to;
+      if (updates.amount !== undefined) row[3] = updates.amount;
+      if (updates.remarks) row[4] = updates.remarks;
+    } else if (tab === 'Daily_Closing') {
+      if (updates.opening_balance !== undefined) row[1] = updates.opening_balance;
+      if (updates.total_jama !== undefined) row[2] = updates.total_jama;
+      if (updates.total_kharcha !== undefined) row[3] = updates.total_kharcha;
+      if (updates.maalik_ko_diya !== undefined) row[4] = updates.maalik_ko_diya;
+      if (updates.closing_balance !== undefined) row[5] = updates.closing_balance;
     }
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${tab}!A${rowIndex}:J${rowIndex}`,
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [row] }
+    });
+    return true;
+  } catch (err) {
+    console.error(`[Update Row Error ${tab}:${rowIndex}]:`, err.message);
+    return false;
   }
-
-  const searchNameNorm = normalizeHindi(filter?.customer_name);
-  const searchPayeeNorm = normalizeHindi(filter?.paid_to);
-  const searchGradeNorm = normalizeHindi(filter?.grade || updates?.grade);
-  let updateCount = 0;
-
-  for (const tab of tabsToSearch) {
-    try {
-      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${tab}!A2:J` });
-      const rows = res.data.values || [];
-
-      let targetRowIndex = -1;
-      let targetRow = null;
-
-      for (let i = rows.length - 1; i >= 0; i--) {
-        const row = rows[i];
-        const rowNameNorm = normalizeHindi(row[1]);
-        const rowPayeeNorm = normalizeHindi(row[2]);
-        const rowGradeNorm = normalizeHindi(row[3]);
-
-        const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
-        const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
-
-        if (matchName || matchPayee) {
-          if (searchGradeNorm && rowGradeNorm && !rowGradeNorm.includes(searchGradeNorm) && !searchGradeNorm.includes(rowGradeNorm)) {
-            continue;
-          }
-          targetRowIndex = i + 2;
-          targetRow = [...row];
-          break;
-        }
-      }
-
-      if (targetRowIndex !== -1 && targetRow) {
-        if (updates.date) targetRow[0] = updates.date;
-
-        if (tab === 'Orders') {
-          if (updates.village) targetRow[2] = updates.village;
-          if (updates.grade) targetRow[3] = updates.grade;
-          if (updates.quantity) targetRow[4] = updates.quantity;
-          if (updates.amount_payable) targetRow[5] = updates.amount_payable;
-          if (updates.amount_received !== undefined && updates.amount_received !== null) targetRow[6] = updates.amount_received;
-          const payable = Number(targetRow[5]) || 0;
-          const received = Number(targetRow[6]) || 0;
-          targetRow[7] = Math.max(0, payable - received);
-        } else if (tab === 'Supply_Dispatch') {
-          if (updates.village) targetRow[2] = updates.village;
-          if (updates.grade) targetRow[3] = updates.grade;
-          if (updates.quantity) {
-            targetRow[4] = updates.quantity;
-            targetRow[5] = updates.quantity;
-            targetRow[6] = parseTotalQty(updates.quantity);
-            targetRow[7] = 0;
-            targetRow[9] = 'Completed';
-          }
-          if (updates.driver) targetRow[8] = updates.driver;
-          if (updates.status) targetRow[9] = updates.status;
-        } else if (tab === 'Expenses') {
-          if (updates.category) targetRow[1] = updates.category;
-          if (updates.paid_to) targetRow[2] = updates.paid_to;
-          if (updates.amount) targetRow[3] = updates.amount;
-          if (updates.remarks) targetRow[4] = updates.remarks;
-        } else if (tab === 'Daily_Closing') {
-          if (updates.opening_balance !== undefined) targetRow[1] = updates.opening_balance;
-          if (updates.total_jama !== undefined) targetRow[2] = updates.total_jama;
-          if (updates.total_kharcha !== undefined) targetRow[3] = updates.total_kharcha;
-          if (updates.maalik_ko_diya !== undefined) targetRow[4] = updates.maalik_ko_diya;
-          if (updates.closing_balance !== undefined) targetRow[5] = updates.closing_balance;
-        }
-
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: SPREADSHEET_ID,
-          range: `${tab}!A${targetRowIndex}:J${targetRowIndex}`,
-          valueInputOption: 'USER_ENTERED',
-          resource: { values: [targetRow] }
-        });
-        updateCount++;
-      }
-    } catch (err) {
-      console.error(`[Update Error in ${tab}]:`, err.message);
-    }
-  }
-
-  return updateCount > 0;
 }
 
-// --- Dynamic Targeted Deletion Logic ---
-async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
-  if (!sheets || !SPREADSHEET_ID) return { success: false, deletedFrom: [] };
+// --- Helper to Find Row Index by Filter ---
+async function findRowByFilter(tab, filter) {
+  try {
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${tab}!A2:J` });
+    const rows = res.data.values || [];
+    const searchNameNorm = normalizeHindi(filter?.customer_name || filter?.name);
+    const searchPayeeNorm = normalizeHindi(filter?.paid_to);
+    const searchGradeNorm = normalizeHindi(filter?.grade);
+
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      const rowNameNorm = normalizeHindi(row[1]);
+      const rowPayeeNorm = normalizeHindi(row[2]);
+      const rowGradeNorm = normalizeHindi(row[3]);
+
+      const matchName = searchNameNorm && (rowNameNorm.includes(searchNameNorm) || searchNameNorm.includes(rowNameNorm));
+      const matchPayee = searchPayeeNorm && (rowPayeeNorm.includes(searchPayeeNorm) || searchPayeeNorm.includes(rowPayeeNorm));
+
+      if (matchName || matchPayee) {
+        if (searchGradeNorm && rowGradeNorm && !rowGradeNorm.includes(searchGradeNorm) && !searchGradeNorm.includes(rowGradeNorm)) {
+          continue;
+        }
+        return i + 2;
+      }
+    }
+  } catch (err) {
+    console.error(`[Find Row Error in ${tab}]:`, err.message);
+  }
+  return -1;
+}
+
+// --- Multi-Row Batch Updates Engine ---
+async function executeBatchUpdates(updatesList) {
+  if (!sheets || !SPREADSHEET_ID || !Array.isArray(updatesList) || updatesList.length === 0) return 0;
+  let updatedCount = 0;
+
+  for (const item of updatesList) {
+    const tab = item.target_tab || 'Supply_Dispatch';
+    let targetRow = item.row_number;
+
+    if (!targetRow || targetRow < 2) {
+      targetRow = await findRowByFilter(tab, item.filter || item);
+    }
+
+    if (targetRow && targetRow >= 2) {
+      const ok = await updateSingleRow(tab, targetRow, item.fields || item.fields_to_update || item);
+      if (ok) updatedCount++;
+    }
+  }
+  return updatedCount;
+}
+
+// --- Multi-Row Batch Deletion Engine (Deletes in Descending Order) ---
+async function deleteSheetEntries(targetTabs, filter, deleteAll = false) {
+  if (!sheets || !SPREADSHEET_ID) return { success: false, deletedFrom: [], count: 0 };
 
   const allTabs = ['Orders', 'Supply_Dispatch', 'Expenses', 'Daily_Closing'];
   let tabsToProcess = [];
@@ -510,6 +444,7 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
   }
 
   const deletedTabs = [];
+  let totalDeletedCount = 0;
 
   if (deleteAll) {
     await Promise.all(
@@ -520,14 +455,20 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
         }).then(() => deletedTabs.push(tab)).catch(err => console.error(`[Clear Error in ${tab}]:`, err.message))
       )
     );
-    return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: true };
+    return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: true, count: 0 };
   }
 
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   const searchNameNorm = normalizeHindi(filter?.customer_name);
   const searchPayeeNorm = normalizeHindi(filter?.paid_to);
   const searchGradeNorm = normalizeHindi(filter?.grade);
-  const targetRowNumber = filter?.row_number;
+
+  let rowList = [];
+  if (Array.isArray(filter?.row_numbers) && filter.row_numbers.length > 0) {
+    rowList = filter.row_numbers;
+  } else if (filter?.row_number) {
+    rowList = [filter.row_number];
+  }
 
   for (const tab of tabsToProcess) {
     const sheetMeta = meta.data.sheets.find(s => s.properties.title === tab);
@@ -541,10 +482,28 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
     const rows = res.data.values || [];
     if (rows.length === 0) continue;
 
-    let rowIndexToDelete = -1;
+    const requests = [];
 
-    if (targetRowNumber && targetRowNumber >= 2 && targetRowNumber <= rows.length + 1) {
-      rowIndexToDelete = targetRowNumber - 1;
+    if (rowList.length > 0) {
+      // Sort in descending order to avoid row index shifts during deletion
+      const sortedRows = [...new Set(rowList)]
+        .map(Number)
+        .filter(n => n >= 2 && n <= rows.length + 1)
+        .sort((a, b) => b - a);
+
+      for (const r of sortedRows) {
+        requests.push({
+          deleteDimension: {
+            range: {
+              sheetId: sheetId,
+              dimension: 'ROWS',
+              startIndex: r - 1,
+              endIndex: r
+            }
+          }
+        });
+      }
+      totalDeletedCount += sortedRows.length;
     } else if (searchNameNorm || searchPayeeNorm) {
       for (let i = rows.length - 1; i >= 0; i--) {
         const row = rows[i];
@@ -559,38 +518,35 @@ async function deleteSheetEntry(targetTabs, filter, deleteAll = false) {
           if (searchGradeNorm && rowGradeNorm && !rowGradeNorm.includes(searchGradeNorm) && !searchGradeNorm.includes(rowGradeNorm)) {
             continue;
           }
-          rowIndexToDelete = i + 1;
-          break;
-        }
-      }
-    } else {
-      rowIndexToDelete = rows.length;
-    }
-
-    if (rowIndexToDelete !== -1 && rowIndexToDelete <= rows.length) {
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: SPREADSHEET_ID,
-        resource: {
-          requests: [{
+          requests.push({
             deleteDimension: {
               range: {
                 sheetId: sheetId,
                 dimension: 'ROWS',
-                startIndex: rowIndexToDelete,
-                endIndex: rowIndexToDelete + 1
+                startIndex: i + 1,
+                endIndex: i + 2
               }
             }
-          }]
+          });
+          totalDeletedCount++;
+          break;
         }
+      }
+    }
+
+    if (requests.length > 0) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: SPREADSHEET_ID,
+        resource: { requests }
       });
       deletedTabs.push(tab);
     }
   }
 
-  return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: false };
+  return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: false, count: totalDeletedCount };
 }
 
-// --- System Prompt for Gemini with Correlation & Mixed-Item Formatting ---
+// --- System Prompt for Gemini with Correlation, Multi-Updates & Multi-Deletions ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
@@ -603,13 +559,17 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
     "customer_name": string,
     "paid_to": string,
     "grade": string,
-    "row_number": number
+    "row_number": number,
+    "row_numbers": [number]
   },
   "fields_to_update": {
     "date": string,
     "village": string,
     "grade": string,
     "quantity": string | number,
+    "total_ordered_qty": string | number,
+    "dispatched_qty": string | number,
+    "total_dispatched": number,
     "amount_payable": number,
     "amount_received": number,
     "driver": string,
@@ -619,6 +579,22 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
     "remarks": string,
     "status": "Completed" | "Pending" | "Partial"
   },
+  "updates": [
+    {
+      "target_tab": "Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing",
+      "row_number": number,
+      "filter": { "customer_name": string, "grade": string },
+      "fields": {
+        "total_dispatched": number,
+        "dispatched_qty": string | number,
+        "total_ordered_qty": string | number,
+        "amount_received": number,
+        "amount_payable": number,
+        "quantity": string | number,
+        "driver": string
+      }
+    }
+  ],
   "orders": [
     {
       "date": string,
@@ -672,50 +648,26 @@ PRICE LIST BENCHMARKS (Per 2,000 Bricks / गाड़ी):
 - अव्वल रोड़ा (Awwal Roda / रोडा I): ₹5,000 – ₹5,500
 - पीला रोड़ा (Peela Roda): ₹2,500 – ₹3,000
 
-CRITICAL CONSOLIDATION & CORRELATION RULES:
-1. SINGLE ROW PER CUSTOMER FOR MIXED ORDERS (DO NOT GENERATE MULTIPLE ENTRIES):
-   - When a customer purchases multiple grades in one transaction (e.g. मुलायम यादव - ₹11,200 for 1000 गोड़िया & 1000 मीठा), create EXACTLY ONE order row:
-     * name: "मुलायम यादव"
-     * village: "गँडोली"
-     * grade: "गोड़िया & मीठा"
-     * quantity: "1000 गोड़िया / 1000 मीठा"
-     * amount_payable: 11200
-     * amount_received: 11200
-     * pending_amount: 0
-2. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES:
-   - For mixed dispatches on the same trip:
-     * name: "मुलायम यादव"
-     * village: "गँडोली"
-     * grade: "गोड़िया & मीठा"
-     * total_ordered_qty: "1000 गो०, 1000 मी०"
-     * dispatched_qty: "1000 गो०, 1000 मी०"
-     * driver: "चिन्टू"
-3. DEDUCING ORDER QUANTITIES FROM CASH & DISPATCH:
-   - सन्तराम (बरईपारा) - ₹14,500 -> 2,000 अव्वल.
-   - मुकीम (इटौंजा) - ₹15,000 -> 2,000 अव्वल.
-   - कन्धाई (पूरे काशीराम) - ₹52,000 -> 8,000 मीठा.
-   - नन्हेखा (सरूरपुर) - ₹10,000 -> 1,000 अव्वल.
-4. ALL NUMBERS ARE STANDARD ENGLISH DIGITS (0-9). Do NOT read English digit "4" as Devanagari "५".
-5. DAILY CLOSING 6-COLUMN EXACT ALIGNMENT:
-   - "opening_balance" = top बचत (e.g. 300).
-   - "total_jama" = sum of all cash receipts (e.g. 103000).
-   - "total_kharcha" = total expenses (e.g. 15100).
-   - "maalik_ko_diya" = cash given to owner (e.g. 81500).
-   - "closing_balance" = final cash in hand remaining (e.g. 6400).
-6. Standardize all Indian names to Hindi Devanagari.
-7. Always convert Roman numerals or abbreviations like "I", "1", "रोडा I" to standard Hindi "अव्वल" or "अव्वल रोड़ा". Never output raw English/Roman numeral "I".
+CRITICAL RULES:
+1. MULTI-ROW DELETIONS: When user asks to delete multiple rows (e.g. "पंक्ति 12, 13, 14 और 15 को डिलीट करो"), return "intent": "delete_entry", "search_filter": { "row_numbers": [12, 13, 14, 15] }.
+2. MULTI-ROW UPDATES: When user asks to update multiple rows in one command (e.g. "Supply_Dispatch में पंक्ति 7 को 2000, पंक्ति 8 को 2000, पंक्ति 9 को 6000 और पंक्ति 11 को 2000 Total Dispatched कर दो"), return "intent": "update_entry" and populate the "updates" array with target_tab, row_number, and the respective fields.
+3. SINGLE ROW PER CUSTOMER FOR MIXED ORDERS / DISPATCHES:
+   - Always group mixed items on one row (e.g. "1000 गोड़िया / 1000 मीठा").
+4. Always convert Roman numerals or abbreviations like "I", "1", "रोडा I" to standard Hindi "अव्वल" or "अव्वल रोड़ा". Never output raw English/Roman numeral "I".
+5. Standardize all Indian names to Hindi Devanagari.
+6. Numbers are standard digits (0-9).
 `;
 
 // --- Webhook Endpoint (Supports all Evolution API route patterns) ---
 app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res) => {
-  // 1. Immediately acknowledge Evolution API to prevent timeout duplicate retries
+  // 1. Immediately acknowledge Evolution API to prevent retries
   res.sendStatus(200);
 
   try {
     const data = req.body?.data;
     if (!data) return;
 
-    // 2. Ignore messages sent BY the bot itself (prevents infinite reply loops)
+    // 2. Ignore messages sent by the bot itself
     if (data.key?.fromMe) return;
 
     const sender = data.key?.remoteJid || '';
@@ -783,7 +735,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    const result = await generateContentWithRetry(PRIMARY_MODEL, contents);
+    const result = await generateContentWithRetry(contents);
 
     let rawText = result.response.text().trim();
     const firstBrace = rawText.indexOf('{');
@@ -936,31 +888,40 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
     else if (parsed.intent === 'update_entry' && sheets) {
-      if (parsed.orders && parsed.orders.length > 0) {
-        let updatedAny = false;
-        for (const order of parsed.orders) {
-          const filter = { customer_name: order.name, paid_to: null, grade: order.grade, row_number: null };
-          const success = await updateSheetEntry(parsed.target_tabs, filter, order);
-          if (success) updatedAny = true;
-        }
-        const reply = updatedAny ? (parsed.reply_text || 'एंट्री सफलतापूर्वक अपडेट कर दी गई है।') : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
-        await sendWhatsAppReply(sender, reply);
-      } else {
-        const success = await updateSheetEntry(parsed.target_tabs, parsed.search_filter, parsed.fields_to_update);
-        const reply = success ? (parsed.reply_text || 'एंट्री सफलतापूर्वक अपडेट कर दी गई है।') : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
-        await sendWhatsAppReply(sender, reply);
+      let updatesList = [];
+      if (Array.isArray(parsed.updates) && parsed.updates.length > 0) {
+        updatesList = parsed.updates;
+      } else if (parsed.orders && parsed.orders.length > 0) {
+        updatesList = parsed.orders.map(o => ({
+          target_tab: 'Orders',
+          filter: { customer_name: o.name, grade: o.grade },
+          fields: o
+        }));
+      } else if (parsed.fields_to_update) {
+        updatesList = [{
+          target_tab: (parsed.target_tabs && parsed.target_tabs[0]) || 'Supply_Dispatch',
+          row_number: parsed.search_filter?.row_number,
+          filter: parsed.search_filter,
+          fields: parsed.fields_to_update
+        }];
       }
+
+      const count = await executeBatchUpdates(updatesList);
+      const reply = count > 0
+        ? (parsed.reply_text || `✅ ${count} प्रविष्टि(याँ) सफलतापूर्वक अपडेट कर दी गई हैं।`)
+        : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
+      await sendWhatsAppReply(sender, reply);
     }
     else if (parsed.intent === 'delete_entry' && sheets) {
-      const result = await deleteSheetEntry(parsed.target_tabs, parsed.search_filter, parsed.delete_all || false);
+      const result = await deleteSheetEntries(parsed.target_tabs, parsed.search_filter, parsed.delete_all || false);
       if (parsed.delete_all) lastImageCache.delete(cleanSenderNumber);
 
       let reply;
       if (result.success) {
         const tabsJoined = result.deletedFrom.join(' और ');
         reply = parsed.reply_text || (result.clearedAll
-          ? `✅ ${tabsJoined} के सभी डेटा को सफलतापूर्वक साफ (क्लियर) कर दिया गया है।`
-          : `✅ ${tabsJoined} से संबंधित प्रविष्टि सफलतापूर्वक हटा दी गई है।`);
+          ? `✅ ${tabsJoined} के सभी डेटा को साफ कर दिया गया है।`
+          : `✅ ${tabsJoined} से ${result.count > 1 ? `${result.count} प्रविष्टियाँ` : 'प्रविष्टि'} सफलतापूर्वक हटा दी गई हैं।`);
       } else {
         reply = 'माफ कीजिए, डिलीट करने के लिए कोई संबंधित एंट्री नहीं मिली।';
       }
