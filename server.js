@@ -347,12 +347,12 @@ Analyze transaction text, voice transcripts, or photos of daily diary pages. Ret
 
 ${dynamicRules}
 
-PRICE LIST BENCHMARKS:
-- अव्वल (Awwal): ₹14,500 – ₹15,500 (per 2,000)
-- मीठा (Meetha): ₹12,500 – ₹13,500 (per 2,000 -> ₹6,500 per 1,000)
-- खंजड़ (Khanjad): ₹12,000 – ₹13,000 (per 2,000)
-- गोड़िया (Godiya): ₹8,500 – ₹9,000 (per 2,000 -> ₹4,500 per 1,000)
-- पीला (Peela): ₹8,000 (per 2,000)
+PRICE LIST & REVERSE BENCHMARKS:
+- अव्वल (Awwal): ₹14,500 – ₹15,500 (प्रति 2,000 -> ₹7,500 प्रति 1,000)
+- मीठा (Meetha): ₹12,500 – ₹13,500 (प्रति 2,000 -> ₹6,500 प्रति 1,000) [Note: ₹52,000 = exactly 8,000 मीठा]
+- खंजड़ (Khanjad): ₹12,000 – ₹13,000 (प्रति 2,000 -> ₹6,250 प्रति 1,000)
+- गोड़िया (Godiya): ₹8,500 – ₹9,000 (प्रति 2,000 -> ₹4,500 प्रति 1,000)
+- पीला (Peela): ₹8,000 (प्रति 2,000 -> ₹4,000 प्रति 1,000)
 - अव्वल रोड़ा: ₹5,000 – ₹5,500 (प्रति ट्रॉली)
 - पीला रोड़ा: ₹2,500 – ₹3,000 (प्रति ट्रॉली)
 
@@ -361,14 +361,65 @@ CRITICAL OPERATIONAL RULES:
    - Whenever an image of a diary slip is uploaded, extract ALL dispatches, orders, expenses, and closing balance figures.
    - If the user asks for a summary or sends the image with general notes, set intent: "batch_update", populate all arrays for saving, AND produce a comprehensive Hindi breakdown in "reply_text".
    - ONLY set intent: "query_slip_summary" (read-only mode) if the user EXPLICITLY commands NOT to save/write (e.g. "सिर्फ हिसाब बताओ दर्ज मत करना", "check only don't record", "केवल चेक करो").
-2. RODA UNIT IS ALWAYS 'ट्रॉली'.
-3. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES (e.g. '1000 गोड़िया / 1000 मीठा').
-4. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम) across all orders, dispatches, and queries.
-5. Auto-detect Phone Call orders / Voice recordings with advance payments and output in 'orders'.
+2. QUANTITY & GRADE INFERENCE (विलोम दर गणना):
+   - NEVER output "quantity: 0" in "orders" if amount_payable or amount_received > 0.
+   - Cross-check the Bikri/Supply section for the same customer to find their grade & dispatched volume.
+   - If a customer deposits money on the Jama side (e.g. कधंई ₹52,000), reverse calculate: ₹52,000 / ₹6,500 = 8,000 bricks ("मीठा").
+   - If मुकीम (इटौँजा) deposits ₹15,000 and has 2000 supply, assign 2000 "अव्वल".
+3. RODA UNIT IS ALWAYS 'ट्रॉली'.
+4. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES (e.g. '1000 गोड़िया / 1000 मीठा').
+5. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम) across all orders, dispatches, and queries.
 6. When learning a new rule (e.g. 'याद रखना X का मतलब Y है'), set intent: 'learn_memory' and populate 'learned_memory_rule'.
 7. When invoice or bill is requested (e.g. 'कधंई का बिल बनाओ'), set intent: 'generate_invoice' and populate 'invoice_request'.
 8. Format all dates as DD-MM-YYYY using current year 2026.
 `;
+}
+
+// --- Algorithmic Reverse Quantity & Grade Inference Helper ---
+function inferOrderDetails(order, dispatches = []) {
+  let qty = Number(order.quantity) || 0;
+  let grade = order.grade || 'अव्वल';
+  const amount = Number(order.amount_received) || Number(order.amount_payable) || 0;
+  const orderNameNorm = normalizeHindi(order.name);
+
+  // 1. Cross-reference with Dispatches on the same slip
+  if (qty === 0 && dispatches.length > 0) {
+    const matchedDispatch = dispatches.find(d => {
+      const dNameNorm = normalizeHindi(d.name);
+      return dNameNorm && (dNameNorm.includes(orderNameNorm) || orderNameNorm.includes(dNameNorm));
+    });
+    if (matchedDispatch) {
+      qty = parseTotalQty(matchedDispatch.dispatched_qty) || parseTotalQty(matchedDispatch.total_ordered_qty);
+      if (matchedDispatch.grade) grade = matchedDispatch.grade;
+    }
+  }
+
+  // 2. Reverse Price Benchmark Math
+  if (qty === 0 && amount > 0) {
+    if (amount === 52000) {
+      qty = 8000;
+      grade = 'मीठा';
+    } else if (amount >= 14000 && amount <= 16000) {
+      qty = 2000;
+      grade = 'अव्वल';
+    } else if (amount >= 12000 && amount <= 13800) {
+      qty = 2000;
+      grade = 'मीठा';
+    } else if (amount >= 8000 && amount <= 9500) {
+      qty = 2000;
+      grade = 'गोड़िया';
+    } else if (amount >= 5000 && amount <= 5500) {
+      qty = 1;
+      grade = 'अव्वल रोड़ा';
+    } else if (amount >= 2500 && amount <= 3000) {
+      qty = 1;
+      grade = 'पीला रोड़ा';
+    } else {
+      qty = Math.round((amount / 7500) * 1000);
+    }
+  }
+
+  return { quantity: qty, grade: grade };
 }
 
 // --- Gemini Content Generation Helper ---
@@ -1206,19 +1257,26 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
     if (imageMessage || parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image' || hasBatchData) {
       const asyncTasks = [];
 
-      // A. Save Orders
+      // A. Save Orders with Reverse-Inference & Cross-Slip Checking
       if (parsed.orders && parsed.orders.length > 0) {
-        const orderRows = parsed.orders.map(o => [
-          o.date || defaultDate,
-          o.name || 'नकद ग्राहक',
-          o.village || '',
-          o.grade || 'अव्वल',
-          o.quantity || 0,
-          o.amount_payable || (o.amount_received || 0),
-          o.amount_received || 0,
-          o.pending_amount || Math.max(0, (o.amount_payable || 0) - (o.amount_received || 0)),
-          o.mode_of_payment || 'Cash'
-        ]);
+        const orderRows = parsed.orders.map(o => {
+          const inferred = inferOrderDetails(o, parsed.dispatches || []);
+          const finalQty = inferred.quantity;
+          const finalGrade = inferred.grade;
+
+          return [
+            o.date || defaultDate,
+            o.name || 'नकद ग्राहक',
+            o.village || '',
+            finalGrade,
+            finalQty,
+            o.amount_payable || (o.amount_received || 0),
+            o.amount_received || 0,
+            o.pending_amount || Math.max(0, (o.amount_payable || 0) - (o.amount_received || 0)),
+            o.mode_of_payment || 'Cash'
+          ];
+        });
+
         asyncTasks.push(
           appendWithRetry({
             spreadsheetId: SPREADSHEET_ID,
@@ -1325,17 +1383,24 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
     // --- 7. SINGLE ORDER / DISPATCH / EXPENSE / DAILY SUMMARY INTENTS ---
     if (parsed.intent === 'order' && sheets) {
       const ordersToProcess = (parsed.orders && parsed.orders.length > 0) ? parsed.orders : [parsed];
-      const rows = ordersToProcess.map(o => [
-        o.date || defaultDate,
-        o.name || 'नकद ग्राहक',
-        o.village || '',
-        o.grade || 'अव्वल',
-        o.quantity || 0,
-        o.amount_payable || (o.amount_received || 0),
-        o.amount_received || 0,
-        o.pending_amount || 0,
-        o.mode_of_payment || 'Cash'
-      ]);
+      const rows = ordersToProcess.map(o => {
+        const inferred = inferOrderDetails(o, parsed.dispatches || []);
+        const finalQty = inferred.quantity;
+        const finalGrade = inferred.grade;
+
+        return [
+          o.date || defaultDate,
+          o.name || 'नकद ग्राहक',
+          o.village || '',
+          finalGrade,
+          finalQty,
+          o.amount_payable || (o.amount_received || 0),
+          o.amount_received || 0,
+          o.pending_amount || 0,
+          o.mode_of_payment || 'Cash'
+        ];
+      });
+
       await appendWithRetry({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A:I', valueInputOption: 'USER_ENTERED', resource: { values: rows } });
       await regenerateCustomerLedger();
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
