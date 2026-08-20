@@ -1,16 +1,18 @@
 {
   "name": "bhatta-munshi",
   "version": "1.0.0",
-  "description": "WhatsApp Munshi Bot for Brick Kiln Accounting",
+  "description": "AI Munshi and Operations Management for Brick Kiln",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
-    "axios": "^1.7.2",
+    "axios": "^1.7.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "googleapis": "^140.0.1"
-  }
+    "googleapis": "^140.0.0",
+    "node-cron": "^3.0.3"
+  },
+  "license": "ISC"
 }
