@@ -20,7 +20,7 @@ const OWNER_PHONE_NUMBER = process.env.OWNER_PHONE_NUMBER || '919277078095';
 const COAL_TUB_KG = Number(process.env.COAL_TUB_KG) || 40;
 
 // --- Primary Model ---
-const MODEL_NAME = process.env.MODEL_NAME || 'gemini-2.5-flash';
+const MODEL_NAME = process.env.MODEL_NAME || 'gemini-3.6-flash';
 
 // --- Authorized Phone Whitelist ---
 const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
