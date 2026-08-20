@@ -485,7 +485,6 @@ async function deleteSheetEntries(targetTabs, filter, deleteAll = false) {
     const requests = [];
 
     if (rowList.length > 0) {
-      // Sort in descending order to avoid row index shifts during deletion
       const sortedRows = [...new Set(rowList)]
         .map(Number)
         .filter(n => n >= 2 && n <= rows.length + 1)
@@ -546,19 +545,108 @@ async function deleteSheetEntries(targetTabs, filter, deleteAll = false) {
   return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: false, count: totalDeletedCount };
 }
 
-// --- System Prompt for Gemini with Correlation, Multi-Updates & Multi-Deletions ---
+// --- Query: Fetch Daily Closing Summary (Yesterday / Date / Latest) ---
+async function getDailyClosingSummary(dateStr) {
+  if (!sheets || !SPREADSHEET_ID) return null;
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Daily_Closing!A2:F'
+    });
+    const rows = res.data.values || [];
+    if (rows.length === 0) return null;
+
+    let targetRow = null;
+    if (dateStr) {
+      targetRow = rows.find(r => r[0] && r[0].trim() === dateStr.trim());
+    }
+
+    if (!targetRow) {
+      targetRow = rows[rows.length - 1];
+    }
+
+    return {
+      date: targetRow[0] || 'N/A',
+      opening_balance: targetRow[1] || '0',
+      total_jama: targetRow[2] || '0',
+      total_kharcha: targetRow[3] || '0',
+      maalik_ko_diya: targetRow[4] || '0',
+      closing_balance: targetRow[5] || '0'
+    };
+  } catch (err) {
+    console.error('[Fetch Summary Error]:', err.message);
+    return null;
+  }
+}
+
+// --- Query: Fetch Specific Customer Dispatch & Order Details ---
+async function getCustomerDetails(customerName) {
+  if (!sheets || !SPREADSHEET_ID || !customerName) return null;
+  const searchNorm = normalizeHindi(customerName);
+
+  try {
+    const [dispatchRes, orderRes] = await Promise.all([
+      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Supply_Dispatch!A2:J' }),
+      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A2:I' })
+    ]);
+
+    const dispatchRows = dispatchRes.data.values || [];
+    const orderRows = orderRes.data.values || [];
+
+    const dispatches = dispatchRows.filter(row => {
+      const nameNorm = normalizeHindi(row[1]);
+      return nameNorm && (nameNorm.includes(searchNorm) || searchNorm.includes(nameNorm));
+    });
+
+    const orders = orderRows.filter(row => {
+      const nameNorm = normalizeHindi(row[1]);
+      return nameNorm && (nameNorm.includes(searchNorm) || searchNorm.includes(nameNorm));
+    });
+
+    if (dispatches.length === 0 && orders.length === 0) return null;
+
+    return {
+      name: dispatches[0]?.[1] || orders[0]?.[1] || customerName,
+      village: dispatches[0]?.[2] || orders[0]?.[2] || '',
+      dispatches: dispatches.map(d => ({
+        date: d[0] || '',
+        grade: d[3] || 'अव्वल',
+        total_ordered: d[4] || '0',
+        dispatched_today: d[5] || '0',
+        total_dispatched: d[6] || '0',
+        balance_remaining: d[7] || '0',
+        driver: d[8] || '',
+        status: d[9] || 'Completed'
+      })),
+      orders: orders.map(o => ({
+        date: o[0] || '',
+        grade: o[3] || 'अव्वल',
+        quantity: o[4] || '0',
+        payable: o[5] || '0',
+        received: o[6] || '0',
+        pending_amount: o[7] || '0'
+      }))
+    };
+  } catch (err) {
+    console.error('[Customer Query Error]:', err.message);
+    return null;
+  }
+}
+
+// --- System Prompt for Gemini ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
 
 {
-  "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "update_entry" | "delete_entry" | "recheck_with_image" | "clarification" | "ignore",
+  "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "query_summary" | "query_customer" | "update_entry" | "delete_entry" | "recheck_with_image" | "clarification" | "ignore",
   "target_tabs": ["Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "ALL"],
   "delete_all": boolean,
   "search_filter": {
     "customer_name": string,
     "paid_to": string,
     "grade": string,
+    "date": string,
     "row_number": number,
     "row_numbers": [number]
   },
@@ -649,25 +737,23 @@ PRICE LIST BENCHMARKS (Per 2,000 Bricks / गाड़ी):
 - पीला रोड़ा (Peela Roda): ₹2,500 – ₹3,000
 
 CRITICAL RULES:
-1. MULTI-ROW DELETIONS: When user asks to delete multiple rows (e.g. "पंक्ति 12, 13, 14 और 15 को डिलीट करो"), return "intent": "delete_entry", "search_filter": { "row_numbers": [12, 13, 14, 15] }.
-2. MULTI-ROW UPDATES: When user asks to update multiple rows in one command (e.g. "Supply_Dispatch में पंक्ति 7 को 2000, पंक्ति 8 को 2000, पंक्ति 9 को 6000 और पंक्ति 11 को 2000 Total Dispatched कर दो"), return "intent": "update_entry" and populate the "updates" array with target_tab, row_number, and the respective fields.
-3. SINGLE ROW PER CUSTOMER FOR MIXED ORDERS / DISPATCHES:
-   - Always group mixed items on one row (e.g. "1000 गोड़िया / 1000 मीठा").
-4. Always convert Roman numerals or abbreviations like "I", "1", "रोडा I" to standard Hindi "अव्वल" or "अव्वल रोड़ा". Never output raw English/Roman numeral "I".
-5. Standardize all Indian names to Hindi Devanagari.
-6. Numbers are standard digits (0-9).
+1. QUERY SUMMARY (DAILY CLOSING / BACHAT): When user asks for past accounts, yesterday summary, or bachat (e.g. "कल का हिसाब बताओ", "कल की बचत कितनी थी", "daily closing details"), return "intent": "query_summary". If a specific date is mentioned, populate "search_filter": { "date": "DD-MM-YYYY" }.
+2. QUERY CUSTOMER DETAILS: When user asks about a customer's bricks/dispatch/payment status (e.g. "अनूप सिंह को कितनी ईंटें गई हैं?", "कन्धाई का स्टेटस बताओ", "Mukim brick dispatch details"), return "intent": "query_customer" with "search_filter": { "customer_name": "ग्राहक का नाम" }.
+3. MULTI-ROW DELETIONS: When user asks to delete multiple rows (e.g. "पंक्ति 12, 13, 14 और 15 को डिलीट करो"), return "intent": "delete_entry", "search_filter": { "row_numbers": [12, 13, 14, 15] }.
+4. MULTI-ROW UPDATES: When user asks to update multiple rows in one command (e.g. "पंक्ति 7 को 2000, पंक्ति 8 को 2000... Total Dispatched कर दो"), return "intent": "update_entry" and populate the "updates" array with target_tab, row_number, and the updated fields.
+5. SINGLE ROW PER CUSTOMER FOR MIXED ORDERS / DISPATCHES: Always group multiple grades purchased together into 1 single row (e.g. "1000 गोड़िया / 1000 मीठा").
+6. Always convert Roman numerals or abbreviations like "I", "1", "रोडा I" to standard Hindi "अव्वल" or "अव्वल रोड़ा". Never output raw English "I".
+7. Standardize all Indian names to Hindi Devanagari.
 `;
 
-// --- Webhook Endpoint (Supports all Evolution API route patterns) ---
+// --- Webhook Endpoint ---
 app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res) => {
-  // 1. Immediately acknowledge Evolution API to prevent retries
   res.sendStatus(200);
 
   try {
     const data = req.body?.data;
     if (!data) return;
 
-    // 2. Ignore messages sent by the bot itself
     if (data.key?.fromMe) return;
 
     const sender = data.key?.remoteJid || '';
@@ -754,7 +840,53 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
 
     const defaultDate = getISTDateOnly();
 
-    if ((parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image') && sheets) {
+    if (parsed.intent === 'query_summary' && sheets) {
+      const targetDate = parsed.search_filter?.date || parsed.daily_closing?.date;
+      const summary = await getDailyClosingSummary(targetDate);
+
+      if (summary) {
+        const reply = `📊 *दैनिक क्लोजिंग हिसाब (${summary.date})*\n\n` +
+          `• *प्रारम्भिक बचत (Opening):* ₹${summary.opening_balance}\n` +
+          `• *कुल जमा (Total Jama):* ₹${summary.total_jama}\n` +
+          `• *कुल खर्चा (Kharcha):* ₹${summary.total_kharcha}\n` +
+          `• *मालिक को दिया:* ₹${summary.maalik_ko_diya}\n` +
+          `• *अंतिम बचत (Closing Balance):* ₹${summary.closing_balance}`;
+        await sendWhatsAppReply(sender, reply);
+      } else {
+        await sendWhatsAppReply(sender, 'माफ कीजिए, दैनिक क्लोजिंग का कोई रिकॉर्ड शीट में नहीं मिला।');
+      }
+    }
+    else if (parsed.intent === 'query_customer' && sheets) {
+      const customerName = parsed.search_filter?.customer_name || parsed.name;
+      const data = await getCustomerDetails(customerName);
+
+      if (data) {
+        let reply = `🧱 *ग्राहक विवरण: ${data.name}* ${data.village ? `(${data.village})` : ''}\n`;
+
+        if (data.dispatches.length > 0) {
+          reply += `\n🚚 *सप्लाई / डिस्पैच रिकॉर्ड:*`;
+          data.dispatches.forEach((d, idx) => {
+            reply += `\n${idx + 1}. *तारीख:* ${d.date} | *ग्रेड:* ${d.grade}\n` +
+                     `   • *कुल ऑर्डर:* ${d.total_ordered}\n` +
+                     `   • *कुल भेजी गई (Supplied):* ${d.total_dispatched}\n` +
+                     `   • *बाकी (Balance):* ${d.balance_remaining}\n` +
+                     `   • *स्थिति:* ${d.status} ${d.driver ? `(ड्राइवर: ${d.driver})` : ''}`;
+          });
+        }
+
+        if (data.orders.length > 0) {
+          reply += `\n\n💰 *पेमेंट / ऑर्डर रिकॉर्ड:*`;
+          data.orders.forEach((o, idx) => {
+            reply += `\n${idx + 1}. *तारीख:* ${o.date} | *कुल रकम:* ₹${o.payable} | *जमा:* ₹${o.received} | *बाकी:* ₹${o.pending_amount}`;
+          });
+        }
+
+        await sendWhatsAppReply(sender, reply);
+      } else {
+        await sendWhatsAppReply(sender, `माफ कीजिए, "${customerName}" का कोई रिकॉर्ड शीट में नहीं मिला।`);
+      }
+    }
+    else if ((parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image') && sheets) {
       const asyncTasks = [];
 
       if (parsed.orders && parsed.orders.length > 0) {
