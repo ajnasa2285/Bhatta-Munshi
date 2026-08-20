@@ -158,6 +158,8 @@ function normalizeHindi(str) {
     [/chintu/g, 'चिन्टू'],
     [/suraj/g, 'सूरज'],
     [/diesel/g, 'डीजल'],
+    [/jai\s*prakash|jaiprakash/g, 'जय प्रकाश'],
+    [/gaushala|goshala/g, 'गौशाला'],
     [/pending/g, 'पेंडिंग'],
     [/completed|complete/g, 'कंप्लीट']
   ];
@@ -307,7 +309,7 @@ async function processBatchDispatches(dateStr, dispatches) {
   await Promise.all(tasks);
 }
 
-// --- Dynamic Row-by-Row Update Core ---
+// --- Dynamic Row-by-Row Update Core (Supports Comprehensive Field Aliases) ---
 async function updateSingleRow(tab, rowIndex, updates) {
   try {
     const res = await sheets.spreadsheets.values.get({
@@ -320,40 +322,64 @@ async function updateSingleRow(tab, rowIndex, updates) {
     if (updates.date) row[0] = updates.date;
 
     if (tab === 'Orders') {
-      if (updates.customer_name || updates.name) row[1] = updates.customer_name || updates.name;
-      if (updates.village) row[2] = updates.village;
-      if (updates.grade) row[3] = updates.grade;
-      if (updates.quantity !== undefined) row[4] = updates.quantity;
-      if (updates.amount_payable !== undefined) row[5] = updates.amount_payable;
-      if (updates.amount_received !== undefined) row[6] = updates.amount_received;
+      if (updates.customer_name || updates.name || updates.customer) {
+        row[1] = updates.customer_name || updates.name || updates.customer;
+      }
+      if (updates.village || updates.destination || updates.location || updates.address) {
+        row[2] = updates.village || updates.destination || updates.location || updates.address;
+      }
+      if (updates.grade || updates.brick_grade) {
+        row[3] = updates.grade || updates.brick_grade;
+      }
+      if (updates.quantity !== undefined || updates.qty !== undefined || updates.ordered_qty !== undefined) {
+        row[4] = updates.quantity || updates.qty || updates.ordered_qty;
+      }
+      if (updates.amount_payable !== undefined || updates.total_amount !== undefined) {
+        row[5] = updates.amount_payable || updates.total_amount;
+      }
+      if (updates.amount_received !== undefined || updates.received !== undefined) {
+        row[6] = updates.amount_received !== undefined ? updates.amount_received : updates.received;
+      }
       const payable = Number(row[5]) || 0;
       const received = Number(row[6]) || 0;
       row[7] = Math.max(0, payable - received);
-      if (updates.mode_of_payment) row[8] = updates.mode_of_payment;
+      if (updates.mode_of_payment || updates.payment_mode) {
+        row[8] = updates.mode_of_payment || updates.payment_mode;
+      }
     } else if (tab === 'Supply_Dispatch') {
-      if (updates.customer_name || updates.name) row[1] = updates.customer_name || updates.name;
-      if (updates.village) row[2] = updates.village;
-      if (updates.grade) row[3] = updates.grade;
-      if (updates.total_ordered_qty !== undefined) row[4] = updates.total_ordered_qty;
-      if (updates.dispatched_qty !== undefined || updates.quantity !== undefined) {
-        row[5] = updates.dispatched_qty || updates.quantity;
+      if (updates.customer_name || updates.name || updates.customer) {
+        row[1] = updates.customer_name || updates.name || updates.customer;
+      }
+      if (updates.village || updates.destination || updates.location || updates.address) {
+        row[2] = updates.village || updates.destination || updates.location || updates.address;
+      }
+      if (updates.grade || updates.brick_grade) {
+        row[3] = updates.grade || updates.brick_grade;
+      }
+      if (updates.total_ordered_qty !== undefined || updates.ordered_qty !== undefined) {
+        row[4] = updates.total_ordered_qty !== undefined ? updates.total_ordered_qty : updates.ordered_qty;
+      }
+      if (updates.dispatched_qty !== undefined || updates.quantity !== undefined || updates.qty !== undefined) {
+        row[5] = updates.dispatched_qty !== undefined ? updates.dispatched_qty : (updates.quantity !== undefined ? updates.quantity : updates.qty);
       }
       if (updates.total_dispatched !== undefined) {
         row[6] = Number(updates.total_dispatched) || parseTotalQty(updates.total_dispatched);
-      } else if (updates.dispatched_qty !== undefined || updates.quantity !== undefined) {
+      } else if (updates.dispatched_qty !== undefined || updates.quantity !== undefined || updates.qty !== undefined) {
         row[6] = parseTotalQty(row[5]);
       }
       const orderedNum = parseTotalQty(row[4]);
       const dispatchedNum = Number(row[6]) || 0;
       row[7] = Math.max(0, orderedNum - dispatchedNum);
-      if (updates.driver !== undefined) row[8] = updates.driver;
+      if (updates.driver !== undefined || updates.vehicle !== undefined) {
+        row[8] = updates.driver !== undefined ? updates.driver : updates.vehicle;
+      }
       row[9] = row[7] === 0 ? 'Completed' : 'Partial';
       if (updates.status) row[9] = updates.status;
     } else if (tab === 'Expenses') {
       if (updates.category) row[1] = updates.category;
-      if (updates.paid_to) row[2] = updates.paid_to;
+      if (updates.paid_to || updates.person) row[2] = updates.paid_to || updates.person;
       if (updates.amount !== undefined) row[3] = updates.amount;
-      if (updates.remarks) row[4] = updates.remarks;
+      if (updates.remarks || updates.description) row[4] = updates.remarks || updates.description;
     } else if (tab === 'Daily_Closing') {
       if (updates.opening_balance !== undefined) row[1] = updates.opening_balance;
       if (updates.total_jama !== undefined) row[2] = updates.total_jama;
@@ -380,9 +406,9 @@ async function findRowByFilter(tab, filter) {
   try {
     const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${tab}!A2:J` });
     const rows = res.data.values || [];
-    const searchNameNorm = normalizeHindi(filter?.customer_name || filter?.name);
+    const searchNameNorm = normalizeHindi(filter?.customer_name || filter?.name || filter?.customer);
     const searchPayeeNorm = normalizeHindi(filter?.paid_to);
-    const searchGradeNorm = normalizeHindi(filter?.grade);
+    const searchGradeNorm = normalizeHindi(filter?.grade || filter?.brick_grade);
 
     for (let i = rows.length - 1; i >= 0; i--) {
       const row = rows[i];
@@ -545,7 +571,7 @@ async function deleteSheetEntries(targetTabs, filter, deleteAll = false) {
   return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: false, count: totalDeletedCount };
 }
 
-// --- Query: Fetch Daily Closing Summary (Yesterday / Date / Latest) ---
+// --- Query: Fetch Daily Closing Summary ---
 async function getDailyClosingSummary(dateStr) {
   if (!sheets || !SPREADSHEET_ID) return null;
   try {
@@ -653,7 +679,9 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
   "fields_to_update": {
     "date": string,
     "village": string,
+    "destination": string,
     "grade": string,
+    "customer_name": string,
     "quantity": string | number,
     "total_ordered_qty": string | number,
     "dispatched_qty": string | number,
@@ -673,6 +701,10 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
       "row_number": number,
       "filter": { "customer_name": string, "grade": string },
       "fields": {
+        "customer_name": string,
+        "village": string,
+        "destination": string,
+        "grade": string,
         "total_dispatched": number,
         "dispatched_qty": string | number,
         "total_ordered_qty": string | number,
@@ -737,13 +769,14 @@ PRICE LIST BENCHMARKS (Per 2,000 Bricks / गाड़ी):
 - पीला रोड़ा (Peela Roda): ₹2,500 – ₹3,000
 
 CRITICAL RULES:
-1. QUERY SUMMARY (DAILY CLOSING / BACHAT): When user asks for past accounts, yesterday summary, or bachat (e.g. "कल का हिसाब बताओ", "कल की बचत कितनी थी", "daily closing details"), return "intent": "query_summary". If a specific date is mentioned, populate "search_filter": { "date": "DD-MM-YYYY" }.
-2. QUERY CUSTOMER DETAILS: When user asks about a customer's bricks/dispatch/payment status (e.g. "अनूप सिंह को कितनी ईंटें गई हैं?", "कन्धाई का स्टेटस बताओ", "Mukim brick dispatch details"), return "intent": "query_customer" with "search_filter": { "customer_name": "ग्राहक का नाम" }.
+1. QUERY SUMMARY: When user asks for past accounts, yesterday summary, or bachat (e.g. "कल का हिसाब बताओ", "कल की बचत कितनी थी"), return "intent": "query_summary". If a specific date is mentioned, populate "search_filter": { "date": "DD-MM-YYYY" }.
+2. QUERY CUSTOMER: When user asks about a customer's bricks/dispatch/payment status (e.g. "अनूप सिंह को कितनी ईंटें गई हैं?", "कन्धाई का स्टेटस बताओ"), return "intent": "query_customer" with "search_filter": { "customer_name": "ग्राहक का नाम" }.
 3. MULTI-ROW DELETIONS: When user asks to delete multiple rows (e.g. "पंक्ति 12, 13, 14 और 15 को डिलीट करो"), return "intent": "delete_entry", "search_filter": { "row_numbers": [12, 13, 14, 15] }.
 4. MULTI-ROW UPDATES: When user asks to update multiple rows in one command (e.g. "पंक्ति 7 को 2000, पंक्ति 8 को 2000... Total Dispatched कर दो"), return "intent": "update_entry" and populate the "updates" array with target_tab, row_number, and the updated fields.
 5. SINGLE ROW PER CUSTOMER FOR MIXED ORDERS / DISPATCHES: Always group multiple grades purchased together into 1 single row (e.g. "1000 गोड़िया / 1000 मीठा").
-6. Always convert Roman numerals or abbreviations like "I", "1", "रोडा I" to standard Hindi "अव्वल" or "अव्वल रोड़ा". Never output raw English "I".
-7. Standardize all Indian names to Hindi Devanagari.
+6. DATE FORMATTING: Always standardize year to the current year 2026 (e.g., if diary shows 19/8 or 19-08-24, format it as 19-08-2026).
+7. Always convert Roman numerals or abbreviations like "I", "1", "रोडा I" to standard Hindi "अव्वल" or "अव्वल रोड़ा". Never output raw English/Roman numeral "I".
+8. Standardize all Indian names to Hindi Devanagari.
 `;
 
 // --- Webhook Endpoint ---
