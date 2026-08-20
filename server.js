@@ -238,7 +238,7 @@ You are the Chief AI Accountant & Operations Manager for an Indian Brick Kiln (�
 Analyze transaction text, voice transcripts, or photos of daily diary pages. Return ONLY valid JSON matching this schema:
 
 {
-  "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "query_date_summary" | "query_customer" | "update_entry" | "delete_entry" | "recheck_with_image" | "generate_invoice" | "learn_memory" | "coal_entry" | "green_brick_entry" | "clarification" | "ignore",
+  "intent": "batch_update" | "query_slip_summary" | "order" | "dispatch" | "expense" | "daily_summary" | "query_date_summary" | "query_customer" | "update_entry" | "delete_entry" | "recheck_with_image" | "generate_invoice" | "learn_memory" | "coal_entry" | "green_brick_entry" | "clarification" | "ignore",
   "target_tabs": ["Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "Customer_Ledger" | "Coal_Fuel_Khata" | "Green_Brick_Stock" | "Agent_Memory" | "ALL"],
   "delete_all": boolean,
   "search_filter": {
@@ -356,14 +356,18 @@ PRICE LIST BENCHMARKS:
 - अव्वल रोड़ा: ₹5,000 – ₹5,500 (प्रति ट्रॉली)
 - पीला रोड़ा: ₹2,500 – ₹3,000 (प्रति ट्रॉली)
 
-CRITICAL RULES:
-1. RODA UNIT IS ALWAYS 'ट्रॉली'.
-2. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES (e.g. '1000 गोड़िया / 1000 मीठा').
-3. Standardize canonical customer 'कधंई' across all orders, dispatches, and queries.
-4. Auto-detect Phone Call orders / Voice recordings with advance payments and output in 'orders'.
-5. When learning a new rule (e.g. 'याद रखना X का मतलब Y है'), set intent: 'learn_memory' and populate 'learned_memory_rule'.
-6. When invoice or bill is requested (e.g. 'कधंई का बिल बनाओ'), set intent: 'generate_invoice' and populate 'invoice_request'.
-7. Format all dates as DD-MM-YYYY using current year 2026.
+CRITICAL OPERATIONAL RULES:
+1. DIARY / SLIP IMAGES (DEFAULT: SAVE & DETAILED SUMMARY):
+   - Whenever an image of a diary slip is uploaded, extract ALL dispatches, orders, expenses, and closing balance figures.
+   - If the user asks for a summary or sends the image with general notes, set intent: "batch_update", populate all arrays for saving, AND produce a comprehensive Hindi breakdown in "reply_text".
+   - ONLY set intent: "query_slip_summary" (read-only mode) if the user EXPLICITLY commands NOT to save/write (e.g. "सिर्फ हिसाब बताओ दर्ज मत करना", "check only don't record", "केवल चेक करो").
+2. RODA UNIT IS ALWAYS 'ट्रॉली'.
+3. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES (e.g. '1000 गोड़िया / 1000 मीठा').
+4. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम) across all orders, dispatches, and queries.
+5. Auto-detect Phone Call orders / Voice recordings with advance payments and output in 'orders'.
+6. When learning a new rule (e.g. 'याद रखना X का मतलब Y है'), set intent: 'learn_memory' and populate 'learned_memory_rule'.
+7. When invoice or bill is requested (e.g. 'कधंई का बिल बनाओ'), set intent: 'generate_invoice' and populate 'invoice_request'.
+8. Format all dates as DD-MM-YYYY using current year 2026.
 `;
 }
 
@@ -1146,9 +1150,11 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       const scope = parsed.search_filter?.scope || 'full';
       const report = await generateDateReport(targetDate, scope);
       await sendWhatsAppReply(sender, report || 'संबंधित तारीख का कोई रिकॉर्ड नहीं मिला।');
+      return;
     }
+
     // --- 4. CUSTOMER QUERIES WITH DUAL LEDGER ---
-    else if (parsed.intent === 'query_customer' && sheets) {
+    if (parsed.intent === 'query_customer' && sheets) {
       const customerName = parsed.search_filter?.customer_name || parsed.name;
       const dateFilter = parsed.search_filter?.date || null;
       const data = await getCustomerDetails(customerName, dateFilter);
@@ -1176,9 +1182,28 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       } else {
         await sendWhatsAppReply(sender, `माफ कीजिए, "${customerName}" का कोई रिकॉर्ड नहीं मिला।`);
       }
+      return;
     }
-    // --- 5. BATCH TRANSACTION ENTRIES & CROSS-RECONCILIATION ---
-    else if ((parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image') && sheets) {
+
+    // --- 5. READ-ONLY SLIP SUMMARY (NO GOOGLE SHEET WRITES) ---
+    if (parsed.intent === 'query_slip_summary') {
+      let summaryReply = parsed.reply_text || '📋 पर्ची का हिसाब जांच लिया गया है।';
+      if (parsed.daily_closing) {
+        const { opening_balance = 0, total_jama = 0, total_kharcha = 0, maalik_ko_diya = 0, closing_balance = 0 } = parsed.daily_closing;
+        const expected = Number(opening_balance) + Number(total_jama) - Number(total_kharcha) - Number(maalik_ko_diya);
+        const diff = Number(closing_balance) - expected;
+        if (diff !== 0 && closing_balance > 0) {
+          summaryReply += `\n\n⚠️ *रोकड़ गड़बड़ी अलर्ट:* इस पर्ची में ₹${Math.abs(diff)} का अंतर है (अपेक्षित बचत: ₹${expected}, मुंशी बचत: ₹${closing_balance})।`;
+        }
+      }
+      await sendWhatsAppReply(sender, summaryReply);
+      return;
+    }
+
+    // --- 6. COMPREHENSIVE BATCH & IMAGE TRANSACTION HANDLER ---
+    const hasBatchData = (parsed.orders?.length > 0) || (parsed.dispatches?.length > 0) || (parsed.expenses?.length > 0) || (parsed.daily_closing && Object.keys(parsed.daily_closing).length > 0);
+
+    if (imageMessage || parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image' || hasBatchData) {
       const asyncTasks = [];
 
       // A. Save Orders
@@ -1230,7 +1255,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
 
       // D. Cash Math Verification & Daily Closing
       let anomalyAlert = '';
-      if (parsed.daily_closing && (parsed.daily_closing.total_jama || parsed.daily_closing.closing_balance)) {
+      if (parsed.daily_closing && (parsed.daily_closing.total_jama || parsed.daily_closing.closing_balance || parsed.daily_closing.total_kharcha)) {
         const dc = parsed.daily_closing;
         const opening = Number(dc.opening_balance) || 0;
         const jama = Number(dc.total_jama) || 0;
@@ -1240,7 +1265,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
         const expectedClosing = opening + jama - kharcha - owner;
         const diff = reportedClosing - expectedClosing;
 
-        if (diff !== 0) {
+        if (diff !== 0 && reportedClosing > 0) {
           anomalyAlert = `\n\n⚠️ *रोकड़ गड़बड़ी अलर्ट:* मुंशी के हिसाब में ₹${Math.abs(diff)} का अंतर है (अपेक्षित बचत: ₹${expectedClosing}, मुंशी बचत: ₹${reportedClosing})।`;
         }
 
@@ -1290,15 +1315,15 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       }
 
       await Promise.all(asyncTasks);
-
-      // Rebuild Master Customer Ledger
       await regenerateCustomerLedger();
 
-      const finalReply = (parsed.reply_text || '✅ डायरी डेटा सफलतापूर्वक दर्ज कर दिया गया है।') + anomalyAlert;
+      const finalReply = (parsed.reply_text || '✅ डायरी की सभी एंट्रीज (सप्लाई, खर्चे, जमा, बचत) दर्ज कर दी गई हैं।') + anomalyAlert;
       await sendWhatsAppReply(sender, finalReply);
+      return;
     }
-    // --- 6. SINGLE ORDER / DISPATCH / EXPENSE INTENTS ---
-    else if (parsed.intent === 'order' && sheets) {
+
+    // --- 7. SINGLE ORDER / DISPATCH / EXPENSE / DAILY SUMMARY INTENTS ---
+    if (parsed.intent === 'order' && sheets) {
       const ordersToProcess = (parsed.orders && parsed.orders.length > 0) ? parsed.orders : [parsed];
       const rows = ordersToProcess.map(o => [
         o.date || defaultDate,
@@ -1314,14 +1339,18 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       await appendWithRetry({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A:I', valueInputOption: 'USER_ENTERED', resource: { values: rows } });
       await regenerateCustomerLedger();
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+      return;
     }
-    else if (parsed.intent === 'dispatch' && sheets) {
+
+    if (parsed.intent === 'dispatch' && sheets) {
       const dispatchesToProcess = (parsed.dispatches && parsed.dispatches.length > 0) ? parsed.dispatches : [parsed];
       await processBatchDispatches(defaultDate, dispatchesToProcess);
       await regenerateCustomerLedger();
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+      return;
     }
-    else if (parsed.intent === 'expense' && sheets) {
+
+    if (parsed.intent === 'expense' && sheets) {
       const expensesToProcess = (parsed.expenses && parsed.expenses.length > 0) ? parsed.expenses : [parsed];
       const rows = expensesToProcess.map(e => [
         e.date || defaultDate,
@@ -1332,9 +1361,32 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       ]);
       await appendWithRetry({ spreadsheetId: SPREADSHEET_ID, range: 'Expenses!A:E', valueInputOption: 'USER_ENTERED', resource: { values: rows } });
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+      return;
     }
-    // --- 7. UPDATES & DELETIONS ---
-    else if (parsed.intent === 'update_entry' && sheets) {
+
+    if ((parsed.intent === 'daily_summary' || parsed.intent === 'daily_closing') && sheets) {
+      const dc = parsed.daily_closing || parsed;
+      await appendWithRetry({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'Daily_Closing!A:F',
+        valueInputOption: 'USER_ENTERED',
+        resource: {
+          values: [[
+            dc.date || defaultDate,
+            Number(dc.opening_balance) || 0,
+            Number(dc.total_jama) || 0,
+            Number(dc.total_kharcha) || 0,
+            Number(dc.maalik_ko_diya) || 0,
+            Number(dc.closing_balance) || 0
+          ]]
+        }
+      });
+      if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+      return;
+    }
+
+    // --- 8. UPDATES & DELETIONS ---
+    if (parsed.intent === 'update_entry' && sheets) {
       let updatesList = Array.isArray(parsed.updates) && parsed.updates.length > 0 ? parsed.updates : [{
         target_tab: (parsed.target_tabs && parsed.target_tabs[0]) || 'Supply_Dispatch',
         row_number: parsed.search_filter?.row_number,
@@ -1344,14 +1396,19 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       const count = await executeBatchUpdates(updatesList);
       await regenerateCustomerLedger();
       await sendWhatsAppReply(sender, count > 0 ? (parsed.reply_text || `✅ ${count} प्रविष्टि(याँ) अपडेट हो गईं।`) : 'माफ कीजिए, यह एंट्री नहीं मिली।');
+      return;
     }
-    else if (parsed.intent === 'delete_entry' && sheets) {
+
+    if (parsed.intent === 'delete_entry' && sheets) {
       const result = await deleteSheetEntries(parsed.target_tabs, parsed.search_filter, parsed.delete_all || false);
       if (parsed.delete_all) lastImageCache.delete(cleanSenderNumber);
       await regenerateCustomerLedger();
       await sendWhatsAppReply(sender, result.success ? (parsed.reply_text || `✅ प्रविष्टि हटा दी गई है।`) : 'डिलीट करने के लिए कोई एंट्री नहीं मिली।');
+      return;
     }
-    else if (parsed.reply_text) {
+
+    // --- 9. FALLBACK DIRECT REPLY ---
+    if (parsed.reply_text) {
       await sendWhatsAppReply(sender, parsed.reply_text);
     }
   } catch (error) {
@@ -1376,6 +1433,7 @@ cron.schedule('30 20 * * *', async () => {
   timezone: 'Asia/Kolkata'
 });
 
+// --- Server Boot & Schema Validation ---
 app.listen(PORT, async () => {
   console.log(`🚀 Brick Kiln Munshi AI Server running on port ${PORT}`);
   await ensureSchemaStructure();
