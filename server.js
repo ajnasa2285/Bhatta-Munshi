@@ -171,6 +171,7 @@ function normalizeHindi(str) {
     [/awwal|awal/g, 'अव्वल'],
     [/peela|pila/g, 'पीला'],
     [/roda|rodda/g, 'रोड़ा'],
+    [/trolly|trolley|trauli|ट्राली|ट्रॉली/g, 'ट्रॉली'],
     [/bindha|vindha/g, 'विन्धा'],
     [/chintu/g, 'चिन्टू'],
     [/suraj/g, 'सूरज'],
@@ -626,7 +627,7 @@ async function generateDateReport(dateStr, scope = 'full') {
                 `   • ग्रेड: ${d[3] || 'अव्वल'} | मात्रा: ${qty}\n` +
                 `   • ड्राइवर: ${d[8] || 'N/A'} | स्थिति: ${d[9] || 'Completed'}`;
       });
-      text += `\n\n📌 *कुल डिस्पैच:* ${totalQtyCount > 0 ? `${totalQtyCount.toLocaleString('en-IN')} ईंटें` : `${dispatchRows.length} गाड़ियां`}`;
+      text += `\n\n📌 *कुल डिस्पैच:* ${totalQtyCount > 0 ? `${totalQtyCount.toLocaleString('en-IN')}` : `${dispatchRows.length} गाड़ियां`}`;
       return text;
     }
 
@@ -687,7 +688,7 @@ async function generateDateReport(dateStr, scope = 'full') {
     }
 
     if (dispatchRows.length > 0) {
-      fullText += `\n\n🚚 *सप्लाई / डिस्पैच (${dispatchRows.length} गाड़ियां):*`;
+      fullText += `\n\n🚚 *सप्लाई / डिस्पैच (${dispatchRows.length} गाड़ियां/ट्रॉली):*`;
       dispatchRows.forEach((d, i) => {
         fullText += `\n${i + 1}. ${d[1]} (${d[2] || 'भट्ठा'}): ${d[5] || d[4]} [${d[3]}] ${d[8] ? `- ड्राइवर ${d[8]}` : ''}`;
       });
@@ -777,7 +778,7 @@ async function getCustomerDetails(customerName, targetDate = null) {
   }
 }
 
-// --- System Prompt for Gemini ---
+// --- System Prompt for Gemini with Trolly / Roda Handling ---
 const SYSTEM_PROMPT = `
 You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा). Current year is 2026.
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
@@ -878,31 +879,41 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
   "reply_text": string
 }
 
-PRICE LIST BENCHMARKS (Per 2,000 Bricks / गाड़ी):
-- अव्वल (Awwal / I): ₹14,500 – ₹15,500
-- मीठा (Meetha / मी०): ₹12,500 – ₹13,500 (approx. ₹13,000 / 2,000 -> ₹6,500 per 1,000)
-- खंजड़ (Khanjad / खं०): ₹12,000 – ₹13,000
-- गोड़िया (Godiya / गो०): ₹8,500 – ₹9,000 (approx. ₹4,500 / 1,000)
-- पीला (Peela / पी०): ₹8,000
-- अव्वल रोड़ा (Awwal Roda / रोडा I): ₹5,000 – ₹5,500
-- पीला रोड़ा (Peela Roda): ₹2,500 – ₹3,000
+PRICE LIST BENCHMARKS (Per 2,000 Bricks / गाड़ी OR Per Trolly for Roda):
+- अव्वल (Awwal / I): ₹14,500 – ₹15,500 (per 2,000)
+- मीठा (Meetha / मी०): ₹12,500 – ₹13,500 (per 2,000 -> ₹6,500 per 1,000)
+- खंजड़ (Khanjad / खं०): ₹12,000 – ₹13,000 (per 2,000)
+- गोड़िया (Godiya / गो०): ₹8,500 – ₹9,000 (per 2,000 -> ₹4,500 per 1,000)
+- पीला (Peela / पी०): ₹8,000 (per 2,000)
+- अव्वल रोड़ा (Awwal Roda / रोडा I): ₹5,000 – ₹5,500 (प्रति ट्रॉली / per Trolly)
+- पीला रोड़ा (Peela Roda): ₹2,500 – ₹3,000 (प्रति ट्रॉली / per Trolly)
 
-CRITICAL INTENT RULES:
-1. "query_date_summary":
+CRITICAL RULES FOR RODA & UNITS:
+1. RODA QUANTITY UNIT (ALWAYS TROLLY):
+   - The quantity of Roda (whether "अव्वल रोड़ा" or "पीला रोड़ा") is ALWAYS measured in "ट्रॉली" (Trolly).
+   - If written as "1 roda peela", "1 रोड़ा पीला", "रोड़ा पीला 1", or "1 रोड़ा", standard quantity must be formatted as "1 ट्रॉली".
+   - Grade should be standardized as "पीला रोड़ा" or "अव्वल रोड़ा".
+   - Example for "अनूप सिंह - 1 रोड़ा पीला / बिन्धा":
+     * Grade: "पीला रोड़ा"
+     * total_ordered_qty: "1 ट्रॉली"
+     * dispatched_qty: "1 ट्रॉली"
+     * driver: "बिन्धा"
+2. SINGLE ROW PER CUSTOMER FOR MIXED ORDERS / DISPATCHES: Always group multiple grades purchased together on 1 single row (e.g. "1000 गोड़िया / 1000 मीठा").
+3. QUERY DATE SUMMARY:
    - "कल का हिसाब बताओ" -> intent: "query_date_summary", search_filter: { "date": "yesterday", "scope": "full" }
    - "12 august 2026 ka dispatch summary batao" -> intent: "query_date_summary", search_filter: { "date": "12-08-2026", "scope": "dispatch" }
    - "12 august ka order summary batao" -> intent: "query_date_summary", search_filter: { "date": "12-08-2026", "scope": "orders" }
    - "कल का खर्चा बताओ" -> intent: "query_date_summary", search_filter: { "date": "yesterday", "scope": "expenses" }
    - "कल की बचत / क्लोजिंग बताओ" -> intent: "query_date_summary", search_filter: { "date": "yesterday", "scope": "closing" }
-2. "query_customer":
+4. QUERY CUSTOMER:
    - "अनूप सिंह का स्टेटस बताओ" -> intent: "query_customer", search_filter: { "customer_name": "अनूप सिंह" }
    - "अनूप सिंह का 12-08-2026 का डिस्पैच बताओ" -> intent: "query_customer", search_filter: { "customer_name": "अनूप सिंह", "date": "12-08-2026" }
-3. "delete_entry":
+5. MULTI-ROW DELETIONS:
    - "पंक्ति 12, 13 और 14 को हटा दो" -> intent: "delete_entry", search_filter: { "row_numbers": [12, 13, 14] }
-4. "update_entry":
+6. MULTI-ROW UPDATES:
    - "पंक्ति 8 में नाम जय प्रकाश और स्थान गौशाला कर दो" -> intent: "update_entry", updates: [{ target_tab: "Supply_Dispatch", row_number: 8, fields: { customer_name: "जय प्रकाश", village: "गौशाला" } }]
-5. Always convert Roman numerals or abbreviations like "I", "1", "रोडा I" to standard Hindi "अव्वल" or "अव्वल रोड़ा". Never output raw English "I".
-6. Always format dates to DD-MM-YYYY using current year 2026.
+7. Always convert Roman numerals or abbreviations like "I", "1", "रोडा I" to standard Hindi "अव्वल" or "अव्वल रोड़ा". Never output raw English "I".
+8. Always format dates to DD-MM-YYYY using current year 2026.
 `;
 
 // --- Webhook Endpoint ---
