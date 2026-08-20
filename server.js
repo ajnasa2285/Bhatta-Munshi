@@ -24,7 +24,7 @@ const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
   ? process.env.ALLOWED_NUMBERS.split(',').map(num => num.trim())
   : ['919277078095'];
 
-// --- Immediate Synchronous Deduplication Lock ---
+// --- Immediate Deduplication Lock ---
 const processedMessageIds = new Set();
 const MAX_TRACKED_IDS = 1000;
 
@@ -39,7 +39,7 @@ function checkAndLockMessage(messageId) {
   return false;
 }
 
-// --- In-Memory Image Cache for Cross-Verification ---
+// --- In-Memory Image Cache ---
 const lastImageCache = new Map();
 
 // --- Initialize Gemini Client ---
@@ -66,13 +66,30 @@ if (fs.existsSync(CREDENTIALS_PATH)) {
   console.error('Warning: credentials.json Secret File not found at', CREDENTIALS_PATH);
 }
 
-// --- Date Formatter Helper ---
-function getISTDateOnly() {
+// --- Date Formatter Helper (Asia/Kolkata) ---
+function getISTDate(offsetDays = 0) {
   const now = new Date();
-  return now.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata' }).replace(/\//g, '-');
+  const istTime = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  if (offsetDays !== 0) {
+    istTime.setDate(istTime.getDate() + offsetDays);
+  }
+  const d = String(istTime.getDate()).padStart(2, '0');
+  const m = String(istTime.getMonth() + 1).padStart(2, '0');
+  const y = istTime.getFullYear();
+  return `${d}-${m}-${y}`;
 }
 
-// --- Sheets API Helper with Retry ---
+function resolveDateStr(inputDate) {
+  if (!inputDate || inputDate.toLowerCase() === 'today' || inputDate === 'आज') {
+    return getISTDate(0);
+  }
+  if (inputDate.toLowerCase() === 'yesterday' || inputDate === 'कल') {
+    return getISTDate(-1);
+  }
+  return inputDate.replace(/\//g, '-').trim();
+}
+
+// --- Sheets API Append Helper with Retry ---
 async function appendWithRetry(params, retries = 2, delay = 800) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -132,7 +149,7 @@ async function sendWhatsAppReply(recipient, text) {
   }
 }
 
-// --- Enhanced Transliteration Normalization ---
+// --- Transliteration & Phonetic Normalization ---
 function normalizeHindi(str) {
   if (!str) return '';
   let s = str.toString().trim().toLowerCase();
@@ -159,9 +176,7 @@ function normalizeHindi(str) {
     [/suraj/g, 'सूरज'],
     [/diesel/g, 'डीजल'],
     [/jai\s*prakash|jaiprakash/g, 'जय प्रकाश'],
-    [/gaushala|goshala/g, 'गौशाला'],
-    [/pending/g, 'पेंडिंग'],
-    [/completed|complete/g, 'कंप्लीट']
+    [/gaushala|goshala/g, 'गौशाला']
   ];
 
   for (const [regex, hindiVal] of transMap) s = s.replace(regex, hindiVal);
@@ -172,7 +187,6 @@ function normalizeHindi(str) {
     .replace(/[\s\.\-_]/g, '');
 }
 
-// --- Helper to parse numeric sum from mixed strings ---
 function parseTotalQty(val) {
   if (typeof val === 'number') return val;
   if (!val) return 0;
@@ -181,7 +195,6 @@ function parseTotalQty(val) {
   return numbers.reduce((sum, n) => sum + Number(n), 0);
 }
 
-// --- Helper to Auto-repair Cutoff / Truncated JSON ---
 function repairTruncatedJSON(jsonStr) {
   let openBraces = 0;
   let openBrackets = 0;
@@ -215,7 +228,7 @@ function repairTruncatedJSON(jsonStr) {
   return jsonStr;
 }
 
-// --- Batched Dispatch Processor with Cumulative Tracking ---
+// --- Batched Dispatch Processor with Single Row Mixed Support & Cumulative Tracking ---
 async function processBatchDispatches(dateStr, dispatches) {
   if (!sheets || !SPREADSHEET_ID || !dispatches || dispatches.length === 0) return;
 
@@ -571,44 +584,142 @@ async function deleteSheetEntries(targetTabs, filter, deleteAll = false) {
   return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: false, count: totalDeletedCount };
 }
 
-// --- Query: Fetch Daily Closing Summary ---
-async function getDailyClosingSummary(dateStr) {
+// --- Granular Date-Specific Report Builder ---
+async function generateDateReport(dateStr, scope = 'full') {
   if (!sheets || !SPREADSHEET_ID) return null;
+  const targetDate = resolveDateStr(dateStr);
+
   try {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: 'Daily_Closing!A2:F'
-    });
-    const rows = res.data.values || [];
-    if (rows.length === 0) return null;
+    const [closingRes, dispatchRes, orderRes, expenseRes] = await Promise.all([
+      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Daily_Closing!A2:F' }),
+      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Supply_Dispatch!A2:J' }),
+      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A2:I' }),
+      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Expenses!A2:E' })
+    ]);
 
-    let targetRow = null;
-    if (dateStr) {
-      targetRow = rows.find(r => r[0] && r[0].trim() === dateStr.trim());
-    }
-
-    if (!targetRow) {
-      targetRow = rows[rows.length - 1];
-    }
-
-    return {
-      date: targetRow[0] || 'N/A',
-      opening_balance: targetRow[1] || '0',
-      total_jama: targetRow[2] || '0',
-      total_kharcha: targetRow[3] || '0',
-      maalik_ko_diya: targetRow[4] || '0',
-      closing_balance: targetRow[5] || '0'
+    const isDateMatch = (cell) => {
+      if (!cell) return false;
+      const clean = cell.toString().replace(/\//g, '-').trim();
+      return clean === targetDate || clean.includes(targetDate);
     };
+
+    const closingRows = (closingRes.data.values || []).filter(r => isDateMatch(r[0]));
+    const dispatchRows = (dispatchRes.data.values || []).filter(r => isDateMatch(r[0]));
+    const orderRows = (orderRes.data.values || []).filter(r => isDateMatch(r[0]));
+    const expenseRows = (expenseRes.data.values || []).filter(r => isDateMatch(r[0]));
+
+    const closing = closingRows.length > 0 ? closingRows[closingRows.length - 1] : null;
+
+    if (!closing && dispatchRows.length === 0 && orderRows.length === 0 && expenseRows.length === 0) {
+      return `⚠️ दिनांक *${targetDate}* का कोई रिकॉर्ड शीट में दर्ज नहीं मिला।`;
+    }
+
+    // 1. DISPATCH ONLY SUMMARY
+    if (scope === 'dispatch') {
+      if (dispatchRows.length === 0) return `🚚 दिनांक *${targetDate}* को कोई ईंट सप्लाई/डिस्पैच दर्ज नहीं है।`;
+      let text = `🚚 *ईंट सप्लाई / डिस्पैच विवरण (${targetDate})*\n`;
+      let totalQtyCount = 0;
+      dispatchRows.forEach((d, i) => {
+        const qty = d[5] || d[4] || '0';
+        totalQtyCount += parseTotalQty(qty);
+        text += `\n${i + 1}. *${d[1]}* ${d[2] ? `(${d[2]})` : ''}\n` +
+                `   • ग्रेड: ${d[3] || 'अव्वल'} | मात्रा: ${qty}\n` +
+                `   • ड्राइवर: ${d[8] || 'N/A'} | स्थिति: ${d[9] || 'Completed'}`;
+      });
+      text += `\n\n📌 *कुल डिस्पैच:* ${totalQtyCount > 0 ? `${totalQtyCount.toLocaleString('en-IN')} ईंटें` : `${dispatchRows.length} गाड़ियां`}`;
+      return text;
+    }
+
+    // 2. ORDER ONLY SUMMARY
+    if (scope === 'orders') {
+      if (orderRows.length === 0) return `📝 दिनांक *${targetDate}* को कोई नया ऑर्डर बुक नहीं हुआ है।`;
+      let text = `📝 *ऑर्डर बुकिंग विवरण (${targetDate})*\n`;
+      let totalAmount = 0;
+      let totalReceived = 0;
+      orderRows.forEach((o, i) => {
+        const payable = Number(o[5]) || 0;
+        const rec = Number(o[6]) || 0;
+        totalAmount += payable;
+        totalReceived += rec;
+        text += `\n${i + 1}. *${o[1]}* ${o[2] ? `(${o[2]})` : ''}\n` +
+                `   • ग्रेड: ${o[3]} | मात्रा: ${o[4]}\n` +
+                `   • कुल रकम: ₹${payable.toLocaleString('en-IN')} | जमा: ₹${rec.toLocaleString('en-IN')} | बाकी: ₹${(o[7] || 0)}`;
+      });
+      text += `\n\n📌 *कुल ऑर्डर मूल्य:* ₹${totalAmount.toLocaleString('en-IN')} (जमा: ₹${totalReceived.toLocaleString('en-IN')})`;
+      return text;
+    }
+
+    // 3. EXPENSES ONLY SUMMARY
+    if (scope === 'expenses') {
+      if (expenseRows.length === 0) return `💸 दिनांक *${targetDate}* को कोई खर्चा दर्ज नहीं है।`;
+      let text = `💸 *खर्चों का विवरण (${targetDate})*\n`;
+      let totalExp = 0;
+      expenseRows.forEach((e, i) => {
+        const amt = Number(e[3]) || 0;
+        totalExp += amt;
+        text += `\n${i + 1}. *${e[2] || e[1]}*: ₹${amt.toLocaleString('en-IN')} ${e[4] ? `(${e[4]})` : ''}`;
+      });
+      text += `\n\n📌 *कुल खर्चा:* ₹${totalExp.toLocaleString('en-IN')}`;
+      return text;
+    }
+
+    // 4. CLOSING ONLY SUMMARY
+    if (scope === 'closing') {
+      if (!closing) return `📊 दिनांक *${targetDate}* की दैनिक क्लोजिंग प्रविष्टि नहीं मिली।`;
+      return `📊 *दैनिक क्लोजिंग हिसाब (${targetDate})*\n\n` +
+             `• *प्रारम्भिक बचत (Opening):* ₹${Number(closing[1] || 0).toLocaleString('en-IN')}\n` +
+             `• *कुल जमा (Total Jama):* ₹${Number(closing[2] || 0).toLocaleString('en-IN')}\n` +
+             `• *कुल खर्चा (Kharcha):* ₹${Number(closing[3] || 0).toLocaleString('en-IN')}\n` +
+             `• *मालिक को दिया:* ₹${Number(closing[4] || 0).toLocaleString('en-IN')}\n` +
+             `• *अंतिम बचत (Closing Balance):* ₹${Number(closing[5] || 0).toLocaleString('en-IN')}`;
+    }
+
+    // 5. FULL COMPLETE BREAKDOWN
+    let fullText = `📋 *दिनांक ${targetDate} का सम्पूर्ण दैनिक हिसाब*\n`;
+
+    if (closing) {
+      fullText += `\n💰 *रोकड़ / क्लोजिंग बैलेंस:*` +
+                  `\n• प्रारम्भिक बचत: ₹${Number(closing[1] || 0).toLocaleString('en-IN')}` +
+                  `\n• कुल जमा (Jama): ₹${Number(closing[2] || 0).toLocaleString('en-IN')}` +
+                  `\n• कुल खर्चा (Kharcha): ₹${Number(closing[3] || 0).toLocaleString('en-IN')}` +
+                  `\n• मालिक को दिया: ₹${Number(closing[4] || 0).toLocaleString('en-IN')}` +
+                  `\n• *अंतिम बचत (Closing): ₹${Number(closing[5] || 0).toLocaleString('en-IN')}*`;
+    }
+
+    if (dispatchRows.length > 0) {
+      fullText += `\n\n🚚 *सप्लाई / डिस्पैच (${dispatchRows.length} गाड़ियां):*`;
+      dispatchRows.forEach((d, i) => {
+        fullText += `\n${i + 1}. ${d[1]} (${d[2] || 'भट्ठा'}): ${d[5] || d[4]} [${d[3]}] ${d[8] ? `- ड्राइवर ${d[8]}` : ''}`;
+      });
+    }
+
+    if (expenseRows.length > 0) {
+      let expSum = 0;
+      fullText += `\n\n💸 *खर्च विवरण:*`;
+      expenseRows.forEach((e, i) => {
+        const amt = Number(e[3]) || 0;
+        expSum += amt;
+        fullText += `\n• ${e[2] || e[1]}: ₹${amt.toLocaleString('en-IN')} ${e[4] ? `(${e[4]})` : ''}`;
+      });
+      fullText += `\n*कुल खर्चा:* ₹${expSum.toLocaleString('en-IN')}`;
+    }
+
+    if (orderRows.length > 0) {
+      fullText += `\n\n📝 *नए ऑर्डर:* ${orderRows.length} ग्राहक (विस्तार के लिए 'ऑर्डर समरी' पूछें)`;
+    }
+
+    return fullText;
   } catch (err) {
-    console.error('[Fetch Summary Error]:', err.message);
+    console.error('[Date Report Error]:', err.message);
     return null;
   }
 }
 
-// --- Query: Fetch Specific Customer Dispatch & Order Details ---
-async function getCustomerDetails(customerName) {
+// --- Customer Search Helper (Supports Customer + Optional Date Filter) ---
+async function getCustomerDetails(customerName, targetDate = null) {
   if (!sheets || !SPREADSHEET_ID || !customerName) return null;
   const searchNorm = normalizeHindi(customerName);
+  const cleanDate = targetDate ? resolveDateStr(targetDate) : null;
 
   try {
     const [dispatchRes, orderRes] = await Promise.all([
@@ -621,12 +732,18 @@ async function getCustomerDetails(customerName) {
 
     const dispatches = dispatchRows.filter(row => {
       const nameNorm = normalizeHindi(row[1]);
-      return nameNorm && (nameNorm.includes(searchNorm) || searchNorm.includes(nameNorm));
+      const matchName = nameNorm && (nameNorm.includes(searchNorm) || searchNorm.includes(nameNorm));
+      const rowDate = (row[0] || '').replace(/\//g, '-').trim();
+      const matchDate = cleanDate ? (rowDate === cleanDate) : true;
+      return matchName && matchDate;
     });
 
     const orders = orderRows.filter(row => {
       const nameNorm = normalizeHindi(row[1]);
-      return nameNorm && (nameNorm.includes(searchNorm) || searchNorm.includes(nameNorm));
+      const matchName = nameNorm && (nameNorm.includes(searchNorm) || searchNorm.includes(nameNorm));
+      const rowDate = (row[0] || '').replace(/\//g, '-').trim();
+      const matchDate = cleanDate ? (rowDate === cleanDate) : true;
+      return matchName && matchDate;
     });
 
     if (dispatches.length === 0 && orders.length === 0) return null;
@@ -634,6 +751,7 @@ async function getCustomerDetails(customerName) {
     return {
       name: dispatches[0]?.[1] || orders[0]?.[1] || customerName,
       village: dispatches[0]?.[2] || orders[0]?.[2] || '',
+      filterDate: cleanDate,
       dispatches: dispatches.map(d => ({
         date: d[0] || '',
         grade: d[3] || 'अव्वल',
@@ -661,11 +779,11 @@ async function getCustomerDetails(customerName) {
 
 // --- System Prompt for Gemini ---
 const SYSTEM_PROMPT = `
-You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा).
+You are the AI Munshi (Accountant) for an Indian Brick Kiln (ईंट भट्ठा). Current year is 2026.
 Analyze incoming transaction text, voice transcripts, or photos of diary pages and return ONLY valid JSON matching this schema:
 
 {
-  "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "query_summary" | "query_customer" | "update_entry" | "delete_entry" | "recheck_with_image" | "clarification" | "ignore",
+  "intent": "batch_update" | "order" | "dispatch" | "expense" | "daily_summary" | "query_date_summary" | "query_customer" | "update_entry" | "delete_entry" | "recheck_with_image" | "clarification" | "ignore",
   "target_tabs": ["Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "ALL"],
   "delete_all": boolean,
   "search_filter": {
@@ -673,6 +791,7 @@ Analyze incoming transaction text, voice transcripts, or photos of diary pages a
     "paid_to": string,
     "grade": string,
     "date": string,
+    "scope": "full" | "closing" | "dispatch" | "orders" | "expenses",
     "row_number": number,
     "row_numbers": [number]
   },
@@ -768,15 +887,22 @@ PRICE LIST BENCHMARKS (Per 2,000 Bricks / गाड़ी):
 - अव्वल रोड़ा (Awwal Roda / रोडा I): ₹5,000 – ₹5,500
 - पीला रोड़ा (Peela Roda): ₹2,500 – ₹3,000
 
-CRITICAL RULES:
-1. QUERY SUMMARY: When user asks for past accounts, yesterday summary, or bachat (e.g. "कल का हिसाब बताओ", "कल की बचत कितनी थी"), return "intent": "query_summary". If a specific date is mentioned, populate "search_filter": { "date": "DD-MM-YYYY" }.
-2. QUERY CUSTOMER: When user asks about a customer's bricks/dispatch/payment status (e.g. "अनूप सिंह को कितनी ईंटें गई हैं?", "कन्धाई का स्टेटस बताओ"), return "intent": "query_customer" with "search_filter": { "customer_name": "ग्राहक का नाम" }.
-3. MULTI-ROW DELETIONS: When user asks to delete multiple rows (e.g. "पंक्ति 12, 13, 14 और 15 को डिलीट करो"), return "intent": "delete_entry", "search_filter": { "row_numbers": [12, 13, 14, 15] }.
-4. MULTI-ROW UPDATES: When user asks to update multiple rows in one command (e.g. "पंक्ति 7 को 2000, पंक्ति 8 को 2000... Total Dispatched कर दो"), return "intent": "update_entry" and populate the "updates" array with target_tab, row_number, and the updated fields.
-5. SINGLE ROW PER CUSTOMER FOR MIXED ORDERS / DISPATCHES: Always group multiple grades purchased together into 1 single row (e.g. "1000 गोड़िया / 1000 मीठा").
-6. DATE FORMATTING: Always standardize year to the current year 2026 (e.g., if diary shows 19/8 or 19-08-24, format it as 19-08-2026).
-7. Always convert Roman numerals or abbreviations like "I", "1", "रोडा I" to standard Hindi "अव्वल" or "अव्वल रोड़ा". Never output raw English/Roman numeral "I".
-8. Standardize all Indian names to Hindi Devanagari.
+CRITICAL INTENT RULES:
+1. "query_date_summary":
+   - "कल का हिसाब बताओ" -> intent: "query_date_summary", search_filter: { "date": "yesterday", "scope": "full" }
+   - "12 august 2026 ka dispatch summary batao" -> intent: "query_date_summary", search_filter: { "date": "12-08-2026", "scope": "dispatch" }
+   - "12 august ka order summary batao" -> intent: "query_date_summary", search_filter: { "date": "12-08-2026", "scope": "orders" }
+   - "कल का खर्चा बताओ" -> intent: "query_date_summary", search_filter: { "date": "yesterday", "scope": "expenses" }
+   - "कल की बचत / क्लोजिंग बताओ" -> intent: "query_date_summary", search_filter: { "date": "yesterday", "scope": "closing" }
+2. "query_customer":
+   - "अनूप सिंह का स्टेटस बताओ" -> intent: "query_customer", search_filter: { "customer_name": "अनूप सिंह" }
+   - "अनूप सिंह का 12-08-2026 का डिस्पैच बताओ" -> intent: "query_customer", search_filter: { "customer_name": "अनूप सिंह", "date": "12-08-2026" }
+3. "delete_entry":
+   - "पंक्ति 12, 13 और 14 को हटा दो" -> intent: "delete_entry", search_filter: { "row_numbers": [12, 13, 14] }
+4. "update_entry":
+   - "पंक्ति 8 में नाम जय प्रकाश और स्थान गौशाला कर दो" -> intent: "update_entry", updates: [{ target_tab: "Supply_Dispatch", row_number: 8, fields: { customer_name: "जय प्रकाश", village: "गौशाला" } }]
+5. Always convert Roman numerals or abbreviations like "I", "1", "रोडा I" to standard Hindi "अव्वल" or "अव्वल रोड़ा". Never output raw English "I".
+6. Always format dates to DD-MM-YYYY using current year 2026.
 `;
 
 // --- Webhook Endpoint ---
@@ -871,54 +997,51 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
     }
     console.log('[Parsed JSON]:', parsed);
 
-    const defaultDate = getISTDateOnly();
+    const defaultDate = getISTDate(0);
 
-    if (parsed.intent === 'query_summary' && sheets) {
-      const targetDate = parsed.search_filter?.date || parsed.daily_closing?.date;
-      const summary = await getDailyClosingSummary(targetDate);
-
-      if (summary) {
-        const reply = `📊 *दैनिक क्लोजिंग हिसाब (${summary.date})*\n\n` +
-          `• *प्रारम्भिक बचत (Opening):* ₹${summary.opening_balance}\n` +
-          `• *कुल जमा (Total Jama):* ₹${summary.total_jama}\n` +
-          `• *कुल खर्चा (Kharcha):* ₹${summary.total_kharcha}\n` +
-          `• *मालिक को दिया:* ₹${summary.maalik_ko_diya}\n` +
-          `• *अंतिम बचत (Closing Balance):* ₹${summary.closing_balance}`;
-        await sendWhatsAppReply(sender, reply);
-      } else {
-        await sendWhatsAppReply(sender, 'माफ कीजिए, दैनिक क्लोजिंग का कोई रिकॉर्ड शीट में नहीं मिला।');
-      }
+    // --- 1. SCOPED DATE QUERIES ---
+    if ((parsed.intent === 'query_date_summary' || parsed.intent === 'query_summary') && sheets) {
+      const targetDate = parsed.search_filter?.date || parsed.daily_closing?.date || 'yesterday';
+      const scope = parsed.search_filter?.scope || 'full';
+      const report = await generateDateReport(targetDate, scope);
+      await sendWhatsAppReply(sender, report || 'माफ कीजिए, संबंधित तारीख का कोई रिकॉर्ड नहीं मिला।');
     }
+    // --- 2. CUSTOMER SPECIFIC QUERIES ---
     else if (parsed.intent === 'query_customer' && sheets) {
       const customerName = parsed.search_filter?.customer_name || parsed.name;
-      const data = await getCustomerDetails(customerName);
+      const dateFilter = parsed.search_filter?.date || null;
+      const data = await getCustomerDetails(customerName, dateFilter);
 
       if (data) {
-        let reply = `🧱 *ग्राहक विवरण: ${data.name}* ${data.village ? `(${data.village})` : ''}\n`;
+        let reply = `🧱 *ग्राहक विवरण: ${data.name}* ${data.village ? `(${data.village})` : ''} ${data.filterDate ? `[दिनांक: ${data.filterDate}]` : ''}\n`;
 
         if (data.dispatches.length > 0) {
-          reply += `\n🚚 *सप्लाई / डिस्पैच रिकॉर्ड:*`;
+          reply += `\n🚚 *सप्लाई / डिस्पैच:*`;
           data.dispatches.forEach((d, idx) => {
             reply += `\n${idx + 1}. *तारीख:* ${d.date} | *ग्रेड:* ${d.grade}\n` +
-                     `   • *कुल ऑर्डर:* ${d.total_ordered}\n` +
-                     `   • *कुल भेजी गई (Supplied):* ${d.total_dispatched}\n` +
+                     `   • *मात्रा:* ${d.dispatched_today || d.total_dispatched}\n` +
                      `   • *बाकी (Balance):* ${d.balance_remaining}\n` +
-                     `   • *स्थिति:* ${d.status} ${d.driver ? `(ड्राइवर: ${d.driver})` : ''}`;
+                     `   • *ड्राइवर:* ${d.driver || 'N/A'} (${d.status})`;
           });
         }
 
         if (data.orders.length > 0) {
-          reply += `\n\n💰 *पेमेंट / ऑर्डर रिकॉर्ड:*`;
+          reply += `\n\n💰 *ऑर्डर व पेमेंट:*`;
           data.orders.forEach((o, idx) => {
-            reply += `\n${idx + 1}. *तारीख:* ${o.date} | *कुल रकम:* ₹${o.payable} | *जमा:* ₹${o.received} | *बाकी:* ₹${o.pending_amount}`;
+            reply += `\n${idx + 1}. *तारीख:* ${o.date} | *ग्रेड:* ${o.grade} (${o.quantity})\n` +
+                     `   • *रकम:* ₹${Number(o.payable).toLocaleString('en-IN')} | *जमा:* ₹${Number(o.received).toLocaleString('en-IN')} | *बाकी:* ₹${Number(o.pending_amount).toLocaleString('en-IN')}`;
           });
         }
 
         await sendWhatsAppReply(sender, reply);
       } else {
-        await sendWhatsAppReply(sender, `माफ कीजिए, "${customerName}" का कोई रिकॉर्ड शीट में नहीं मिला।`);
+        const notFoundText = dateFilter 
+          ? `माफ कीजिए, "${customerName}" का दिनांक ${dateFilter} को कोई रिकॉर्ड नहीं मिला।`
+          : `माफ कीजिए, "${customerName}" का कोई रिकॉर्ड शीट में नहीं मिला।`;
+        await sendWhatsAppReply(sender, notFoundText);
       }
     }
+    // --- 3. BATCH TRANSACTION ENTRIES ---
     else if ((parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image') && sheets) {
       const asyncTasks = [];
 
@@ -1052,6 +1175,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       });
       if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
     }
+    // --- 4. MULTI & SINGLE ROW UPDATES ---
     else if (parsed.intent === 'update_entry' && sheets) {
       let updatesList = [];
       if (Array.isArray(parsed.updates) && parsed.updates.length > 0) {
@@ -1077,6 +1201,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
         : 'माफ कीजिए, यह एंट्री शीट में नहीं मिली।';
       await sendWhatsAppReply(sender, reply);
     }
+    // --- 5. MULTI & SINGLE ROW DELETIONS ---
     else if (parsed.intent === 'delete_entry' && sheets) {
       const result = await deleteSheetEntries(parsed.target_tabs, parsed.search_filter, parsed.delete_all || false);
       if (parsed.delete_all) lastImageCache.delete(cleanSenderNumber);
