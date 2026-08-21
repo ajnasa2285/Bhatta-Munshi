@@ -238,7 +238,7 @@ You are the Chief AI Accountant & Operations Manager for an Indian Brick Kiln (�
 Analyze transaction text, voice transcripts, or photos of daily diary pages. Return ONLY valid JSON matching this schema:
 
 {
-  "intent": "batch_update" | "query_slip_summary" | "order" | "dispatch" | "expense" | "daily_summary" | "query_date_summary" | "query_customer" | "update_entry" | "delete_entry" | "recheck_with_image" | "generate_invoice" | "learn_memory" | "coal_entry" | "green_brick_entry" | "clarification" | "ignore",
+  "intent": "batch_update" | "query_slip_summary" | "order" | "dispatch" | "expense" | "daily_summary" | "query_date_summary" | "query_customer" | "update_entry" | "delete_entry" | "recheck_with_image" | "generate_invoice" | "learn_memory" | "sync_ledger" | "coal_entry" | "green_brick_entry" | "clarification" | "ignore",
   "target_tabs": ["Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "Customer_Ledger" | "Coal_Fuel_Khata" | "Green_Brick_Stock" | "Agent_Memory" | "ALL"],
   "delete_all": boolean,
   "search_filter": {
@@ -363,19 +363,21 @@ CRITICAL OPERATIONAL RULES:
    - ONLY set intent: "query_slip_summary" (read-only mode) if the user EXPLICITLY commands NOT to save/write (e.g. "सिर्फ हिसाब बताओ दर्ज मत करना", "check only don't record", "केवल चेक करो").
 2. QUANTITY & GRADE INFERENCE (विलोम दर गणना):
    - NEVER output "quantity: 0" in "orders" if amount_payable or amount_received > 0.
-   - Cross-check the Bikri/Supply section for the same customer to find their grade & dispatched volume.
+   - Cross-check the Bikri/Supply section on the same slip for the customer to find their grade & dispatched volume.
    - If a customer deposits money on the Jama side (e.g. कधंई ₹52,000), reverse calculate: ₹52,000 / ₹6,500 = 8,000 bricks ("मीठा").
    - If मुकीम (इटौँजा) deposits ₹15,000 and has 2000 supply, assign 2000 "अव्वल".
-3. RODA UNIT IS ALWAYS 'ट्रॉली'.
-4. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES (e.g. '1000 गोड़िया / 1000 मीठा').
-5. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम) across all orders, dispatches, and queries.
-6. When learning a new rule (e.g. 'याद रखना X का मतलब Y है'), set intent: 'learn_memory' and populate 'learned_memory_rule'.
-7. When invoice or bill is requested (e.g. 'कधंई का बिल बनाओ'), set intent: 'generate_invoice' and populate 'invoice_request'.
-8. Format all dates as DD-MM-YYYY using current year 2026.
+3. SYNC / REFRESH INSTRUCTION:
+   - If user asks to sync, recalculate, or check manual sheet edits (e.g. "शीट सिंक करो", "डेटा रिफ्रेश करो", "मैंने बदलाव किए हैं देख लो"), set intent: "sync_ledger".
+4. RODA UNIT IS ALWAYS 'ट्रॉली'.
+5. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES (e.g. '1000 गोड़िया / 1000 मीठा').
+6. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम) across all orders, dispatches, and queries.
+7. When learning a new rule (e.g. 'याद रखना X का मतलब Y है'), set intent: 'learn_memory' and populate 'learned_memory_rule'.
+8. When invoice or bill is requested (e.g. 'कधंई का बिल बनाओ'), set intent: 'generate_invoice' and populate 'invoice_request'.
+9. Format all dates as DD-MM-YYYY using current year 2026.
 `;
 }
 
-// --- Algorithmic Reverse Quantity & Grade Inference Helper ---
+// --- Reverse Quantity & Grade Inference Helper ---
 function inferOrderDetails(order, dispatches = []) {
   let qty = Number(order.quantity) || 0;
   let grade = order.grade || 'अव्वल';
@@ -1195,7 +1197,17 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 3. SCOPED DATE QUERIES ---
+    // --- 3. EXPLICIT SHEET / LEDGER SYNC TRIGGER ---
+    if (parsed.intent === 'sync_ledger' || (text && (text.includes('शीट सिंक') || text.includes('डेटा रिफ्रेश') || text.includes('sync sheet')))) {
+      await regenerateCustomerLedger();
+      await sendWhatsAppReply(
+        sender,
+        `🔄 *शीट डेटा सफलतापूर्वक सिंक और अपडेट हो गया है!*\n\n• सभी ग्राहक खाते और बकाया (Customer Ledger) री-कैलकुलेट हो चुके हैं।\n• मेमोरी और मानक नियम सक्रिय हैं।`
+      );
+      return;
+    }
+
+    // --- 4. SCOPED DATE QUERIES ---
     if (parsed.intent === 'query_date_summary' && sheets) {
       const targetDate = parsed.search_filter?.date || 'yesterday';
       const scope = parsed.search_filter?.scope || 'full';
@@ -1204,7 +1216,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 4. CUSTOMER QUERIES WITH DUAL LEDGER ---
+    // --- 5. CUSTOMER QUERIES WITH DUAL LEDGER ---
     if (parsed.intent === 'query_customer' && sheets) {
       const customerName = parsed.search_filter?.customer_name || parsed.name;
       const dateFilter = parsed.search_filter?.date || null;
@@ -1236,7 +1248,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 5. READ-ONLY SLIP SUMMARY (NO GOOGLE SHEET WRITES) ---
+    // --- 6. READ-ONLY SLIP SUMMARY (NO GOOGLE SHEET WRITES) ---
     if (parsed.intent === 'query_slip_summary') {
       let summaryReply = parsed.reply_text || '📋 पर्ची का हिसाब जांच लिया गया है।';
       if (parsed.daily_closing) {
@@ -1251,7 +1263,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 6. COMPREHENSIVE BATCH & IMAGE TRANSACTION HANDLER ---
+    // --- 7. COMPREHENSIVE BATCH & IMAGE TRANSACTION HANDLER ---
     const hasBatchData = (parsed.orders?.length > 0) || (parsed.dispatches?.length > 0) || (parsed.expenses?.length > 0) || (parsed.daily_closing && Object.keys(parsed.daily_closing).length > 0);
 
     if (imageMessage || parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image' || hasBatchData) {
@@ -1380,7 +1392,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 7. SINGLE ORDER / DISPATCH / EXPENSE / DAILY SUMMARY INTENTS ---
+    // --- 8. SINGLE ORDER / DISPATCH / EXPENSE / DAILY SUMMARY INTENTS ---
     if (parsed.intent === 'order' && sheets) {
       const ordersToProcess = (parsed.orders && parsed.orders.length > 0) ? parsed.orders : [parsed];
       const rows = ordersToProcess.map(o => {
@@ -1450,7 +1462,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 8. UPDATES & DELETIONS ---
+    // --- 9. UPDATES & DELETIONS ---
     if (parsed.intent === 'update_entry' && sheets) {
       let updatesList = Array.isArray(parsed.updates) && parsed.updates.length > 0 ? parsed.updates : [{
         target_tab: (parsed.target_tabs && parsed.target_tabs[0]) || 'Supply_Dispatch',
@@ -1472,7 +1484,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 9. FALLBACK DIRECT REPLY ---
+    // --- 10. FALLBACK DIRECT REPLY ---
     if (parsed.reply_text) {
       await sendWhatsAppReply(sender, parsed.reply_text);
     }
