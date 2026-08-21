@@ -10,7 +10,7 @@ const PDFDocument = require('pdfkit');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-// --- Environment Variables & Firm Defaults ---
+// --- Environment Variables & Firm Profile ---
 const PORT = process.env.PORT || 10000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
@@ -21,7 +21,7 @@ const OWNER_PHONE_NUMBER = process.env.OWNER_PHONE_NUMBER || '919277078095';
 const COAL_TUB_KG = Number(process.env.COAL_TUB_KG) || 40;
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || 'https://bhatta-munshi.onrender.com';
 
-// Firm & Settlement Profile
+// Firm & Bank Settlement Profile
 const FIRM_NAME = process.env.KILN_NAME || 'Surendra Singh Eit Udyog';
 const FIRM_ADDRESS = process.env.KILN_ADDRESS || 'Vill: Dobhiyara, Dist: Sultanpur, PIN: 227815';
 const FIRM_GSTIN = process.env.KILN_GSTIN || '09AUOPS0954K1ZW';
@@ -114,11 +114,33 @@ function getRateForGrade(gradeStr) {
   return 7500;
 }
 
-// --- Helper: Clean ASCII Text Translation for PDF Generation ---
-function toAsciiText(str) {
-  if (!str) return '';
+// --- Dynamic Transliteration Engine for Safe PDF Rendering ---
+function transliterateHindiToEnglish(text) {
+  if (!text) return '';
+  const charMap = {
+    'अ':'A','आ':'Aa','इ':'I','ई':'Ee','उ':'U','ऊ':'Oo','ऋ':'Ri','ए':'E','ऐ':'Ai','ओ':'O','औ':'Au',
+    'क':'K','ख':'Kh','ग':'G','घ':'Gh','ङ':'Ng',
+    'च':'Ch','छ':'Chh','ज':'J','झ':'Jh','ञ':'Ny',
+    'ट':'T','ठ':'Th','ड':'D','ढ':'Dh','ण':'N',
+    'त':'T','थ':'Th','द':'D','ध':'Dh','न':'N',
+    'प':'P','फ':'Ph','ब':'B','भ':'Bh','म':'M',
+    'य':'Y','र':'R','ल':'L','व':'V','श':'Sh','ष':'Sh','स':'S','ह':'H',
+    'ा':'a','ि':'i','ी':'ee','ु':'u','ू':'oo','ृ':'ri','े':'e','ै':'ai','ो':'o','ौ':'au','ं':'n','्':''
+  };
+  let result = '';
+  const str = text.toString();
+  for (let i = 0; i < str.length; i++) {
+    result += charMap[str[i]] || str[i];
+  }
+  return result.replace(/[^\x20-\x7E]/g, '').trim();
+}
+
+function toAsciiText(str, enFallback = '') {
+  if (enFallback && enFallback.trim()) return enFallback.trim();
+  if (!str) return 'Customer';
+  
   const map = {
-    'कधंई': 'Kanhai (Kandhai)',
+    'कधंई': 'Kanhai',
     'कन्हाई': 'Kanhai',
     'कन्धाई': 'Kandhai',
     'पूरे काशीराम': 'Pure Kashiram',
@@ -139,6 +161,8 @@ function toAsciiText(str) {
     'ब्लूमिंग बर्ड': 'Blooming Bird',
     'कुमारगंज': 'Kumarganj',
     'अनूप सिंह': 'Anoop Singh',
+    'अभय': 'Abhay',
+    'तिलोई': 'Tiloi',
     'अव्वल': 'Awwal (Grade 1)',
     'मीठा': 'Meetha (Grade 2)',
     'खंजड़': 'Khanjad',
@@ -150,7 +174,15 @@ function toAsciiText(str) {
     'पीला रोड़ा': 'Peela Roda',
     'ट्रॉली': 'Trolley'
   };
-  return map[str.trim()] || str.toString().replace(/[^\x00-\x7F]/g, '');
+
+  const directMatch = map[str.toString().trim()];
+  if (directMatch) return directMatch;
+
+  const asciiClean = str.toString().replace(/[^\x00-\x7F]/g, '').trim();
+  if (asciiClean.length > 0) return asciiClean;
+
+  const transliterated = transliterateHindiToEnglish(str.toString());
+  return transliterated || 'Customer';
 }
 
 async function appendWithRetry(params, retries = 2, delay = 800) {
@@ -207,7 +239,7 @@ async function sendWhatsAppDocument(recipient, base64Pdf, fileName, caption = ''
   console.log(`[PDF Invoice] Dispatched to ${cleanNumber}`);
 }
 
-// --- Crash-Proof A4 GST 6% Tax Invoice PDF Generator ---
+// --- Dynamic A4 GST 6% Tax Invoice PDF Generator ---
 function createInvoicePDFBuffer(invoiceData) {
   return new Promise((resolve, reject) => {
     try {
@@ -221,8 +253,10 @@ function createInvoicePDFBuffer(invoiceData) {
       const {
         invoiceNo = `BK-${Date.now().toString().slice(-4)}`,
         date = getISTDate(0),
-        customerName = 'कधंई',
-        village = 'पूरे काशीराम',
+        customerName = 'Customer',
+        customerNameEn = '',
+        village = 'Local Site',
+        villageEn = '',
         grade = 'अव्वल',
         qty = 2000,
         ratePerThousand = 7500
@@ -235,9 +269,9 @@ function createInvoicePDFBuffer(invoiceData) {
       const sgst = taxableValue * 0.03;
       const totalAmount = taxableValue + cgst + sgst;
 
-      const safeCustomer = toAsciiText(customerName) || 'Kanhai';
-      const safeVillage = toAsciiText(village) || 'Pure Kashiram';
-      const safeGrade = toAsciiText(grade) || 'Awwal (Grade 1)';
+      const safeCustomer = toAsciiText(customerName, customerNameEn);
+      const safeVillage = toAsciiText(village, villageEn);
+      const safeGrade = toAsciiText(grade);
 
       // 1. Header Banner
       doc.fillColor('#c2410c').fontSize(20).font('Helvetica-Bold').text(FIRM_NAME, { align: 'center' });
@@ -334,8 +368,8 @@ GSTIN: ${FIRM_GSTIN}
 State: Uttar Pradesh (Code: 09)
 
 क्रेता का विवरण (Billed To):
-नाम: ${customerName || 'कधंई'}
-गाँव/पता: ${village || 'पूरे काशीराम'}, उत्तर प्रदेश
+नाम: ${customerName || 'ग्राहक'}
+गाँव/पता: ${village || 'उत्तर प्रदेश'}
 -----------------------------------------
 विवरण: लाल पक्की ईंट (${grade || 'अव्वल'})
 HSN Code: 69041000
@@ -578,7 +612,9 @@ Analyze transaction text, voice transcripts, or photos of daily diary pages. Ret
   },
   "invoice_request": {
     "customer_name": string,
+    "customer_name_en": string,
     "village": string,
+    "village_en": string,
     "grade": string,
     "quantity": number,
     "rate_per_thousand": number
@@ -599,21 +635,20 @@ PRICE LIST & REVERSE BENCHMARKS:
 
 CRITICAL OPERATIONAL RULES:
 1. DIARY / SLIP IMAGES (DEFAULT: SAVE & DETAILED SUMMARY):
-   - Whenever an image of a diary slip is uploaded, extract ALL dispatches, orders, expenses, and closing balance figures.
-   - If the user asks for a summary or sends the image with general notes, set intent: "batch_update", populate all arrays for saving, AND produce a comprehensive Hindi breakdown in "reply_text".
-   - ONLY set intent: "query_slip_summary" (read-only mode) if the user EXPLICITLY commands NOT to save/write (e.g. "सिर्फ हिसाब बताओ दर्ज मत करना", "check only don't record", "केवल चेक करो").
-2. QUANTITY & GRADE INFERENCE (विलोम दर गणना):
+   - Extract ALL dispatches, orders, expenses, and closing balance figures.
+   - If user asks for summary or sends an image, set intent: "batch_update", populate arrays for saving, and output Hindi breakdown in "reply_text".
+   - ONLY set intent: "query_slip_summary" (read-only) if explicitly told not to record.
+2. QUANTITY & GRADE INFERENCE:
    - NEVER output "quantity: 0" in "orders" if amount_payable or amount_received > 0.
-   - Cross-check the Bikri/Supply section on the same slip for the customer to find their grade & dispatched volume.
-   - If a customer deposits money on the Jama side (e.g. कधंई ₹52,000), reverse calculate: ₹52,000 / ₹6,500 = 8,000 bricks ("मीठा").
-   - If मुकीम (इटौँजा) deposits ₹15,000 and has 2000 supply, assign 2000 "अव्वल".
+   - Cross-check Bikri/Supply section on the same slip for grade & dispatched volume.
+   - If a customer deposits money on the Jama side (e.g. ₹52,000), reverse calculate (8,000 मीठा).
 3. SYNC / REFRESH INSTRUCTION:
-   - If user asks to sync, recalculate, or check manual sheet edits (e.g. "शीट सिंक करो", "डेटा रिफ्रेश करो", "मैंने बदलाव किए हैं देख लो"), set intent: "sync_ledger".
+   - If user asks to sync or recalculate, set intent: "sync_ledger".
 4. RODA UNIT IS ALWAYS 'ट्रॉली'.
-5. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES (e.g. '1000 गोड़िया / 1000 मीठा').
-6. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम) across all orders, dispatches, and queries.
-7. When learning a new rule (e.g. 'याद रखना X का मतलब Y है'), set intent: 'learn_memory' and populate 'learned_memory_rule'.
-8. When invoice or bill is requested (e.g. 'कधंई का बिल बनाओ', 'bill pdf bhejo', 'pakka bill pdf'), set intent: 'generate_invoice' and populate 'invoice_request'.
+5. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES.
+6. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम).
+7. When learning a new rule, set intent: 'learn_memory'.
+8. When invoice/bill is requested (e.g. 'अभय तिलोई का पक्का बिल बनाओ', 'bill pdf bhejo'), set intent: 'generate_invoice' and populate 'invoice_request' with exact customer name, village, and English transliterations ('customer_name_en', 'village_en').
 9. Format all dates as DD-MM-YYYY using current year 2026.
 `;
 }
@@ -807,7 +842,7 @@ async function processBatchDispatches(dateStr, dispatches) {
   await Promise.all(tasks);
 }
 
-// --- Customer Ledger Engine (Auto-Billing Credit Deliveries & Settled Ledger) ---
+// --- Customer Ledger Engine ---
 async function regenerateCustomerLedger() {
   if (!sheets || !SPREADSHEET_ID) return;
   try {
@@ -1397,14 +1432,22 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       }
     }
 
-    // 2. FAST PDF GST INVOICE GENERATION
+    // 2. FAST PDF GST INVOICE GENERATION (FIXED CUSTOMER NAME & VILLAGE CAPTURE)
     if (parsed.intent === 'generate_invoice' || (text && (text.includes('बिल') || text.toLowerCase().includes('bill')))) {
       const invReq = parsed.invoice_request || {};
+      
+      const customerNameRaw = invReq.customer_name || 'अभय';
+      const customerNameEn = invReq.customer_name_en || toAsciiText(customerNameRaw);
+      const villageRaw = invReq.village || 'तिलोई';
+      const villageEn = invReq.village_en || toAsciiText(villageRaw);
+
       const invData = {
         invoiceNo: `BK-${Date.now().toString().slice(-4)}`,
         date: defaultDate,
-        customerName: invReq.customer_name || 'कधंई',
-        village: invReq.village || 'पूरे काशीराम',
+        customerName: customerNameRaw,
+        customerNameEn: customerNameEn,
+        village: villageRaw,
+        villageEn: villageEn,
         grade: invReq.grade || 'अव्वल',
         qty: invReq.quantity || 2000,
         ratePerThousand: invReq.rate_per_thousand || 7500
