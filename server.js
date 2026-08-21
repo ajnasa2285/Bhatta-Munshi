@@ -92,6 +92,28 @@ function resolveDateStr(inputDate) {
   return inputDate.replace(/\//g, '-').trim();
 }
 
+// --- Rate Matrix for Auto-Billing Dispatches ---
+const GRADE_RATES = {
+  'अव्वल': 7500,
+  'मीठा': 6500,
+  'खंजड़': 6250,
+  'गोड़िया': 4500,
+  'पीला': 4000,
+  'अव्वल रोड़ा': 5000,
+  'पीला रोड़ा': 2750,
+  'रोड़ा अव्वल': 5000,
+  'रोड़ा पीला': 2750,
+  'रोड़ा': 5000
+};
+
+function getRateForGrade(gradeStr) {
+  if (!gradeStr) return 7500;
+  for (const [g, rate] of Object.entries(GRADE_RATES)) {
+    if (gradeStr.includes(g)) return rate;
+  }
+  return 7500;
+}
+
 // --- Sheets API Append Helper with Retry ---
 async function appendWithRetry(params, retries = 2, delay = 800) {
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -586,31 +608,64 @@ async function regenerateCustomerLedger() {
     const dispatches = dispatchRes.data.values || [];
     const ledgerMap = new Map();
 
+    // 1. Process Master Orders & Cash Advances
     for (const o of orders) {
       const name = o[1];
       if (!name) continue;
       const key = normalizeHindi(name);
-      const item = ledgerMap.get(key) || { name, village: o[2] || '', orderedBricks: 0, dispatchedBricks: 0, totalBilled: 0, totalPaid: 0 };
+      const item = ledgerMap.get(key) || {
+        name,
+        village: o[2] || '',
+        orderedBricks: 0,
+        dispatchedBricks: 0,
+        totalBilled: 0,
+        totalPaid: 0,
+        hasExplicitOrder: true
+      };
       item.orderedBricks += parseTotalQty(o[4]);
       item.totalBilled += Number(o[5]) || 0;
       item.totalPaid += Number(o[6]) || 0;
       ledgerMap.set(key, item);
     }
 
+    // 2. Process Dispatches & Auto-Bill Credit Deliveries
     for (const d of dispatches) {
       const name = d[1];
       if (!name) continue;
       const key = normalizeHindi(name);
-      const item = ledgerMap.get(key) || { name, village: d[2] || '', orderedBricks: parseTotalQty(d[4]), dispatchedBricks: 0, totalBilled: 0, totalPaid: 0 };
-      item.dispatchedBricks += parseTotalQty(d[6]) || parseTotalQty(d[5]);
+      const grade = d[3] || 'अव्वल';
+      const isRoda = grade.includes('रोड़ा');
+      const dispQty = isRoda ? 0 : (parseTotalQty(d[6]) || parseTotalQty(d[5]));
+      const masterQty = isRoda ? 0 : parseTotalQty(d[4]);
+
+      const item = ledgerMap.get(key) || {
+        name,
+        village: d[2] || '',
+        orderedBricks: masterQty,
+        dispatchedBricks: 0,
+        totalBilled: 0,
+        totalPaid: 0,
+        hasExplicitOrder: false
+      };
+
+      item.dispatchedBricks += dispQty;
+      if (!item.hasExplicitOrder) {
+        if (item.orderedBricks === 0) item.orderedBricks = item.dispatchedBricks;
+        const rate = getRateForGrade(grade);
+        const billedVal = isRoda ? rate : (dispQty * rate) / 1000;
+        item.totalBilled += billedVal;
+      }
       ledgerMap.set(key, item);
     }
 
+    // 3. Rebuild Ledger Rows with Accurate Financial Status
     const ledgerRows = [];
     for (const [, acc] of ledgerMap.entries()) {
       const pendingBricks = Math.max(0, acc.orderedBricks - acc.dispatchedBricks);
       const netDue = Math.max(0, acc.totalBilled - acc.totalPaid);
-      const status = (pendingBricks === 0 && netDue === 0) ? 'बेबाक (Settled)' : 'बाकी (Pending)';
+      const status = (pendingBricks === 0 && netDue === 0 && acc.totalBilled > 0)
+        ? 'बेबाक (Settled)'
+        : (netDue > 0 ? `बाकी: ₹${netDue.toLocaleString('en-IN')}` : 'बाकी ईंटें');
 
       ledgerRows.push([
         acc.name,
