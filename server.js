@@ -10,7 +10,7 @@ const PDFDocument = require('pdfkit');
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-// --- Environment Variables ---
+// --- Environment Variables & Firm Defaults ---
 const PORT = process.env.PORT || 10000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
@@ -19,11 +19,19 @@ const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
 const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 const OWNER_PHONE_NUMBER = process.env.OWNER_PHONE_NUMBER || '919277078095';
 const COAL_TUB_KG = Number(process.env.COAL_TUB_KG) || 40;
+const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || 'https://bhatta-munshi.onrender.com';
 
-// --- Primary Model ---
+// Firm & Settlement Profile
+const FIRM_NAME = process.env.KILN_NAME || 'Surendra Singh Eit Udyog';
+const FIRM_ADDRESS = process.env.KILN_ADDRESS || 'Vill: Dobhiyara, Dist: Sultanpur, PIN: 227815';
+const FIRM_GSTIN = process.env.KILN_GSTIN || '09AUOPS0954K1ZW';
+const BANK_NAME = process.env.BANK_NAME || 'Bank of Baroda';
+const BANK_ACCOUNT_NO = process.env.BANK_ACCOUNT_NO || '11150200000035';
+const BANK_IFSC = process.env.BANK_IFSC || 'BARB0KUMARG';
+const BANK_HOLDER = process.env.BANK_ACCOUNT_HOLDER || 'SURENDRA SINGH EIT BHATTA';
+
 const MODEL_NAME = process.env.MODEL_NAME || 'gemini-3.6-flash';
 
-// --- Authorized Phone Whitelist ---
 const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
   ? process.env.ALLOWED_NUMBERS.split(',').map(num => num.trim())
   : ['919277078095'];
@@ -43,10 +51,7 @@ function checkAndLockMessage(messageId) {
   return false;
 }
 
-// --- In-Memory Image Cache ---
 const lastImageCache = new Map();
-
-// --- Initialize Gemini Client ---
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || '');
 
 // --- Initialize Google Sheets API ---
@@ -66,8 +71,6 @@ if (fs.existsSync(CREDENTIALS_PATH)) {
   } catch (err) {
     console.error('Failed to load credentials.json:', err.message);
   }
-} else {
-  console.error('Warning: credentials.json Secret File not found at', CREDENTIALS_PATH);
 }
 
 // --- Date Formatter Helper (Asia/Kolkata) ---
@@ -84,16 +87,12 @@ function getISTDate(offsetDays = 0) {
 }
 
 function resolveDateStr(inputDate) {
-  if (!inputDate || inputDate.toLowerCase() === 'today' || inputDate === 'आज') {
-    return getISTDate(0);
-  }
-  if (inputDate.toLowerCase() === 'yesterday' || inputDate === 'कल') {
-    return getISTDate(-1);
-  }
+  if (!inputDate || inputDate.toLowerCase() === 'today' || inputDate === 'आज') return getISTDate(0);
+  if (!inputDate || inputDate.toLowerCase() === 'yesterday' || inputDate === 'कल') return getISTDate(-1);
   return inputDate.replace(/\//g, '-').trim();
 }
 
-// --- Rate Matrix for Auto-Billing & Reverse Estimation ---
+// --- Rate Matrix ---
 const GRADE_RATES = {
   'अव्वल': 7500,
   'मीठा': 6500,
@@ -115,7 +114,7 @@ function getRateForGrade(gradeStr) {
   return 7500;
 }
 
-// --- Helper: Convert Hindi Strings to Clean English for PDFKit ---
+// --- Helper: Clean ASCII Text Translation for PDF Generation ---
 function toAsciiText(str) {
   if (!str) return '';
   const map = {
@@ -154,7 +153,6 @@ function toAsciiText(str) {
   return map[str.trim()] || str.toString().replace(/[^\x00-\x7F]/g, '');
 }
 
-// --- Sheets API Append Helper with Retry ---
 async function appendWithRetry(params, retries = 2, delay = 800) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -171,7 +169,6 @@ async function appendWithRetry(params, retries = 2, delay = 800) {
   }
 }
 
-// --- WhatsApp Reply Helper (Text) ---
 async function sendWhatsAppReply(recipient, text) {
   if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) return;
   try {
@@ -179,7 +176,7 @@ async function sendWhatsAppReply(recipient, text) {
     await axios.post(
       `${WHATSAPP_GATEWAY_BASE_URL}/message/sendText/${WHATSAPP_GATEWAY_TYPE}`,
       { number: cleanNumber, text: text },
-      { headers: { apikey: WHATSAPP_GATEWAY_KEY } }
+      { headers: { apikey: WHATSAPP_GATEWAY_KEY }, timeout: 8000 }
     );
     console.log(`[Text Reply] Sent to ${cleanNumber}`);
   } catch (error) {
@@ -187,11 +184,8 @@ async function sendWhatsAppReply(recipient, text) {
   }
 }
 
-// --- WhatsApp Document Helper (PDF Send via Evolution API) ---
 async function sendWhatsAppDocument(recipient, base64Pdf, fileName, caption = '') {
-  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) {
-    throw new Error('WhatsApp Gateway environment variables are not configured');
-  }
+  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) return;
   const cleanNumber = recipient.replace('@s.whatsapp.net', '').replace('@c.us', '');
   const cleanBase64 = base64Pdf.replace(/^data:application\/pdf;base64,/, '');
 
@@ -204,14 +198,13 @@ async function sendWhatsAppDocument(recipient, base64Pdf, fileName, caption = ''
     fileName: fileName || 'Tax_Invoice.pdf'
   };
 
-  const response = await axios.post(
+  await axios.post(
     `${WHATSAPP_GATEWAY_BASE_URL}/message/sendMedia/${WHATSAPP_GATEWAY_TYPE}`,
     payload,
-    { headers: { apikey: WHATSAPP_GATEWAY_KEY } }
+    { headers: { apikey: WHATSAPP_GATEWAY_KEY }, timeout: 15000 }
   );
 
   console.log(`[PDF Invoice] Dispatched to ${cleanNumber}`);
-  return response.data;
 }
 
 // --- Crash-Proof A4 GST 6% Tax Invoice PDF Generator ---
@@ -223,7 +216,7 @@ function createInvoicePDFBuffer(invoiceData) {
 
       doc.on('data', buffers.push.bind(buffers));
       doc.on('end', () => resolve(Buffer.concat(buffers).toString('base64')));
-      doc.on('error', (err) => reject(err));
+      doc.on('error', reject);
 
       const {
         invoiceNo = `BK-${Date.now().toString().slice(-4)}`,
@@ -246,26 +239,27 @@ function createInvoicePDFBuffer(invoiceData) {
       const safeVillage = toAsciiText(village) || 'Pure Kashiram';
       const safeGrade = toAsciiText(grade) || 'Awwal (Grade 1)';
 
-      // 1. Header
-      doc.fillColor('#c2410c').fontSize(20).font('Helvetica-Bold').text(process.env.KILN_NAME || 'SHRI GANESH BRICK FIELD', { align: 'center' });
-      doc.fillColor('#334155').fontSize(11).font('Helvetica').text('TAX INVOICE (PAKKA BILL)', { align: 'center' });
-      doc.moveDown(0.4);
+      // 1. Header Banner
+      doc.fillColor('#c2410c').fontSize(20).font('Helvetica-Bold').text(FIRM_NAME, { align: 'center' });
+      doc.fontSize(9.5).fillColor('#334155').font('Helvetica').text(FIRM_ADDRESS, { align: 'center' });
+      doc.fontSize(11).font('Helvetica-Bold').text('TAX INVOICE (PAKKA BILL)', { align: 'center' });
+      doc.moveDown(0.3);
 
-      // 2. Business Tax Info
-      doc.fontSize(9).fillColor('#000000').text(`GSTIN: ${process.env.KILN_GSTIN || '09AAAAA0000A1Z5'} | State: Uttar Pradesh (09) | HSN: 69041000`, { align: 'center' });
+      // 2. Business Metadata
+      doc.fontSize(9).fillColor('#000000').font('Helvetica').text(`GSTIN: ${FIRM_GSTIN} | State: Uttar Pradesh (Code: 09) | HSN: 69041000`, { align: 'center' });
       doc.moveDown(0.8);
-      doc.rect(40, 105, 515, 1).fill('#cbd5e1');
+      doc.rect(40, 115, 515, 1).fill('#cbd5e1');
 
       // 3. Invoice Metadata & Buyer Info
       doc.fontSize(10).fillColor('#0f172a').font('Helvetica');
-      doc.text(`Invoice No : ${invoiceNo}`, 45, 120);
-      doc.text(`Date       : ${date}`, 45, 135);
+      doc.text(`Invoice No : ${invoiceNo}`, 45, 128);
+      doc.text(`Date       : ${date}`, 45, 143);
 
-      doc.text(`Billed To  : ${safeCustomer}`, 320, 120);
-      doc.text(`Address    : ${safeVillage}, UP`, 320, 135);
+      doc.text(`Billed To  : ${safeCustomer}`, 320, 128);
+      doc.text(`Address    : ${safeVillage}, UP`, 320, 143);
 
       // 4. Items Table Header
-      const tableTop = 165;
+      const tableTop = 175;
       doc.rect(40, tableTop, 515, 22).fill('#f1f5f9');
       doc.fillColor('#0f172a').fontSize(10).font('Helvetica-Bold');
       doc.text('Description', 50, tableTop + 6);
@@ -303,14 +297,14 @@ function createInvoicePDFBuffer(invoiceData) {
       doc.text('Total Invoice Value:', 320, taxY + 56);
       doc.text(`Rs. ${totalAmount.toFixed(2)}`, 455, taxY + 56);
 
-      // 7. Settlement Bank Account Box
+      // 7. Settlement Bank Account Details Box
       const bankY = taxY + 110;
       doc.rect(40, bankY - 10, 515, 65).stroke('#cbd5e1');
-      doc.fontSize(9).font('Helvetica-Bold').fillColor('#c2410c').text('BANK PAYMENT DETAILS:', 50, bankY);
+      doc.fontSize(9).font('Helvetica-Bold').fillColor('#c2410c').text('BANK PAYMENT & SETTLEMENT DETAILS:', 50, bankY);
       doc.font('Helvetica').fillColor('#0f172a');
-      doc.text(`Bank Name : ${process.env.BANK_NAME || 'State Bank of India'}`, 50, bankY + 15);
-      doc.text(`Account No: ${process.env.BANK_ACCOUNT_NO || 'XXXXXXXXXXXX1234'}`, 50, bankY + 28);
-      doc.text(`IFSC Code : ${process.env.BANK_IFSC || 'SBIN000XXXX'} | Holder: ${process.env.BANK_ACCOUNT_HOLDER || 'Shri Ganesh Brick Field'}`, 50, bankY + 41);
+      doc.text(`Bank Name : ${BANK_NAME}`, 50, bankY + 15);
+      doc.text(`Account No: ${BANK_ACCOUNT_NO}`, 50, bankY + 28);
+      doc.text(`IFSC Code : ${BANK_IFSC} | Holder: ${BANK_HOLDER}`, 50, bankY + 41);
 
       doc.end();
     } catch (err) {
@@ -319,7 +313,7 @@ function createInvoicePDFBuffer(invoiceData) {
   });
 }
 
-// --- Text Invoice Fallback ---
+// --- Text Invoice Formatter Fallback ---
 function formatGSTInvoice({ invoiceNo, date, customerName, village, grade, qty, ratePerThousand }) {
   const quantity = Number(qty) || 2000;
   const rate = Number(ratePerThousand) || 7500;
@@ -330,12 +324,13 @@ function formatGSTInvoice({ invoiceNo, date, customerName, village, grade, qty, 
 
   return `
 =========================================
-          ${process.env.KILN_NAME || 'श्री गणेश ईंट उद्योग'}
+          ${FIRM_NAME}
+           ${FIRM_ADDRESS}
            TAX INVOICE (पक्का बिल)
 =========================================
 इनवॉइस सं०: ${invoiceNo || `BK-${Date.now().toString().slice(-4)}`}
 दिनांक: ${date || getISTDate(0)}
-GSTIN: ${process.env.KILN_GSTIN || '09AAAAA0000A1Z5'}
+GSTIN: ${FIRM_GSTIN}
 State: Uttar Pradesh (Code: 09)
 
 क्रेता का विवरण (Billed To):
@@ -353,11 +348,11 @@ SGST @ 3%                     : ₹${sgst.toFixed(2)}
 -----------------------------------------
 कुल इनवॉइस मूल्य (Total Value) : ₹${totalAmount.toFixed(2)}
 =========================================
-बैंक विवरण (Bank Details):
-• बैंक: ${process.env.BANK_NAME || 'State Bank of India'}
-• खाता: ${process.env.BANK_ACCOUNT_NO || 'XXXXXXXXXXXX1234'}
-• IFSC: ${process.env.BANK_IFSC || 'SBIN000XXXX'}
-• खाता धारक: ${process.env.BANK_ACCOUNT_HOLDER || 'श्री गणेश ईंट उद्योग'}
+बैंक विवरण (Bank Settlement Details):
+• बैंक: ${BANK_NAME}
+• खाता: ${BANK_ACCOUNT_NO}
+• IFSC: ${BANK_IFSC}
+• खाता धारक: ${BANK_HOLDER}
 =========================================`;
 }
 
@@ -442,8 +437,16 @@ function repairTruncatedJSON(jsonStr) {
   return jsonStr;
 }
 
-// --- Dynamic Memory Loader from Sheet ---
-async function getDynamicRules() {
+// --- High-Speed In-Memory Dynamic Memory Cache ---
+let cachedMemoryRules = '';
+let lastMemoryFetch = 0;
+const MEMORY_CACHE_TTL = 10 * 60 * 1000;
+
+async function getDynamicRules(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && cachedMemoryRules && (now - lastMemoryFetch < MEMORY_CACHE_TTL)) {
+    return cachedMemoryRules;
+  }
   try {
     if (!sheets || !SPREADSHEET_ID) return '';
     const res = await sheets.spreadsheets.values.get({
@@ -459,7 +462,9 @@ async function getDynamicRules() {
         memoryPrompt += `- Shorthand/Alias "${r[1]}" -> Standard Name: "${r[2]}" (Location: ${r[3] || 'N/A'}). Note: ${r[4] || ''}\n`;
       }
     });
-    return memoryPrompt;
+    cachedMemoryRules = memoryPrompt;
+    lastMemoryFetch = now;
+    return cachedMemoryRules;
   } catch (err) {
     return `- Primary Master Customer: Canonical name is strictly "कधंई" (Village: पूरे काशीराम). Map all spellings (कन्हाई, कन्धाई, कधई) to "कधंई".\n`;
   }
@@ -613,14 +618,12 @@ CRITICAL OPERATIONAL RULES:
 `;
 }
 
-// --- Algorithmic Reverse Quantity & Grade Inference Helper ---
 function inferOrderDetails(order, dispatches = []) {
   let qty = Number(order.quantity) || 0;
   let grade = order.grade || 'अव्वल';
   const amount = Number(order.amount_received) || Number(order.amount_payable) || 0;
   const orderNameNorm = normalizeHindi(order.name);
 
-  // 1. Cross-reference with Dispatches on the same slip
   if (qty === 0 && dispatches.length > 0) {
     const matchedDispatch = dispatches.find(d => {
       const dNameNorm = normalizeHindi(d.name);
@@ -632,7 +635,6 @@ function inferOrderDetails(order, dispatches = []) {
     }
   }
 
-  // 2. Reverse Price Benchmark Math
   if (qty === 0 && amount > 0) {
     if (amount === 52000) {
       qty = 8000;
@@ -660,8 +662,7 @@ function inferOrderDetails(order, dispatches = []) {
   return { quantity: qty, grade: grade };
 }
 
-// --- Gemini Content Generation Helper ---
-async function generateContentWithRetry(contents, retries = 3, delay = 1500) {
+async function generateContentWithRetry(contents, retries = 2, delay = 1000) {
   const model = genAI.getGenerativeModel({
     model: MODEL_NAME,
     generationConfig: {
@@ -676,7 +677,6 @@ async function generateContentWithRetry(contents, retries = 3, delay = 1500) {
       return await model.generateContent(contents);
     } catch (err) {
       const status = err.status || (err.response && err.response.status);
-      console.warn(`[Gemini Attempt ${attempt}] Status: ${status || err.message}`);
       if ((status === 503 || status === 429 || status === 500) && attempt < retries) {
         await new Promise(res => setTimeout(res, delay));
         delay *= 2;
@@ -687,7 +687,6 @@ async function generateContentWithRetry(contents, retries = 3, delay = 1500) {
   }
 }
 
-// --- Smart Cross-Tab Dispatch Processor ---
 async function processBatchDispatches(dateStr, dispatches) {
   if (!sheets || !SPREADSHEET_ID || !dispatches || dispatches.length === 0) return;
 
@@ -726,7 +725,6 @@ async function processBatchDispatches(dateStr, dispatches) {
     let masterOrderedQty = parseTotalQty(dispatch.total_ordered_qty);
     let matchedVillage = dispatch.village || '';
 
-    // Lookup original master order from Orders sheet if Total Ordered is unknown
     if (masterOrderedQty === 0 || !dispatch.total_ordered_qty) {
       if (targetRow && parseTotalQty(targetRow[4]) > 0) {
         masterOrderedQty = parseTotalQty(targetRow[4]);
@@ -809,7 +807,7 @@ async function processBatchDispatches(dateStr, dispatches) {
   await Promise.all(tasks);
 }
 
-// --- Customer Ledger Rebuild Engine (Credit Protection & Auto-Billing) ---
+// --- Customer Ledger Engine (Auto-Billing Credit Deliveries & Settled Ledger) ---
 async function regenerateCustomerLedger() {
   if (!sheets || !SPREADSHEET_ID) return;
   try {
@@ -822,7 +820,6 @@ async function regenerateCustomerLedger() {
     const dispatches = dispatchRes.data.values || [];
     const ledgerMap = new Map();
 
-    // 1. Process Master Orders & Cash Advances
     for (const o of orders) {
       const name = o[1];
       if (!name) continue;
@@ -842,7 +839,6 @@ async function regenerateCustomerLedger() {
       ledgerMap.set(key, item);
     }
 
-    // 2. Process Dispatches & Auto-Bill Credit Deliveries
     for (const d of dispatches) {
       const name = d[1];
       if (!name) continue;
@@ -872,7 +868,6 @@ async function regenerateCustomerLedger() {
       ledgerMap.set(key, item);
     }
 
-    // 3. Rebuild Ledger Rows with Accurate Financial Dues
     const ledgerRows = [];
     for (const [, acc] of ledgerMap.entries()) {
       const pendingBricks = Math.max(0, acc.orderedBricks - acc.dispatchedBricks);
@@ -909,7 +904,6 @@ async function regenerateCustomerLedger() {
   }
 }
 
-// --- Dynamic Row-by-Row Update Core ---
 async function updateSingleRow(tab, rowIndex, updates) {
   try {
     const res = await sheets.spreadsheets.values.get({
@@ -1063,7 +1057,6 @@ async function deleteSheetEntries(targetTabs, filter, deleteAll = false) {
   return { success: deletedTabs.length > 0, deletedFrom: deletedTabs, clearedAll: false, count: totalDeletedCount };
 }
 
-// --- Date Report Generator ---
 async function generateDateReport(dateStr, scope = 'full') {
   if (!sheets || !SPREADSHEET_ID) return null;
   const targetDate = resolveDateStr(dateStr);
@@ -1122,7 +1115,6 @@ async function generateDateReport(dateStr, scope = 'full') {
   }
 }
 
-// --- Customer Search Helper ---
 async function getCustomerDetails(customerName, targetDate = null) {
   if (!sheets || !SPREADSHEET_ID || !customerName) return null;
   const searchNorm = normalizeHindi(customerName);
@@ -1183,7 +1175,6 @@ async function getCustomerDetails(customerName, targetDate = null) {
   }
 }
 
-// --- Smart Idempotent Schema Structure Synchronizer ---
 async function ensureSchemaStructure() {
   if (!sheets || !SPREADSHEET_ID) return;
 
@@ -1212,7 +1203,6 @@ async function ensureSchemaStructure() {
     const sheetMap = new Map();
     meta.data.sheets.forEach(s => sheetMap.set(s.properties.title, s.properties.sheetId));
 
-    // 1. Create missing tabs only
     const missingTabs = Object.keys(SCHEMA).filter(t => !sheetMap.has(t));
     if (missingTabs.length > 0) {
       console.log(`[Schema Sync] Creating ${missingTabs.length} missing tab(s): ${missingTabs.join(', ')}`);
@@ -1227,7 +1217,6 @@ async function ensureSchemaStructure() {
       });
     }
 
-    // 2. Fetch all existing Row 1 headers in a single batch read
     const ranges = Object.keys(SCHEMA).map(t => `${t}!1:1`);
     const batchRes = await sheets.spreadsheets.values.batchGet({
       spreadsheetId: SPREADSHEET_ID,
@@ -1247,8 +1236,6 @@ async function ensureSchemaStructure() {
         requiredHeaders.some((h, i) => h !== existingHeaders[i]);
 
       if (isHeaderMismatch) {
-        console.log(`[Schema Sync] Updating headers for tab: ${tabName}`);
-
         valueUpdates.push({
           range: `${tabName}!A1:${String.fromCharCode(64 + requiredHeaders.length)}1`,
           values: [requiredHeaders]
@@ -1298,7 +1285,6 @@ async function ensureSchemaStructure() {
       });
     }
 
-    // 3. Seed canonical memory if Agent_Memory is empty
     const memCheck = await sheets.spreadsheets.values.get({
       spreadsheetId: SPREADSHEET_ID,
       range: 'Agent_Memory!A2:E'
@@ -1312,13 +1298,15 @@ async function ensureSchemaStructure() {
       });
     }
 
-    if (missingTabs.length === 0 && valueUpdates.length === 0) {
-      console.log('⚡ [Schema Sync] Sheet structure is already up-to-date. Zero API writes needed.');
-    }
+    await getDynamicRules(true);
+    console.log('⚡ [Schema Sync] Sheet structure is ready and Memory rules cached.');
   } catch (err) {
     console.error('[Schema Sync Error]:', err.message);
   }
 }
+
+// Health check endpoint
+app.get(['/', '/health'], (req, res) => res.status(200).send('Brick Kiln AI Agent is Live! 🚀'));
 
 // --- Main Webhook Endpoint ---
 app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res) => {
@@ -1385,7 +1373,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
 
     const defaultDate = getISTDate(0);
 
-    // --- 1. DYNAMIC MEMORY RULE LEARNING ---
+    // 1. MEMORY RULE LEARNING
     if (parsed.intent === 'learn_memory' || (parsed.learned_memory_rule && parsed.learned_memory_rule.is_learning_instruction)) {
       const mem = parsed.learned_memory_rule;
       if (sheets && mem?.alias_trigger && mem?.canonical_value) {
@@ -1403,12 +1391,13 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
             ]]
           }
         });
+        await getDynamicRules(true);
         await sendWhatsAppReply(sender, `🧠 *नया नियम याद कर लिया गया है!*\n• उपनाम/गलत वर्तनी: "${mem.alias_trigger}"\n• सही मानक नाम: *${mem.canonical_value}* ${mem.associated_location ? `(${mem.associated_location})` : ''}`);
         return;
       }
     }
 
-    // --- 2. GST INVOICE GENERATION (DIRECT PDF GENERATION + AUTO-FALLBACK) ---
+    // 2. FAST PDF GST INVOICE GENERATION
     if (parsed.intent === 'generate_invoice' || (text && (text.includes('बिल') || text.toLowerCase().includes('bill')))) {
       const invReq = parsed.invoice_request || {};
       const invData = {
@@ -1427,19 +1416,20 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
           sender,
           base64Pdf,
           `Invoice_${invData.invoiceNo}.pdf`,
-          `📄 *पक्का बिल (Tax Invoice)*\n• ग्राहक: *${invData.customerName}* (${invData.village})\n• मात्रा: *${Number(invData.qty).toLocaleString('en-IN')} नग [${invData.grade}]*\n• कुल मूल्य: *₹${((invData.qty * invData.ratePerThousand / 1000) * 1.06).toFixed(2)}*`
+          `📄 *पक्का बिल (Tax Invoice)*\n• फर्म: *${FIRM_NAME}*\n• ग्राहक: *${invData.customerName}* (${invData.village})\n• मात्रा: *${Number(invData.qty).toLocaleString('en-IN')} नग [${invData.grade}]*\n• कुल मूल्य: *₹${((invData.qty * invData.ratePerThousand / 1000) * 1.06).toFixed(2)}*`
         );
       } catch (pdfErr) {
-        console.error('[PDF Send Failed, falling back to text]:', pdfErr.message);
+        console.error('[PDF Fallback to Text]:', pdfErr.message);
         const fallbackText = formatGSTInvoice(invData);
         await sendWhatsAppReply(sender, fallbackText);
       }
       return;
     }
 
-    // --- 3. EXPLICIT SHEET / LEDGER SYNC TRIGGER ---
+    // 3. EXPLICIT SHEET SYNC
     if (parsed.intent === 'sync_ledger' || (text && (text.includes('शीट सिंक') || text.includes('डेटा रिफ्रेश') || text.includes('sync sheet')))) {
       await regenerateCustomerLedger();
+      await getDynamicRules(true);
       await sendWhatsAppReply(
         sender,
         `🔄 *शीट डेटा सफलतापूर्वक सिंक और अपडेट हो गया है!*\n\n• सभी ग्राहक खाते और बकाया (Customer Ledger) री-कैलकुलेट हो चुके हैं।\n• मेमोरी और मानक नियम सक्रिय हैं।`
@@ -1447,7 +1437,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 4. SCOPED DATE QUERIES ---
+    // 4. SCOPED DATE QUERIES
     if (parsed.intent === 'query_date_summary' && sheets) {
       const targetDate = parsed.search_filter?.date || 'yesterday';
       const scope = parsed.search_filter?.scope || 'full';
@@ -1456,7 +1446,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 5. CUSTOMER QUERIES WITH DUAL LEDGER ---
+    // 5. CUSTOMER QUERIES
     if (parsed.intent === 'query_customer' && sheets) {
       const customerName = parsed.search_filter?.customer_name || parsed.name;
       const dateFilter = parsed.search_filter?.date || null;
@@ -1488,7 +1478,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 6. READ-ONLY SLIP SUMMARY (NO GOOGLE SHEET WRITES) ---
+    // 6. READ-ONLY SLIP SUMMARY
     if (parsed.intent === 'query_slip_summary') {
       let summaryReply = parsed.reply_text || '📋 पर्ची का हिसाब जांच लिया गया है।';
       if (parsed.daily_closing) {
@@ -1503,13 +1493,12 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 7. COMPREHENSIVE BATCH & IMAGE TRANSACTION HANDLER ---
+    // 7. COMPREHENSIVE BATCH & IMAGE TRANSACTION HANDLER
     const hasBatchData = (parsed.orders?.length > 0) || (parsed.dispatches?.length > 0) || (parsed.expenses?.length > 0) || (parsed.daily_closing && Object.keys(parsed.daily_closing).length > 0);
 
     if (imageMessage || parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image' || hasBatchData) {
       const asyncTasks = [];
 
-      // A. Save Orders with Reverse-Inference & Cross-Slip Checking
       if (parsed.orders && parsed.orders.length > 0) {
         const orderRows = parsed.orders.map(o => {
           const inferred = inferOrderDetails(o, parsed.dispatches || []);
@@ -1539,12 +1528,10 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
         );
       }
 
-      // B. Save Dispatches with Cross-Tab Match
       if (parsed.dispatches && parsed.dispatches.length > 0) {
         asyncTasks.push(processBatchDispatches(defaultDate, parsed.dispatches));
       }
 
-      // C. Save Expenses
       if (parsed.expenses && parsed.expenses.length > 0) {
         const expenseRows = parsed.expenses.map(e => [
           e.date || defaultDate,
@@ -1563,7 +1550,6 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
         );
       }
 
-      // D. Cash Math Verification & Daily Closing
       let anomalyAlert = '';
       if (parsed.daily_closing && (parsed.daily_closing.total_jama || parsed.daily_closing.closing_balance || parsed.daily_closing.total_kharcha)) {
         const dc = parsed.daily_closing;
@@ -1594,7 +1580,6 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
         );
       }
 
-      // E. Coal Consumption Calculation
       if (parsed.coal_consumption_tubs && Number(parsed.coal_consumption_tubs) > 0) {
         const tubs = Number(parsed.coal_consumption_tubs);
         const consumedMT = (tubs * COAL_TUB_KG) / 1000;
@@ -1610,7 +1595,6 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
         );
       }
 
-      // F. Green Brick Rain Damage
       if (parsed.green_brick_rain_loss && Number(parsed.green_brick_rain_loss) > 0) {
         asyncTasks.push(
           appendWithRetry({
@@ -1632,20 +1616,17 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 8. SINGLE ORDER / DISPATCH / EXPENSE / DAILY SUMMARY INTENTS ---
+    // 8. SINGLE INTENTS
     if (parsed.intent === 'order' && sheets) {
       const ordersToProcess = (parsed.orders && parsed.orders.length > 0) ? parsed.orders : [parsed];
       const rows = ordersToProcess.map(o => {
         const inferred = inferOrderDetails(o, parsed.dispatches || []);
-        const finalQty = inferred.quantity;
-        const finalGrade = inferred.grade;
-
         return [
           o.date || defaultDate,
           o.name || 'नकद ग्राहक',
           o.village || '',
-          finalGrade,
-          finalQty,
+          inferred.grade,
+          inferred.quantity,
           o.amount_payable || (o.amount_received || 0),
           o.amount_received || 0,
           o.pending_amount || 0,
@@ -1702,7 +1683,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 9. UPDATES & DELETIONS ---
+    // 9. UPDATES & DELETIONS
     if (parsed.intent === 'update_entry' && sheets) {
       let updatesList = Array.isArray(parsed.updates) && parsed.updates.length > 0 ? parsed.updates : [{
         target_tab: (parsed.target_tabs && parsed.target_tabs[0]) || 'Supply_Dispatch',
@@ -1724,7 +1705,6 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // --- 10. FALLBACK DIRECT REPLY ---
     if (parsed.reply_text) {
       await sendWhatsAppReply(sender, parsed.reply_text);
     }
@@ -1733,7 +1713,19 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
   }
 });
 
-// --- Scheduled End-of-Day Owner WhatsApp Report (8:30 PM IST Daily) ---
+// --- Keep-Alive Ping (10 Mins) ---
+cron.schedule('*/10 * * * *', async () => {
+  try {
+    if (RENDER_EXTERNAL_URL) {
+      await axios.get(`${RENDER_EXTERNAL_URL}/health`, { timeout: 5000 });
+      console.log('⚡ [Keep-Alive] Self ping successful.');
+    }
+  } catch (e) {
+    // Silent catch
+  }
+});
+
+// --- Scheduled End-of-Day Snapshot (8:30 PM IST Daily) ---
 cron.schedule('30 20 * * *', async () => {
   try {
     const today = getISTDate(0);
@@ -1741,7 +1733,6 @@ cron.schedule('30 20 * * *', async () => {
     if (report && OWNER_PHONE_NUMBER) {
       const header = `👑 *मालिक दैनिक रिपोर्ट (Daily Owner Snapshot)*\n`;
       await sendWhatsAppReply(OWNER_PHONE_NUMBER, header + report);
-      console.log(`[Cron] Nightly report dispatched to Owner (${OWNER_PHONE_NUMBER}).`);
     }
   } catch (err) {
     console.error('[Nightly Cron Error]:', err.message);
@@ -1750,7 +1741,7 @@ cron.schedule('30 20 * * *', async () => {
   timezone: 'Asia/Kolkata'
 });
 
-// --- Server Boot & Schema Validation ---
+// --- Server Boot ---
 app.listen(PORT, async () => {
   console.log(`🚀 Brick Kiln Munshi AI Server running on port ${PORT}`);
   await ensureSchemaStructure();
