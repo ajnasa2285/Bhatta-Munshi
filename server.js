@@ -115,6 +115,45 @@ function getRateForGrade(gradeStr) {
   return 7500;
 }
 
+// --- Helper: Convert Hindi Strings to Clean English for PDFKit ---
+function toAsciiText(str) {
+  if (!str) return '';
+  const map = {
+    'कधंई': 'Kanhai (Kandhai)',
+    'कन्हाई': 'Kanhai',
+    'कन्धाई': 'Kandhai',
+    'पूरे काशीराम': 'Pure Kashiram',
+    'सन्तराम': 'Santram',
+    'बरई पारा': 'Barai Para',
+    'मुकीम': 'Mukim',
+    'इटौँजा': 'Itaunja',
+    'नन्हे खा': 'Nanhe Khan',
+    'सरूरपुर': 'Saroorpur',
+    'मुलायम यादव': 'Mulayam Yadav',
+    'गडौली': 'Gadauli',
+    'बालगोविन्द': 'Balgovind',
+    'महुलारा': 'Mahulara',
+    'गगन सिंह': 'Gagan Singh',
+    'मिल्कीपुर': 'Milkipur',
+    'राम कुमार': 'Ram Kumar',
+    'बसापुर': 'Basapur',
+    'ब्लूमिंग बर्ड': 'Blooming Bird',
+    'कुमारगंज': 'Kumarganj',
+    'अनूप सिंह': 'Anoop Singh',
+    'अव्वल': 'Awwal (Grade 1)',
+    'मीठा': 'Meetha (Grade 2)',
+    'खंजड़': 'Khanjad',
+    'गोड़िया': 'Godiya',
+    'पीला': 'Peela',
+    'रोड़ा अव्वल': 'Awwal Roda',
+    'रोड़ा पीला': 'Peela Roda',
+    'अव्वल रोड़ा': 'Awwal Roda',
+    'पीला रोड़ा': 'Peela Roda',
+    'ट्रॉली': 'Trolley'
+  };
+  return map[str.trim()] || str.toString().replace(/[^\x00-\x7F]/g, '');
+}
+
 // --- Sheets API Append Helper with Retry ---
 async function appendWithRetry(params, retries = 2, delay = 800) {
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -148,124 +187,135 @@ async function sendWhatsAppReply(recipient, text) {
   }
 }
 
-// --- WhatsApp Document Helper (PDF Send) ---
+// --- WhatsApp Document Helper (PDF Send via Evolution API) ---
 async function sendWhatsAppDocument(recipient, base64Pdf, fileName, caption = '') {
-  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) return;
-  try {
-    const cleanNumber = recipient.replace('@s.whatsapp.net', '').replace('@c.us', '');
-    await axios.post(
-      `${WHATSAPP_GATEWAY_BASE_URL}/message/sendMedia/${WHATSAPP_GATEWAY_TYPE}`,
-      {
-        number: cleanNumber,
-        media: `data:application/pdf;base64,${base64Pdf}`,
-        mediatype: 'document',
-        mimetype: 'application/pdf',
-        fileName: fileName || 'Tax_Invoice.pdf',
-        caption: caption
-      },
-      { headers: { apikey: WHATSAPP_GATEWAY_KEY } }
-    );
-    console.log(`[PDF Invoice] Dispatched to ${cleanNumber}`);
-  } catch (error) {
-    console.error('[Document Send Error]:', JSON.stringify(error.response?.data || error.message, null, 2));
+  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) {
+    throw new Error('WhatsApp Gateway environment variables are not configured');
   }
+  const cleanNumber = recipient.replace('@s.whatsapp.net', '').replace('@c.us', '');
+  const cleanBase64 = base64Pdf.replace(/^data:application\/pdf;base64,/, '');
+
+  const payload = {
+    number: cleanNumber,
+    mediatype: 'document',
+    mimetype: 'application/pdf',
+    caption: caption,
+    media: cleanBase64,
+    fileName: fileName || 'Tax_Invoice.pdf'
+  };
+
+  const response = await axios.post(
+    `${WHATSAPP_GATEWAY_BASE_URL}/message/sendMedia/${WHATSAPP_GATEWAY_TYPE}`,
+    payload,
+    { headers: { apikey: WHATSAPP_GATEWAY_KEY } }
+  );
+
+  console.log(`[PDF Invoice] Dispatched to ${cleanNumber}`);
+  return response.data;
 }
 
-// --- PDF Generator Engine (A4 GST 6% Tax Invoice) ---
+// --- Crash-Proof A4 GST 6% Tax Invoice PDF Generator ---
 function createInvoicePDFBuffer(invoiceData) {
   return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: 'A4', margin: 40 });
-    const buffers = [];
+    try {
+      const doc = new PDFDocument({ size: 'A4', margin: 40 });
+      const buffers = [];
 
-    doc.on('data', buffers.push.bind(buffers));
-    doc.on('end', () => resolve(Buffer.concat(buffers).toString('base64')));
-    doc.on('error', reject);
+      doc.on('data', buffers.push.bind(buffers));
+      doc.on('end', () => resolve(Buffer.concat(buffers).toString('base64')));
+      doc.on('error', (err) => reject(err));
 
-    const {
-      invoiceNo = `BK-${Date.now().toString().slice(-4)}`,
-      date = getISTDate(0),
-      customerName = 'कधंई',
-      village = 'पूरे काशीराम',
-      grade = 'अव्वल',
-      qty = 2000,
-      ratePerThousand = 7500
-    } = invoiceData;
+      const {
+        invoiceNo = `BK-${Date.now().toString().slice(-4)}`,
+        date = getISTDate(0),
+        customerName = 'कधंई',
+        village = 'पूरे काशीराम',
+        grade = 'अव्वल',
+        qty = 2000,
+        ratePerThousand = 7500
+      } = invoiceData;
 
-    const quantity = Number(qty) || 2000;
-    const rate = Number(ratePerThousand) || 7500;
-    const taxableValue = (quantity * rate) / 1000;
-    const cgst = taxableValue * 0.03;
-    const sgst = taxableValue * 0.03;
-    const totalAmount = taxableValue + cgst + sgst;
+      const quantity = Number(qty) || 2000;
+      const rate = Number(ratePerThousand) || 7500;
+      const taxableValue = (quantity * rate) / 1000;
+      const cgst = taxableValue * 0.03;
+      const sgst = taxableValue * 0.03;
+      const totalAmount = taxableValue + cgst + sgst;
 
-    // Header Banner
-    doc.fillColor('#c2410c').fontSize(20).text(process.env.KILN_NAME || 'SHRI GANESH BRICK FIELD', { align: 'center' });
-    doc.fillColor('#334155').fontSize(11).text('TAX INVOICE (पक्का बिल)', { align: 'center' });
-    doc.moveDown(0.5);
+      const safeCustomer = toAsciiText(customerName) || 'Kanhai';
+      const safeVillage = toAsciiText(village) || 'Pure Kashiram';
+      const safeGrade = toAsciiText(grade) || 'Awwal (Grade 1)';
 
-    // Business Metadata
-    doc.fontSize(9).fillColor('#000000');
-    doc.text(`GSTIN: ${process.env.KILN_GSTIN || '09AAAAA0000A1Z5'} | State: Uttar Pradesh (Code: 09) | HSN: 69041000`, { align: 'center' });
-    doc.moveDown(1);
-    doc.rect(40, 105, 515, 1).fill('#cbd5e1');
+      // 1. Header
+      doc.fillColor('#c2410c').fontSize(20).font('Helvetica-Bold').text(process.env.KILN_NAME || 'SHRI GANESH BRICK FIELD', { align: 'center' });
+      doc.fillColor('#334155').fontSize(11).font('Helvetica').text('TAX INVOICE (PAKKA BILL)', { align: 'center' });
+      doc.moveDown(0.4);
 
-    // Invoice Meta & Billed-To
-    doc.fontSize(10).fillColor('#0f172a');
-    doc.text(`Invoice No : ${invoiceNo}`, 45, 120);
-    doc.text(`Date       : ${date}`, 45, 135);
+      // 2. Business Tax Info
+      doc.fontSize(9).fillColor('#000000').text(`GSTIN: ${process.env.KILN_GSTIN || '09AAAAA0000A1Z5'} | State: Uttar Pradesh (09) | HSN: 69041000`, { align: 'center' });
+      doc.moveDown(0.8);
+      doc.rect(40, 105, 515, 1).fill('#cbd5e1');
 
-    doc.text(`Billed To  : ${customerName}`, 320, 120);
-    doc.text(`Address    : ${village}, Uttar Pradesh`, 320, 135);
+      // 3. Invoice Metadata & Buyer Info
+      doc.fontSize(10).fillColor('#0f172a').font('Helvetica');
+      doc.text(`Invoice No : ${invoiceNo}`, 45, 120);
+      doc.text(`Date       : ${date}`, 45, 135);
 
-    // Items Table Header
-    const tableTop = 165;
-    doc.rect(40, tableTop, 515, 22).fill('#f1f5f9');
-    doc.fillColor('#0f172a').fontSize(10).font('Helvetica-Bold');
-    doc.text('Description', 50, tableTop + 6);
-    doc.text('Grade', 180, tableTop + 6);
-    doc.text('Quantity', 270, tableTop + 6);
-    doc.text('Rate / 1000', 360, tableTop + 6);
-    doc.text('Amount (INR)', 450, tableTop + 6);
+      doc.text(`Billed To  : ${safeCustomer}`, 320, 120);
+      doc.text(`Address    : ${safeVillage}, UP`, 320, 135);
 
-    // Items Row
-    const rowY = tableTop + 30;
-    doc.font('Helvetica').fontSize(10);
-    doc.text('Burnt Clay Bricks', 50, rowY);
-    doc.text(grade, 180, rowY);
-    doc.text(quantity.toLocaleString('en-IN'), 270, rowY);
-    doc.text(`₹${rate.toLocaleString('en-IN')}`, 360, rowY);
-    doc.text(`₹${taxableValue.toFixed(2)}`, 450, rowY);
+      // 4. Items Table Header
+      const tableTop = 165;
+      doc.rect(40, tableTop, 515, 22).fill('#f1f5f9');
+      doc.fillColor('#0f172a').fontSize(10).font('Helvetica-Bold');
+      doc.text('Description', 50, tableTop + 6);
+      doc.text('Grade', 190, tableTop + 6);
+      doc.text('Quantity', 280, tableTop + 6);
+      doc.text('Rate / 1000', 370, tableTop + 6);
+      doc.text('Amount (INR)', 455, tableTop + 6);
 
-    doc.rect(40, rowY + 25, 515, 1).fill('#cbd5e1');
+      // 5. Items Row
+      const rowY = tableTop + 30;
+      doc.font('Helvetica').fontSize(10);
+      doc.text('Burnt Clay Bricks', 50, rowY);
+      doc.text(safeGrade, 190, rowY);
+      doc.text(quantity.toLocaleString('en-IN') + ' Pcs', 280, rowY);
+      doc.text(`Rs. ${rate.toLocaleString('en-IN')}`, 370, rowY);
+      doc.text(`Rs. ${taxableValue.toFixed(2)}`, 455, rowY);
 
-    // Tax Calculation Section
-    const taxY = rowY + 35;
-    doc.fontSize(9).fillColor('#334155');
-    doc.text('Taxable Amount:', 340, taxY);
-    doc.text(`₹${taxableValue.toFixed(2)}`, 450, taxY);
+      doc.rect(40, rowY + 25, 515, 1).fill('#cbd5e1');
 
-    doc.text('CGST @ 3%:', 340, taxY + 16);
-    doc.text(`₹${cgst.toFixed(2)}`, 450, taxY + 16);
+      // 6. Taxes & Net Calculation
+      const taxY = rowY + 35;
+      doc.fontSize(9).fillColor('#334155');
+      doc.text('Taxable Amount:', 340, taxY);
+      doc.text(`Rs. ${taxableValue.toFixed(2)}`, 455, taxY);
 
-    doc.text('SGST @ 3%:', 340, taxY + 32);
-    doc.text(`₹${sgst.toFixed(2)}`, 450, taxY + 32);
+      doc.text('CGST @ 3%:', 340, taxY + 16);
+      doc.text(`Rs. ${cgst.toFixed(2)}`, 455, taxY + 16);
 
-    doc.rect(330, taxY + 48, 225, 1).fill('#cbd5e1');
+      doc.text('SGST @ 3%:', 340, taxY + 32);
+      doc.text(`Rs. ${sgst.toFixed(2)}`, 455, taxY + 32);
 
-    doc.fontSize(11).font('Helvetica-Bold').fillColor('#0f172a');
-    doc.text('Total Invoice Value:', 320, taxY + 56);
-    doc.text(`₹${totalAmount.toFixed(2)}`, 450, taxY + 56);
+      doc.rect(330, taxY + 48, 225, 1).fill('#cbd5e1');
 
-    // Settlement Bank Details Box
-    const bankY = taxY + 110;
-    doc.rect(40, bankY - 10, 515, 65).stroke('#cbd5e1');
-    doc.fontSize(9).font('Helvetica-Bold').fillColor('#c2410c').text('BANK DETAILS FOR SETTLEMENT:', 50, bankY);
-    doc.font('Helvetica').fillColor('#0f172a');
-    doc.text(`Bank Name: ${process.env.BANK_NAME || 'State Bank of India'}`, 50, bankY + 15);
-    doc.text(`Account No: ${process.env.BANK_ACCOUNT_NO || 'XXXXXXXXXXXX1234'}`, 50, bankY + 28);
-    doc.text(`IFSC: ${process.env.BANK_IFSC || 'SBIN000XXXX'} | Account Holder: ${process.env.BANK_ACCOUNT_HOLDER || 'Shri Ganesh Brick Field'}`, 50, bankY + 41);
+      doc.fontSize(11).font('Helvetica-Bold').fillColor('#0f172a');
+      doc.text('Total Invoice Value:', 320, taxY + 56);
+      doc.text(`Rs. ${totalAmount.toFixed(2)}`, 455, taxY + 56);
 
-    doc.end();
+      // 7. Settlement Bank Account Box
+      const bankY = taxY + 110;
+      doc.rect(40, bankY - 10, 515, 65).stroke('#cbd5e1');
+      doc.fontSize(9).font('Helvetica-Bold').fillColor('#c2410c').text('BANK PAYMENT DETAILS:', 50, bankY);
+      doc.font('Helvetica').fillColor('#0f172a');
+      doc.text(`Bank Name : ${process.env.BANK_NAME || 'State Bank of India'}`, 50, bankY + 15);
+      doc.text(`Account No: ${process.env.BANK_ACCOUNT_NO || 'XXXXXXXXXXXX1234'}`, 50, bankY + 28);
+      doc.text(`IFSC Code : ${process.env.BANK_IFSC || 'SBIN000XXXX'} | Holder: ${process.env.BANK_ACCOUNT_HOLDER || 'Shri Ganesh Brick Field'}`, 50, bankY + 41);
+
+      doc.end();
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
@@ -286,7 +336,7 @@ function formatGSTInvoice({ invoiceNo, date, customerName, village, grade, qty, 
 इनवॉइस सं०: ${invoiceNo || `BK-${Date.now().toString().slice(-4)}`}
 दिनांक: ${date || getISTDate(0)}
 GSTIN: ${process.env.KILN_GSTIN || '09AAAAA0000A1Z5'}
-State: Uttar Pradesh (Code: ${process.env.KILN_STATE_CODE || '09'})
+State: Uttar Pradesh (Code: 09)
 
 क्रेता का विवरण (Billed To):
 नाम: ${customerName || 'कधंई'}
@@ -558,7 +608,7 @@ CRITICAL OPERATIONAL RULES:
 5. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES (e.g. '1000 गोड़िया / 1000 मीठा').
 6. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम) across all orders, dispatches, and queries.
 7. When learning a new rule (e.g. 'याद रखना X का मतलब Y है'), set intent: 'learn_memory' and populate 'learned_memory_rule'.
-8. When invoice or bill is requested (e.g. 'कधंई का बिल बनाओ', 'bill pdf bhejo'), set intent: 'generate_invoice' and populate 'invoice_request'.
+8. When invoice or bill is requested (e.g. 'कधंई का बिल बनाओ', 'bill pdf bhejo', 'pakka bill pdf'), set intent: 'generate_invoice' and populate 'invoice_request'.
 9. Format all dates as DD-MM-YYYY using current year 2026.
 `;
 }
@@ -1358,7 +1408,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       }
     }
 
-    // --- 2. GST INVOICE GENERATION (DIRECT PDF GENERATION + DISPATCH) ---
+    // --- 2. GST INVOICE GENERATION (DIRECT PDF GENERATION + AUTO-FALLBACK) ---
     if (parsed.intent === 'generate_invoice' || (text && (text.includes('बिल') || text.toLowerCase().includes('bill')))) {
       const invReq = parsed.invoice_request || {};
       const invData = {
@@ -1376,13 +1426,13 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
         await sendWhatsAppDocument(
           sender,
           base64Pdf,
-          `Invoice_${invData.customerName}_${invData.invoiceNo}.pdf`,
-          `📄 *पक्का बिल (Tax Invoice)*\n• ग्राहक: *${invData.customerName}* (${invData.village})\n• मात्रा: *${Number(invData.qty).toLocaleString('en-IN')} नग [${invData.grade}]*\n• कुल इनवॉइस मूल्य: *₹${((invData.qty * invData.ratePerThousand / 1000) * 1.06).toFixed(2)}*`
+          `Invoice_${invData.invoiceNo}.pdf`,
+          `📄 *पक्का बिल (Tax Invoice)*\n• ग्राहक: *${invData.customerName}* (${invData.village})\n• मात्रा: *${Number(invData.qty).toLocaleString('en-IN')} नग [${invData.grade}]*\n• कुल मूल्य: *₹${((invData.qty * invData.ratePerThousand / 1000) * 1.06).toFixed(2)}*`
         );
       } catch (pdfErr) {
-        console.error('[PDF Generation Fallback]:', pdfErr.message);
-        const invoiceCard = formatGSTInvoice(invData);
-        await sendWhatsAppReply(sender, invoiceCard);
+        console.error('[PDF Send Failed, falling back to text]:', pdfErr.message);
+        const fallbackText = formatGSTInvoice(invData);
+        await sendWhatsAppReply(sender, fallbackText);
       }
       return;
     }
