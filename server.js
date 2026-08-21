@@ -5,6 +5,7 @@ const axios = require('axios');
 const cron = require('node-cron');
 const { google } = require('googleapis');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const PDFDocument = require('pdfkit');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -92,7 +93,7 @@ function resolveDateStr(inputDate) {
   return inputDate.replace(/\//g, '-').trim();
 }
 
-// --- Rate Matrix for Auto-Billing Dispatches ---
+// --- Rate Matrix for Auto-Billing & Reverse Estimation ---
 const GRADE_RATES = {
   'अव्वल': 7500,
   'मीठा': 6500,
@@ -131,7 +132,7 @@ async function appendWithRetry(params, retries = 2, delay = 800) {
   }
 }
 
-// --- WhatsApp Reply Helper ---
+// --- WhatsApp Reply Helper (Text) ---
 async function sendWhatsAppReply(recipient, text) {
   if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) return;
   try {
@@ -141,10 +142,173 @@ async function sendWhatsAppReply(recipient, text) {
       { number: cleanNumber, text: text },
       { headers: { apikey: WHATSAPP_GATEWAY_KEY } }
     );
-    console.log(`[Reply] Sent to ${cleanNumber}`);
+    console.log(`[Text Reply] Sent to ${cleanNumber}`);
   } catch (error) {
     console.error('[Reply Error]:', JSON.stringify(error.response?.data || error.message, null, 2));
   }
+}
+
+// --- WhatsApp Document Helper (PDF Send) ---
+async function sendWhatsAppDocument(recipient, base64Pdf, fileName, caption = '') {
+  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) return;
+  try {
+    const cleanNumber = recipient.replace('@s.whatsapp.net', '').replace('@c.us', '');
+    await axios.post(
+      `${WHATSAPP_GATEWAY_BASE_URL}/message/sendMedia/${WHATSAPP_GATEWAY_TYPE}`,
+      {
+        number: cleanNumber,
+        media: `data:application/pdf;base64,${base64Pdf}`,
+        mediatype: 'document',
+        mimetype: 'application/pdf',
+        fileName: fileName || 'Tax_Invoice.pdf',
+        caption: caption
+      },
+      { headers: { apikey: WHATSAPP_GATEWAY_KEY } }
+    );
+    console.log(`[PDF Invoice] Dispatched to ${cleanNumber}`);
+  } catch (error) {
+    console.error('[Document Send Error]:', JSON.stringify(error.response?.data || error.message, null, 2));
+  }
+}
+
+// --- PDF Generator Engine (A4 GST 6% Tax Invoice) ---
+function createInvoicePDFBuffer(invoiceData) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 40 });
+    const buffers = [];
+
+    doc.on('data', buffers.push.bind(buffers));
+    doc.on('end', () => resolve(Buffer.concat(buffers).toString('base64')));
+    doc.on('error', reject);
+
+    const {
+      invoiceNo = `BK-${Date.now().toString().slice(-4)}`,
+      date = getISTDate(0),
+      customerName = 'कधंई',
+      village = 'पूरे काशीराम',
+      grade = 'अव्वल',
+      qty = 2000,
+      ratePerThousand = 7500
+    } = invoiceData;
+
+    const quantity = Number(qty) || 2000;
+    const rate = Number(ratePerThousand) || 7500;
+    const taxableValue = (quantity * rate) / 1000;
+    const cgst = taxableValue * 0.03;
+    const sgst = taxableValue * 0.03;
+    const totalAmount = taxableValue + cgst + sgst;
+
+    // Header Banner
+    doc.fillColor('#c2410c').fontSize(20).text(process.env.KILN_NAME || 'SHRI GANESH BRICK FIELD', { align: 'center' });
+    doc.fillColor('#334155').fontSize(11).text('TAX INVOICE (पक्का बिल)', { align: 'center' });
+    doc.moveDown(0.5);
+
+    // Business Metadata
+    doc.fontSize(9).fillColor('#000000');
+    doc.text(`GSTIN: ${process.env.KILN_GSTIN || '09AAAAA0000A1Z5'} | State: Uttar Pradesh (Code: 09) | HSN: 69041000`, { align: 'center' });
+    doc.moveDown(1);
+    doc.rect(40, 105, 515, 1).fill('#cbd5e1');
+
+    // Invoice Meta & Billed-To
+    doc.fontSize(10).fillColor('#0f172a');
+    doc.text(`Invoice No : ${invoiceNo}`, 45, 120);
+    doc.text(`Date       : ${date}`, 45, 135);
+
+    doc.text(`Billed To  : ${customerName}`, 320, 120);
+    doc.text(`Address    : ${village}, Uttar Pradesh`, 320, 135);
+
+    // Items Table Header
+    const tableTop = 165;
+    doc.rect(40, tableTop, 515, 22).fill('#f1f5f9');
+    doc.fillColor('#0f172a').fontSize(10).font('Helvetica-Bold');
+    doc.text('Description', 50, tableTop + 6);
+    doc.text('Grade', 180, tableTop + 6);
+    doc.text('Quantity', 270, tableTop + 6);
+    doc.text('Rate / 1000', 360, tableTop + 6);
+    doc.text('Amount (INR)', 450, tableTop + 6);
+
+    // Items Row
+    const rowY = tableTop + 30;
+    doc.font('Helvetica').fontSize(10);
+    doc.text('Burnt Clay Bricks', 50, rowY);
+    doc.text(grade, 180, rowY);
+    doc.text(quantity.toLocaleString('en-IN'), 270, rowY);
+    doc.text(`₹${rate.toLocaleString('en-IN')}`, 360, rowY);
+    doc.text(`₹${taxableValue.toFixed(2)}`, 450, rowY);
+
+    doc.rect(40, rowY + 25, 515, 1).fill('#cbd5e1');
+
+    // Tax Calculation Section
+    const taxY = rowY + 35;
+    doc.fontSize(9).fillColor('#334155');
+    doc.text('Taxable Amount:', 340, taxY);
+    doc.text(`₹${taxableValue.toFixed(2)}`, 450, taxY);
+
+    doc.text('CGST @ 3%:', 340, taxY + 16);
+    doc.text(`₹${cgst.toFixed(2)}`, 450, taxY + 16);
+
+    doc.text('SGST @ 3%:', 340, taxY + 32);
+    doc.text(`₹${sgst.toFixed(2)}`, 450, taxY + 32);
+
+    doc.rect(330, taxY + 48, 225, 1).fill('#cbd5e1');
+
+    doc.fontSize(11).font('Helvetica-Bold').fillColor('#0f172a');
+    doc.text('Total Invoice Value:', 320, taxY + 56);
+    doc.text(`₹${totalAmount.toFixed(2)}`, 450, taxY + 56);
+
+    // Settlement Bank Details Box
+    const bankY = taxY + 110;
+    doc.rect(40, bankY - 10, 515, 65).stroke('#cbd5e1');
+    doc.fontSize(9).font('Helvetica-Bold').fillColor('#c2410c').text('BANK DETAILS FOR SETTLEMENT:', 50, bankY);
+    doc.font('Helvetica').fillColor('#0f172a');
+    doc.text(`Bank Name: ${process.env.BANK_NAME || 'State Bank of India'}`, 50, bankY + 15);
+    doc.text(`Account No: ${process.env.BANK_ACCOUNT_NO || 'XXXXXXXXXXXX1234'}`, 50, bankY + 28);
+    doc.text(`IFSC: ${process.env.BANK_IFSC || 'SBIN000XXXX'} | Account Holder: ${process.env.BANK_ACCOUNT_HOLDER || 'Shri Ganesh Brick Field'}`, 50, bankY + 41);
+
+    doc.end();
+  });
+}
+
+// --- Text Invoice Fallback ---
+function formatGSTInvoice({ invoiceNo, date, customerName, village, grade, qty, ratePerThousand }) {
+  const quantity = Number(qty) || 2000;
+  const rate = Number(ratePerThousand) || 7500;
+  const taxableValue = (quantity * rate) / 1000;
+  const cgst = taxableValue * 0.03;
+  const sgst = taxableValue * 0.03;
+  const totalAmount = taxableValue + cgst + sgst;
+
+  return `
+=========================================
+          ${process.env.KILN_NAME || 'श्री गणेश ईंट उद्योग'}
+           TAX INVOICE (पक्का बिल)
+=========================================
+इनवॉइस सं०: ${invoiceNo || `BK-${Date.now().toString().slice(-4)}`}
+दिनांक: ${date || getISTDate(0)}
+GSTIN: ${process.env.KILN_GSTIN || '09AAAAA0000A1Z5'}
+State: Uttar Pradesh (Code: ${process.env.KILN_STATE_CODE || '09'})
+
+क्रेता का विवरण (Billed To):
+नाम: ${customerName || 'कधंई'}
+गाँव/पता: ${village || 'पूरे काशीराम'}, उत्तर प्रदेश
+-----------------------------------------
+विवरण: लाल पक्की ईंट (${grade || 'अव्वल'})
+HSN Code: 69041000
+मात्रा: ${quantity.toLocaleString('en-IN')} नग
+दर (Rate): ₹${rate.toLocaleString('en-IN')} / हज़ार
+-----------------------------------------
+कर योग्य मूल्य (Taxable Amount): ₹${taxableValue.toFixed(2)}
+CGST @ 3%                     : ₹${cgst.toFixed(2)}
+SGST @ 3%                     : ₹${sgst.toFixed(2)}
+-----------------------------------------
+कुल इनवॉइस मूल्य (Total Value) : ₹${totalAmount.toFixed(2)}
+=========================================
+बैंक विवरण (Bank Details):
+• बैंक: ${process.env.BANK_NAME || 'State Bank of India'}
+• खाता: ${process.env.BANK_ACCOUNT_NO || 'XXXXXXXXXXXX1234'}
+• IFSC: ${process.env.BANK_IFSC || 'SBIN000XXXX'}
+• खाता धारक: ${process.env.BANK_ACCOUNT_HOLDER || 'श्री गणेश ईंट उद्योग'}
+=========================================`;
 }
 
 // --- Transliteration & Phonetic Normalization (CANONICAL TARGET: कधंई) ---
@@ -394,12 +558,12 @@ CRITICAL OPERATIONAL RULES:
 5. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES (e.g. '1000 गोड़िया / 1000 मीठा').
 6. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम) across all orders, dispatches, and queries.
 7. When learning a new rule (e.g. 'याद रखना X का मतलब Y है'), set intent: 'learn_memory' and populate 'learned_memory_rule'.
-8. When invoice or bill is requested (e.g. 'कधंई का बिल बनाओ'), set intent: 'generate_invoice' and populate 'invoice_request'.
+8. When invoice or bill is requested (e.g. 'कधंई का बिल बनाओ', 'bill pdf bhejo'), set intent: 'generate_invoice' and populate 'invoice_request'.
 9. Format all dates as DD-MM-YYYY using current year 2026.
 `;
 }
 
-// --- Reverse Quantity & Grade Inference Helper ---
+// --- Algorithmic Reverse Quantity & Grade Inference Helper ---
 function inferOrderDetails(order, dispatches = []) {
   let qty = Number(order.quantity) || 0;
   let grade = order.grade || 'अव्वल';
@@ -595,7 +759,7 @@ async function processBatchDispatches(dateStr, dispatches) {
   await Promise.all(tasks);
 }
 
-// --- Customer Ledger Rebuild Engine ---
+// --- Customer Ledger Rebuild Engine (Credit Protection & Auto-Billing) ---
 async function regenerateCustomerLedger() {
   if (!sheets || !SPREADSHEET_ID) return;
   try {
@@ -658,7 +822,7 @@ async function regenerateCustomerLedger() {
       ledgerMap.set(key, item);
     }
 
-    // 3. Rebuild Ledger Rows with Accurate Financial Status
+    // 3. Rebuild Ledger Rows with Accurate Financial Dues
     const ledgerRows = [];
     for (const [, acc] of ledgerMap.entries()) {
       const pendingBricks = Math.max(0, acc.orderedBricks - acc.dispatchedBricks);
@@ -693,48 +857,6 @@ async function regenerateCustomerLedger() {
   } catch (err) {
     console.error('[Ledger Regeneration Error]:', err.message);
   }
-}
-
-// --- GST 6% Invoice Formatter ---
-function formatGSTInvoice({ invoiceNo, date, customerName, village, grade, qty, ratePerThousand }) {
-  const quantity = Number(qty) || 2000;
-  const rate = Number(ratePerThousand) || 7500;
-  const taxableValue = (quantity * rate) / 1000;
-  const cgst = taxableValue * 0.03;
-  const sgst = taxableValue * 0.03;
-  const totalAmount = taxableValue + cgst + sgst;
-
-  return `
-=========================================
-          ${process.env.KILN_NAME || 'श्री गणेश ईंट उद्योग'}
-           TAX INVOICE (पक्का बिल)
-=========================================
-इनवॉइस सं०: ${invoiceNo || `BK-${Date.now().toString().slice(-4)}`}
-दिनांक: ${date || getISTDate(0)}
-GSTIN: ${process.env.KILN_GSTIN || '09AAAAA0000A1Z5'}
-State: Uttar Pradesh (Code: ${process.env.KILN_STATE_CODE || '09'})
-
-क्रेता का विवरण (Billed To):
-नाम: ${customerName || 'कधंई'}
-गाँव/पता: ${village || 'पूरे काशीराम'}, उत्तर प्रदेश
------------------------------------------
-विवरण: लाल पक्की ईंट (${grade || 'अव्वल'})
-HSN Code: 69041000
-मात्रा: ${quantity.toLocaleString('en-IN')} नग
-दर (Rate): ₹${rate.toLocaleString('en-IN')} / हज़ार
------------------------------------------
-कर योग्य मूल्य (Taxable Amount): ₹${taxableValue.toFixed(2)}
-CGST @ 3%                     : ₹${cgst.toFixed(2)}
-SGST @ 3%                     : ₹${sgst.toFixed(2)}
------------------------------------------
-कुल इनवॉइस मूल्य (Total Value) : ₹${totalAmount.toFixed(2)}
-=========================================
-बैंक विवरण (Bank Details):
-• बैंक: ${process.env.BANK_NAME || 'State Bank of India'}
-• खाता: ${process.env.BANK_ACCOUNT_NO || 'XXXXXXXXXXXX1234'}
-• IFSC: ${process.env.BANK_IFSC || 'SBIN000XXXX'}
-• खाता धारक: ${process.env.BANK_ACCOUNT_HOLDER || 'श्री गणेश ईंट उद्योग'}
-=========================================`;
 }
 
 // --- Dynamic Row-by-Row Update Core ---
@@ -1236,10 +1358,10 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       }
     }
 
-    // --- 2. GST INVOICE GENERATION ---
-    if (parsed.intent === 'generate_invoice' || (text && (text.includes('बिल बनाओ') || text.toLowerCase().startsWith('bill')))) {
+    // --- 2. GST INVOICE GENERATION (DIRECT PDF GENERATION + DISPATCH) ---
+    if (parsed.intent === 'generate_invoice' || (text && (text.includes('बिल') || text.toLowerCase().includes('bill')))) {
       const invReq = parsed.invoice_request || {};
-      const invoiceCard = formatGSTInvoice({
+      const invData = {
         invoiceNo: `BK-${Date.now().toString().slice(-4)}`,
         date: defaultDate,
         customerName: invReq.customer_name || 'कधंई',
@@ -1247,8 +1369,21 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
         grade: invReq.grade || 'अव्वल',
         qty: invReq.quantity || 2000,
         ratePerThousand: invReq.rate_per_thousand || 7500
-      });
-      await sendWhatsAppReply(sender, invoiceCard);
+      };
+
+      try {
+        const base64Pdf = await createInvoicePDFBuffer(invData);
+        await sendWhatsAppDocument(
+          sender,
+          base64Pdf,
+          `Invoice_${invData.customerName}_${invData.invoiceNo}.pdf`,
+          `📄 *पक्का बिल (Tax Invoice)*\n• ग्राहक: *${invData.customerName}* (${invData.village})\n• मात्रा: *${Number(invData.qty).toLocaleString('en-IN')} नग [${invData.grade}]*\n• कुल इनवॉइस मूल्य: *₹${((invData.qty * invData.ratePerThousand / 1000) * 1.06).toFixed(2)}*`
+        );
+      } catch (pdfErr) {
+        console.error('[PDF Generation Fallback]:', pdfErr.message);
+        const invoiceCard = formatGSTInvoice(invData);
+        await sendWhatsAppReply(sender, invoiceCard);
+      }
       return;
     }
 
