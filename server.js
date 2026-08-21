@@ -18,6 +18,7 @@ const WHATSAPP_GATEWAY_BASE_URL = process.env.WHATSAPP_GATEWAY_BASE_URL;
 const WHATSAPP_GATEWAY_KEY = process.env.WHATSAPP_GATEWAY_KEY;
 const WHATSAPP_GATEWAY_TYPE = process.env.WHATSAPP_GATEWAY_TYPE;
 const OWNER_PHONE_NUMBER = process.env.OWNER_PHONE_NUMBER || '919277078095';
+const MUNSHI_PHONE_NUMBER = process.env.MUNSHI_PHONE_NUMBER || OWNER_PHONE_NUMBER;
 const COAL_TUB_KG = Number(process.env.COAL_TUB_KG) || 40;
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || 'https://bhatta-munshi.onrender.com';
 
@@ -114,6 +115,30 @@ function getRateForGrade(gradeStr) {
   return 7500;
 }
 
+// --- Brick & Roda Quantity Separation Helpers ---
+function parseBrickQty(val, grade = '') {
+  if (typeof val === 'number') return val;
+  if (!val) return 0;
+  const gradeStr = (grade || '').toString().toLowerCase();
+  if (gradeStr.includes('रोड़ा') || gradeStr.includes('roda')) {
+    return 0;
+  }
+  const cleanedVal = val.toString()
+    .replace(/\d+\s*(?:ट्रॉली|ट्राली|ट्रोली|trolley|trauli|trolly)\s*(?:रोड़ा|roda)?/gi, '')
+    .trim();
+  const numbers = cleanedVal.match(/\d+/g);
+  if (!numbers) return 0;
+  return numbers.reduce((sum, n) => sum + Number(n), 0);
+}
+
+function parseTrolleyQty(val) {
+  if (!val) return 0;
+  const match = val.toString().match(/(\d+)\s*(?:ट्रॉली|ट्राली|ट्रोली|trolley|trauli|trolly)/i);
+  if (match) return Number(match[1]);
+  const numMatch = val.toString().match(/\d+/);
+  return numMatch ? Number(numMatch[0]) : 1;
+}
+
 // --- Dynamic Transliteration Engine for Safe PDF Rendering ---
 function transliterateHindiToEnglish(text) {
   if (!text) return '';
@@ -202,7 +227,7 @@ async function appendWithRetry(params, retries = 2, delay = 800) {
 }
 
 async function sendWhatsAppReply(recipient, text) {
-  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) return;
+  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE || !recipient || !text) return;
   try {
     const cleanNumber = recipient.replace('@s.whatsapp.net', '').replace('@c.us', '');
     await axios.post(
@@ -217,7 +242,7 @@ async function sendWhatsAppReply(recipient, text) {
 }
 
 async function sendWhatsAppDocument(recipient, base64Pdf, fileName, caption = '') {
-  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE) return;
+  if (!WHATSAPP_GATEWAY_BASE_URL || !WHATSAPP_GATEWAY_KEY || !WHATSAPP_GATEWAY_TYPE || !recipient) return;
   const cleanNumber = recipient.replace('@s.whatsapp.net', '').replace('@c.us', '');
   const cleanBase64 = base64Pdf.replace(/^data:application\/pdf;base64,/, '');
 
@@ -430,14 +455,6 @@ function normalizeHindi(str) {
     .replace(/[\s\.\-_]/g, '');
 }
 
-function parseTotalQty(val) {
-  if (typeof val === 'number') return val;
-  if (!val) return 0;
-  const numbers = val.toString().match(/\d+/g);
-  if (!numbers) return 0;
-  return numbers.reduce((sum, n) => sum + Number(n), 0);
-}
-
 function repairTruncatedJSON(jsonStr) {
   let openBraces = 0;
   let openBrackets = 0;
@@ -513,7 +530,7 @@ You are the Chief AI Accountant & Operations Manager for an Indian Brick Kiln (�
 Analyze transaction text, voice transcripts, or photos of daily diary pages. Return ONLY valid JSON matching this schema:
 
 {
-  "intent": "batch_update" | "query_slip_summary" | "order" | "dispatch" | "expense" | "daily_summary" | "query_date_summary" | "query_customer" | "update_entry" | "delete_entry" | "recheck_with_image" | "generate_invoice" | "learn_memory" | "sync_ledger" | "coal_entry" | "green_brick_entry" | "clarification" | "ignore",
+  "intent": "order" | "delivery_status_update" | "batch_update" | "query_slip_summary" | "dispatch" | "expense" | "daily_summary" | "query_date_summary" | "query_customer" | "update_entry" | "delete_entry" | "recheck_with_image" | "generate_invoice" | "learn_memory" | "sync_ledger" | "coal_entry" | "green_brick_entry" | "clarification" | "ignore",
   "target_tabs": ["Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "Customer_Ledger" | "Coal_Fuel_Khata" | "Green_Brick_Stock" | "Agent_Memory" | "ALL"],
   "delete_all": boolean,
   "search_filter": {
@@ -559,10 +576,17 @@ Analyze transaction text, voice transcripts, or photos of daily diary pages. Ret
       "village": string,
       "grade": string,
       "quantity": string | number,
+      "unit": "नग" | "ट्रॉली",
       "amount_payable": number,
       "amount_received": number,
       "pending_amount": number,
-      "mode_of_payment": "Cash" | "UPI" | "Online"
+      "mode_of_payment": "Cash" | "UPI" | "Online",
+      "payment_condition": {
+        "type": "cod_driver" | "advance_cash_person" | "home_parents" | "online_transfer" | "standard",
+        "description": string,
+        "person_name": string,
+        "amount": number
+      }
     }
   ],
   "dispatches": [
@@ -573,10 +597,21 @@ Analyze transaction text, voice transcripts, or photos of daily diary pages. Ret
       "grade": string,
       "total_ordered_qty": string | number,
       "dispatched_qty": string | number,
+      "unit": "नग" | "ट्रॉली",
       "driver": string,
       "is_credit": boolean
     }
   ],
+  "delivery_update": {
+    "customer_name": string,
+    "customer_phone": string,
+    "village": string,
+    "stage": "loading" | "dispatched" | "eta",
+    "quantity_str": string,
+    "driver_name": string,
+    "eta_minutes": string,
+    "customer_message": string
+  },
   "expenses": [
     {
       "date": string,
@@ -634,30 +669,35 @@ PRICE LIST & REVERSE BENCHMARKS:
 - पीला रोड़ा: ₹2,500 – ₹3,000 (प्रति ट्रॉली)
 
 CRITICAL OPERATIONAL RULES:
-1. DIARY / SLIP IMAGES (DEFAULT: SAVE & DETAILED SUMMARY):
-   - Extract ALL dispatches, orders, expenses, and closing balance figures.
-   - If user asks for summary or sends an image, set intent: "batch_update", populate arrays for saving, and output Hindi breakdown in "reply_text".
-   - ONLY set intent: "query_slip_summary" (read-only) if explicitly told not to record.
-2. QUANTITY & GRADE INFERENCE:
-   - NEVER output "quantity: 0" in "orders" if amount_payable or amount_received > 0.
-   - Cross-check Bikri/Supply section on the same slip for grade & dispatched volume.
-   - If a customer deposits money on the Jama side (e.g. ₹52,000), reverse calculate (8,000 मीठा).
-3. SYNC / REFRESH INSTRUCTION:
-   - If user asks to sync or recalculate, set intent: "sync_ledger".
-4. RODA UNIT IS ALWAYS 'ट्रॉली'.
-5. SINGLE ROW PER CUSTOMER FOR MIXED DISPATCHES.
-6. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम).
-7. When learning a new rule, set intent: 'learn_memory'.
-8. When invoice/bill is requested (e.g. 'अभय तिलोई का पक्का बिल बनाओ', 'bill pdf bhejo'), set intent: 'generate_invoice' and populate 'invoice_request' with exact customer name, village, and English transliterations ('customer_name_en', 'village_en').
-9. Format all dates as DD-MM-YYYY using current year 2026.
+1. NON-BUSINESS FILTER (SILENT IGNORE):
+   - If a message, photo, or audio is NOT related to brick kiln operations (e.g. casual greetings like "Hi", "Hello", personal chat, machinery photos, selfies, weather, jokes), set intent: "ignore" and reply_text: "".
+2. UNIVERSAL ORDERS & PAYMENT CONDITIONS:
+   - Accept orders from ANY customer with details.
+   - For mixed orders (e.g. 2000 अव्वल + 1 ट्रॉली रोड़ा), output SEPARATE items in the 'orders' array (never combine piece and trolley count into one number like 2001).
+   - Classify payment condition:
+     * Condition 1: Pay driver at site (cod_driver)
+     * Condition 2: Paid cash to person (advance_cash_person)
+     * Condition 3: Paid cash at home to parents (home_parents)
+     * Condition 4: Online transfer to account holder (online_transfer)
+3. DELIVERY STATUS UPDATES (LOAD / DISPATCH / ETA):
+   - When text/voice says "लोड हो रहा है", "भट्ठे से निकल गया", "10-15 मिनट में पहुंचेगा", set intent: "delivery_status_update" and format a respectful Hindi notification in 'customer_message'.
+4. RODA VS BRICK SEPARATION:
+   - RODA is strictly measured in 'ट्रॉली'. Bricks in pieces (नग). NEVER output 6001 for 6000 bricks + 1 trolley.
+5. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम).
+6. Format all dates as DD-MM-YYYY using current year 2026.
 `;
 }
 
 function inferOrderDetails(order, dispatches = []) {
-  let qty = Number(order.quantity) || 0;
+  let qty = parseBrickQty(order.quantity, order.grade);
   let grade = order.grade || 'अव्वल';
+  const isRoda = grade.includes('रोड़ा') || (order.unit === 'ट्रॉली');
   const amount = Number(order.amount_received) || Number(order.amount_payable) || 0;
   const orderNameNorm = normalizeHindi(order.name);
+
+  if (isRoda) {
+    return { quantity: parseTrolleyQty(order.quantity), grade: grade, unit: 'ट्रॉली' };
+  }
 
   if (qty === 0 && dispatches.length > 0) {
     const matchedDispatch = dispatches.find(d => {
@@ -665,7 +705,7 @@ function inferOrderDetails(order, dispatches = []) {
       return dNameNorm && (dNameNorm.includes(orderNameNorm) || orderNameNorm.includes(dNameNorm));
     });
     if (matchedDispatch) {
-      qty = parseTotalQty(matchedDispatch.dispatched_qty) || parseTotalQty(matchedDispatch.total_ordered_qty);
+      qty = parseBrickQty(matchedDispatch.dispatched_qty, matchedDispatch.grade) || parseBrickQty(matchedDispatch.total_ordered_qty, matchedDispatch.grade);
       if (matchedDispatch.grade) grade = matchedDispatch.grade;
     }
   }
@@ -686,15 +726,17 @@ function inferOrderDetails(order, dispatches = []) {
     } else if (amount >= 5000 && amount <= 5500) {
       qty = 1;
       grade = 'अव्वल रोड़ा';
+      return { quantity: 1, grade: 'अव्वल रोड़ा', unit: 'ट्रॉली' };
     } else if (amount >= 2500 && amount <= 3000) {
       qty = 1;
       grade = 'पीला रोड़ा';
+      return { quantity: 1, grade: 'पीला रोड़ा', unit: 'ट्रॉली' };
     } else {
       qty = Math.round((amount / 7500) * 1000);
     }
   }
 
-  return { quantity: qty, grade: grade };
+  return { quantity: qty || 2000, grade: grade, unit: 'नग' };
 }
 
 async function generateContentWithRetry(contents, retries = 2, delay = 1000) {
@@ -739,7 +781,8 @@ async function processBatchDispatches(dateStr, dispatches) {
   for (const dispatch of dispatches) {
     const searchNameNorm = normalizeHindi(dispatch.name);
     const targetGradeNorm = normalizeHindi(dispatch.grade);
-    const numericDispatched = parseTotalQty(dispatch.dispatched_qty);
+    const isRoda = (dispatch.grade || '').includes('रोड़ा');
+    const numericDispatched = isRoda ? parseTrolleyQty(dispatch.dispatched_qty) : parseBrickQty(dispatch.dispatched_qty, dispatch.grade);
 
     let targetRowIndex = -1;
     let targetRow = null;
@@ -757,12 +800,12 @@ async function processBatchDispatches(dateStr, dispatches) {
       }
     }
 
-    let masterOrderedQty = parseTotalQty(dispatch.total_ordered_qty);
+    let masterOrderedQty = isRoda ? parseTrolleyQty(dispatch.total_ordered_qty) : parseBrickQty(dispatch.total_ordered_qty, dispatch.grade);
     let matchedVillage = dispatch.village || '';
 
     if (masterOrderedQty === 0 || !dispatch.total_ordered_qty) {
-      if (targetRow && parseTotalQty(targetRow[4]) > 0) {
-        masterOrderedQty = parseTotalQty(targetRow[4]);
+      if (targetRow && (isRoda ? parseTrolleyQty(targetRow[4]) : parseBrickQty(targetRow[4], targetRow[3])) > 0) {
+        masterOrderedQty = isRoda ? parseTrolleyQty(targetRow[4]) : parseBrickQty(targetRow[4], targetRow[3]);
         matchedVillage = matchedVillage || targetRow[2];
       } else {
         for (let j = orderRows.length - 1; j >= 0; j--) {
@@ -771,7 +814,7 @@ async function processBatchDispatches(dateStr, dispatches) {
 
           if (searchNameNorm && (oNameNorm.includes(searchNameNorm) || searchNameNorm.includes(oNameNorm))) {
             if (!targetGradeNorm || oGradeNorm.includes(targetGradeNorm) || targetGradeNorm.includes(oGradeNorm)) {
-              masterOrderedQty = parseTotalQty(orderRows[j][4]);
+              masterOrderedQty = isRoda ? parseTrolleyQty(orderRows[j][4]) : parseBrickQty(orderRows[j][4], orderRows[j][3]);
               matchedVillage = matchedVillage || orderRows[j][2];
               break;
             }
@@ -783,7 +826,7 @@ async function processBatchDispatches(dateStr, dispatches) {
     if (masterOrderedQty === 0) masterOrderedQty = numericDispatched;
 
     if (targetRowIndex !== -1 && targetRow) {
-      const prevDispatchedNum = parseTotalQty(targetRow[6]) || parseTotalQty(targetRow[5]) || 0;
+      const prevDispatchedNum = isRoda ? parseTrolleyQty(targetRow[6] || targetRow[5]) : parseBrickQty(targetRow[6] || targetRow[5], targetRow[3]);
       const finalDispatchedNum = prevDispatchedNum + numericDispatched;
       const balanceRemaining = Math.max(0, masterOrderedQty - finalDispatchedNum);
       const status = balanceRemaining === 0 ? 'Completed' : 'Partial';
@@ -799,10 +842,10 @@ async function processBatchDispatches(dateStr, dispatches) {
               targetRow[1] || dispatch.name,
               matchedVillage || targetRow[2] || '',
               dispatch.grade || targetRow[3],
-              masterOrderedQty,
-              dispatch.dispatched_qty,
-              finalDispatchedNum,
-              balanceRemaining,
+              isRoda ? `${masterOrderedQty} ट्रॉली` : masterOrderedQty,
+              isRoda ? `${dispatch.dispatched_qty} ट्रॉली` : dispatch.dispatched_qty,
+              isRoda ? `${finalDispatchedNum} ट्रॉली` : finalDispatchedNum,
+              isRoda ? `${balanceRemaining} ट्रॉली` : balanceRemaining,
               dispatch.driver || targetRow[8] || '',
               status
             ]]
@@ -818,10 +861,10 @@ async function processBatchDispatches(dateStr, dispatches) {
         dispatch.name || 'नकद ग्राहक',
         matchedVillage,
         dispatch.grade || 'अव्वल',
-        masterOrderedQty,
-        dispatch.dispatched_qty,
-        numericDispatched,
-        balanceRemaining,
+        isRoda ? `${masterOrderedQty} ट्रॉली` : masterOrderedQty,
+        isRoda ? `${dispatch.dispatched_qty} ट्रॉली` : dispatch.dispatched_qty,
+        isRoda ? `${numericDispatched} ट्रॉली` : numericDispatched,
+        isRoda ? `${balanceRemaining} ट्रॉली` : balanceRemaining,
         dispatch.driver || '',
         status
       ]);
@@ -842,12 +885,12 @@ async function processBatchDispatches(dateStr, dispatches) {
   await Promise.all(tasks);
 }
 
-// --- Customer Ledger Engine ---
+// --- Customer Ledger Engine (Separate Rows for Bricks & Roda) ---
 async function regenerateCustomerLedger() {
   if (!sheets || !SPREADSHEET_ID) return;
   try {
     const [ordersRes, dispatchRes] = await Promise.all([
-      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A2:I' }),
+      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A2:J' }),
       sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Supply_Dispatch!A2:J' })
     ]);
 
@@ -858,17 +901,25 @@ async function regenerateCustomerLedger() {
     for (const o of orders) {
       const name = o[1];
       if (!name) continue;
-      const key = normalizeHindi(name);
+      const grade = o[3] || 'अव्वल';
+      const isRoda = grade.includes('रोड़ा');
+      const itemType = isRoda ? 'रोड़ा (Roda)' : 'ईंट (Bricks)';
+      const key = `${normalizeHindi(name)}_${isRoda ? 'RODA' : 'BRICK'}`;
+
       const item = ledgerMap.get(key) || {
         name,
         village: o[2] || '',
-        orderedBricks: 0,
-        dispatchedBricks: 0,
+        itemType,
+        unit: isRoda ? 'ट्रॉली' : 'नग',
+        orderedQty: 0,
+        dispatchedQty: 0,
         totalBilled: 0,
         totalPaid: 0,
         hasExplicitOrder: true
       };
-      item.orderedBricks += parseTotalQty(o[4]);
+
+      const count = isRoda ? parseTrolleyQty(o[4]) : parseBrickQty(o[4], grade);
+      item.orderedQty += count;
       item.totalBilled += Number(o[5]) || 0;
       item.totalPaid += Number(o[6]) || 0;
       ledgerMap.set(key, item);
@@ -877,27 +928,31 @@ async function regenerateCustomerLedger() {
     for (const d of dispatches) {
       const name = d[1];
       if (!name) continue;
-      const key = normalizeHindi(name);
       const grade = d[3] || 'अव्वल';
       const isRoda = grade.includes('रोड़ा');
-      const dispQty = isRoda ? 0 : (parseTotalQty(d[6]) || parseTotalQty(d[5]));
-      const masterQty = isRoda ? 0 : parseTotalQty(d[4]);
+      const itemType = isRoda ? 'रोड़ा (Roda)' : 'ईंट (Bricks)';
+      const key = `${normalizeHindi(name)}_${isRoda ? 'RODA' : 'BRICK'}`;
+
+      const dispCount = isRoda ? parseTrolleyQty(d[6] || d[5]) : parseBrickQty(d[6] || d[5], grade);
+      const masterCount = isRoda ? parseTrolleyQty(d[4]) : parseBrickQty(d[4], grade);
 
       const item = ledgerMap.get(key) || {
         name,
         village: d[2] || '',
-        orderedBricks: masterQty,
-        dispatchedBricks: 0,
+        itemType,
+        unit: isRoda ? 'ट्रॉली' : 'नग',
+        orderedQty: masterCount,
+        dispatchedQty: 0,
         totalBilled: 0,
         totalPaid: 0,
         hasExplicitOrder: false
       };
 
-      item.dispatchedBricks += dispQty;
+      item.dispatchedQty += dispCount;
       if (!item.hasExplicitOrder) {
-        if (item.orderedBricks === 0) item.orderedBricks = item.dispatchedBricks;
+        if (item.orderedQty === 0) item.orderedQty = item.dispatchedQty;
         const rate = getRateForGrade(grade);
-        const billedVal = isRoda ? rate : (dispQty * rate) / 1000;
+        const billedVal = isRoda ? (dispCount * rate) : (dispCount * rate) / 1000;
         item.totalBilled += billedVal;
       }
       ledgerMap.set(key, item);
@@ -905,18 +960,19 @@ async function regenerateCustomerLedger() {
 
     const ledgerRows = [];
     for (const [, acc] of ledgerMap.entries()) {
-      const pendingBricks = Math.max(0, acc.orderedBricks - acc.dispatchedBricks);
+      const pendingQty = Math.max(0, acc.orderedQty - acc.dispatchedQty);
       const netDue = Math.max(0, acc.totalBilled - acc.totalPaid);
-      const status = (pendingBricks === 0 && netDue === 0 && acc.totalBilled > 0)
+      const status = (pendingQty === 0 && netDue === 0 && acc.totalBilled > 0)
         ? 'बेबाक (Settled)'
-        : (netDue > 0 ? `बाकी: ₹${netDue.toLocaleString('en-IN')}` : 'बाकी ईंटें');
+        : (netDue > 0 ? `बाकी: ₹${netDue.toLocaleString('en-IN')}` : 'बाकी माल');
 
       ledgerRows.push([
         acc.name,
         acc.village,
-        acc.orderedBricks,
-        acc.dispatchedBricks,
-        pendingBricks,
+        acc.itemType,
+        acc.orderedQty,
+        acc.dispatchedQty,
+        acc.unit,
         acc.totalBilled,
         acc.totalPaid,
         netDue,
@@ -925,14 +981,14 @@ async function regenerateCustomerLedger() {
     }
 
     if (ledgerRows.length > 0) {
-      await sheets.spreadsheets.values.clear({ spreadsheetId: SPREADSHEET_ID, range: 'Customer_Ledger!A2:I' });
+      await sheets.spreadsheets.values.clear({ spreadsheetId: SPREADSHEET_ID, range: 'Customer_Ledger!A2:J' });
       await sheets.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
-        range: 'Customer_Ledger!A2:I',
+        range: 'Customer_Ledger!A2:J',
         valueInputOption: 'USER_ENTERED',
         resource: { values: ledgerRows }
       });
-      console.log(`[Ledger] Rebuilt ${ledgerRows.length} customer ledger accounts.`);
+      console.log(`[Ledger] Rebuilt ${ledgerRows.length} customer ledger lines.`);
     }
   } catch (err) {
     console.error('[Ledger Regeneration Error]:', err.message);
@@ -965,14 +1021,13 @@ async function updateSingleRow(tab, rowIndex, updates) {
       if (updates.grade) row[3] = updates.grade;
       if (updates.total_ordered_qty !== undefined) row[4] = updates.total_ordered_qty;
       if (updates.dispatched_qty !== undefined) row[5] = updates.dispatched_qty;
-      if (updates.total_dispatched !== undefined) {
-        row[6] = Number(updates.total_dispatched) || parseTotalQty(updates.total_dispatched);
-      }
-      const ord = parseTotalQty(row[4]);
-      const disp = Number(row[6]) || 0;
-      row[7] = Math.max(0, ord - disp);
+      if (updates.total_dispatched !== undefined) row[6] = updates.total_dispatched;
+      const isRoda = (row[3] || '').includes('रोड़ा');
+      const ord = isRoda ? parseTrolleyQty(row[4]) : parseBrickQty(row[4], row[3]);
+      const disp = isRoda ? parseTrolleyQty(row[6]) : parseBrickQty(row[6], row[3]);
+      row[7] = isRoda ? `${Math.max(0, ord - disp)} ट्रॉली` : Math.max(0, ord - disp);
       if (updates.driver !== undefined) row[8] = updates.driver;
-      row[9] = row[7] === 0 ? 'Completed' : 'Partial';
+      row[9] = (ord - disp <= 0) ? 'Completed' : 'Partial';
     } else if (tab === 'Expenses') {
       if (updates.category) row[1] = updates.category;
       if (updates.paid_to) row[2] = updates.paid_to;
@@ -1150,6 +1205,7 @@ async function generateDateReport(dateStr, scope = 'full') {
   }
 }
 
+// --- Customer Details & Aggregated Full Hisab (Bricks + Roda) ---
 async function getCustomerDetails(customerName, targetDate = null) {
   if (!sheets || !SPREADSHEET_ID || !customerName) return null;
   const searchNorm = normalizeHindi(customerName);
@@ -1159,12 +1215,14 @@ async function getCustomerDetails(customerName, targetDate = null) {
     const [dispatchRes, orderRes, ledgerRes] = await Promise.all([
       sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Supply_Dispatch!A2:J' }),
       sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A2:I' }),
-      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Customer_Ledger!A2:I' })
+      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Customer_Ledger!A2:J' })
     ]);
 
     const dispatchRows = dispatchRes.data.values || [];
     const orderRows = orderRes.data.values || [];
     const ledgerRows = ledgerRes.data.values || [];
+
+    const matchedLedgerLines = ledgerRows.filter(r => normalizeHindi(r[0]).includes(searchNorm));
 
     const dispatches = dispatchRows.filter(row => {
       const nameNorm = normalizeHindi(row[1]);
@@ -1180,23 +1238,48 @@ async function getCustomerDetails(customerName, targetDate = null) {
       return matchName && (cleanDate ? rowDate === cleanDate : true);
     });
 
-    const ledgerAcc = ledgerRows.find(r => normalizeHindi(r[0]).includes(searchNorm));
+    if (dispatches.length === 0 && orders.length === 0 && matchedLedgerLines.length === 0) return null;
 
-    if (dispatches.length === 0 && orders.length === 0 && !ledgerAcc) return null;
+    let totalBrickOrdered = 0, totalBrickDispatched = 0;
+    let totalRodaOrdered = 0, totalRodaDispatched = 0;
+    let grandBilled = 0, grandPaid = 0, grandDue = 0;
+
+    matchedLedgerLines.forEach(line => {
+      const itemType = line[2] || '';
+      const ord = Number(line[3]) || 0;
+      const disp = Number(line[4]) || 0;
+      const billed = Number(line[6]) || 0;
+      const paid = Number(line[7]) || 0;
+      const due = Number(line[8]) || 0;
+
+      if (itemType.includes('रोड़ा') || itemType.includes('Roda')) {
+        totalRodaOrdered += ord;
+        totalRodaDispatched += disp;
+      } else {
+        totalBrickOrdered += ord;
+        totalBrickDispatched += disp;
+      }
+      grandBilled += billed;
+      grandPaid += paid;
+      grandDue += due;
+    });
 
     return {
-      name: ledgerAcc?.[0] || dispatches[0]?.[1] || orders[0]?.[1] || customerName,
-      village: ledgerAcc?.[1] || dispatches[0]?.[2] || orders[0]?.[2] || '',
+      name: matchedLedgerLines[0]?.[0] || dispatches[0]?.[1] || orders[0]?.[1] || customerName,
+      village: matchedLedgerLines[0]?.[1] || dispatches[0]?.[2] || orders[0]?.[2] || '',
       filterDate: cleanDate,
-      ledger: ledgerAcc ? {
-        orderedBricks: ledgerAcc[2],
-        dispatchedBricks: ledgerAcc[3],
-        pendingBricks: ledgerAcc[4],
-        totalBilled: ledgerAcc[5],
-        totalPaid: ledgerAcc[6],
-        netDue: ledgerAcc[7],
-        status: ledgerAcc[8]
-      } : null,
+      summary: {
+        totalBrickOrdered,
+        totalBrickDispatched,
+        pendingBricks: Math.max(0, totalBrickOrdered - totalBrickDispatched),
+        totalRodaOrdered,
+        totalRodaDispatched,
+        pendingRoda: Math.max(0, totalRodaOrdered - totalRodaDispatched),
+        grandBilled,
+        grandPaid,
+        grandDue: Math.max(0, grandBilled - grandPaid),
+        status: grandDue === 0 && grandBilled > 0 ? 'बेबाक (Settled)' : (grandDue > 0 ? `बाकी: ₹${grandDue.toLocaleString('en-IN')}` : 'बाकी माल')
+      },
       dispatches: dispatches.map(d => ({
         date: d[0], grade: d[3], qty: d[5] || d[4], total_disp: d[6], remaining: d[7], driver: d[8], status: d[9]
       })),
@@ -1215,10 +1298,10 @@ async function ensureSchemaStructure() {
 
   const SCHEMA = {
     "Daily_Closing": ["Date", "Opening_Balance", "Total_Jama", "Total_Kharcha", "Maalik_Ko_Diya", "Closing_Balance"],
-    "Orders": ["Date", "Customer_Name", "Village", "Brick_Grade", "Quantity", "Amount_Payable", "Amount_Received", "Pending_Amount", "Mode_of_Payment"],
+    "Orders": ["Date", "Customer_Name", "Village", "Brick_Grade", "Quantity", "Amount_Payable", "Amount_Received", "Pending_Amount", "Mode_of_Payment", "Customer_Phone", "Payment_Condition"],
     "Supply_Dispatch": ["Date", "Customer_Name", "Village", "Brick_Grade", "Master_Order_Qty", "Dispatched_Today", "Total_Dispatched", "Remaining_Bricks", "Driver", "Status"],
     "Expenses": ["Date", "Category", "Paid_To", "Amount", "Remarks"],
-    "Customer_Ledger": ["Customer_Name", "Village", "Ordered_Bricks", "Dispatched_Bricks", "Pending_Bricks", "Total_Billed", "Total_Paid", "Net_Due", "Status"],
+    "Customer_Ledger": ["Customer_Name", "Village", "Item_Type", "Ordered_Qty", "Dispatched_Qty", "Unit", "Total_Billed", "Total_Paid", "Net_Due", "Status"],
     "Agent_Memory": ["Category", "Alias_Trigger", "Canonical_Value", "Associated_Location", "Notes"],
     "Coal_Fuel_Khata": ["Date", "Description", "Inward_MT", "Rate", "Tubs_Burnt", "Kg_Per_Tub", "Consumed_MT", "Status"],
     "Green_Brick_Stock": ["Date", "Molded_Inward", "Bhari_Loaded", "Rain_Damage_Lost", "Status"],
@@ -1359,7 +1442,6 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
     const cleanSenderNumber = sender.replace('@s.whatsapp.net', '').replace('@c.us', '').trim();
     if (!cleanSenderNumber) return;
 
-    if (ALLOWED_NUMBERS.length > 0 && !ALLOWED_NUMBERS.includes(cleanSenderNumber)) return;
     if (checkAndLockMessage(messageId)) return;
 
     const systemPrompt = await buildSystemPrompt();
@@ -1377,11 +1459,11 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       lastImageCache.set(cleanSenderNumber, { base64: base64Image, mimeType });
 
       contents = [
-        `${systemPrompt}\n\nUSER CAPTION: "${caption}"\nExtract all transactions, dispatches, jama, and closing balances from this diary image.`,
+        `${systemPrompt}\n\nUSER CAPTION: "${caption}"\nExtract all transactions, dispatches, jama, and closing balances from this diary image. If it's not a diary or account slip, set intent: "ignore".`,
         { inlineData: { mimeType, data: base64Image } }
       ];
     } else if (text) {
-      contents = [`${systemPrompt}\n\nInput message / voice order transcript: "${text}"`];
+      contents = [`${systemPrompt}\n\nInput message / order transcript: "${text}"`];
     } else if (audioMessage) {
       const base64Audio = req.body?.data?.message?.base64 || '';
       if (!base64Audio) return;
@@ -1404,11 +1486,39 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
     } catch (err) {
       parsed = JSON.parse(repairTruncatedJSON(rawText));
     }
-    console.log('[Parsed Intent]:', parsed.intent);
+    console.log(`[Parsed Intent from ${cleanSenderNumber}]:`, parsed.intent);
+
+    // 1. STRICT NON-BUSINESS FILTER (SILENT IGNORE)
+    if (parsed.intent === 'ignore') {
+      console.log(`[Silent Ignore] Non-business message dropped for ${cleanSenderNumber}`);
+      return;
+    }
+
+    // 2. SENDER WHITELIST CHECK (OPEN FOR ORDER BOOKING ONLY)
+    const isWhitelisted = ALLOWED_NUMBERS.length === 0 || ALLOWED_NUMBERS.includes(cleanSenderNumber);
+    if (!isWhitelisted && parsed.intent !== 'order') {
+      console.log(`[Access Restricted] Non-whitelisted number ${cleanSenderNumber} attempted non-order intent: ${parsed.intent}`);
+      return;
+    }
 
     const defaultDate = getISTDate(0);
 
-    // 1. MEMORY RULE LEARNING
+    // 3. DELIVERY STATUS UPDATE HANDLER (LOAD / DISPATCH / ETA PROXIMITY)
+    if (parsed.intent === 'delivery_status_update') {
+      const du = parsed.delivery_update || {};
+      let munshiAck = `🚚 *सप्लाई स्टेटस अपडेट:* ${du.customer_name || 'ग्राहक'} (${du.stage || 'Status'})\n• विवरण: ${du.quantity_str || '1 ट्रॉली'}\n• ड्राइवर: ${du.driver_name || 'N/A'}`;
+      
+      if (du.customer_phone) {
+        await sendWhatsAppReply(du.customer_phone, du.customer_message || `नमस्ते, सुरेन्द्र सिंह ईंट उद्योग से आपकी ईंटों की सप्लाई का अपडेट: ${du.stage}`);
+        munshiAck += `\n📲 *ग्राहक (${du.customer_phone}) को लाइव सूचना भेज दी गई है।*`;
+      } else {
+        munshiAck += `\nℹ️ *ग्राहक का फोन नंबर उपलब्ध नहीं है।*`;
+      }
+      await sendWhatsAppReply(sender, munshiAck);
+      return;
+    }
+
+    // 4. MEMORY RULE LEARNING
     if (parsed.intent === 'learn_memory' || (parsed.learned_memory_rule && parsed.learned_memory_rule.is_learning_instruction)) {
       const mem = parsed.learned_memory_rule;
       if (sheets && mem?.alias_trigger && mem?.canonical_value) {
@@ -1432,7 +1542,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       }
     }
 
-    // 2. FAST PDF GST INVOICE GENERATION (FIXED CUSTOMER NAME & VILLAGE CAPTURE)
+    // 5. FAST PDF GST INVOICE GENERATION
     if (parsed.intent === 'generate_invoice' || (text && (text.includes('बिल') || text.toLowerCase().includes('bill')))) {
       const invReq = parsed.invoice_request || {};
       
@@ -1469,18 +1579,18 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // 3. EXPLICIT SHEET SYNC
+    // 6. EXPLICIT SHEET SYNC
     if (parsed.intent === 'sync_ledger' || (text && (text.includes('शीट सिंक') || text.includes('डेटा रिफ्रेश') || text.includes('sync sheet')))) {
       await regenerateCustomerLedger();
       await getDynamicRules(true);
       await sendWhatsAppReply(
         sender,
-        `🔄 *शीट डेटा सफलतापूर्वक सिंक और अपडेट हो गया है!*\n\n• सभी ग्राहक खाते और बकाया (Customer Ledger) री-कैलकुलेट हो चुके हैं।\n• मेमोरी और मानक नियम सक्रिय हैं।`
+        `🔄 *शीट डेटा सफलतापूर्वक सिंक और अपडेट हो गया है!*\n\n• सभी ग्राहक खाते (ईंट व रोड़ा) री-कैलकुलेट हो चुके हैं।\n• मेमोरी और मानक नियम सक्रिय हैं।`
       );
       return;
     }
 
-    // 4. SCOPED DATE QUERIES
+    // 7. SCOPED DATE QUERIES
     if (parsed.intent === 'query_date_summary' && sheets) {
       const targetDate = parsed.search_filter?.date || 'yesterday';
       const scope = parsed.search_filter?.scope || 'full';
@@ -1489,29 +1599,30 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // 5. CUSTOMER QUERIES
+    // 8. CUSTOMER FULL HISAB QUERIES (AGGREGATED BRICKS + RODA)
     if (parsed.intent === 'query_customer' && sheets) {
       const customerName = parsed.search_filter?.customer_name || parsed.name;
       const dateFilter = parsed.search_filter?.date || null;
       const data = await getCustomerDetails(customerName, dateFilter);
 
-      if (data) {
+      if (data && data.summary) {
+        const s = data.summary;
         let reply = `🧱 *ग्राहक खाता बही: ${data.name}* ${data.village ? `(${data.village})` : ''}\n`;
-        if (data.ledger) {
-          reply += `\n📊 *लाइव खाता स्थिति:*` +
-                   `\n• कुल बुक ईंटें: ${Number(data.ledger.orderedBricks).toLocaleString('en-IN')}` +
-                   `\n• सप्लाई हो चुकीं: ${Number(data.ledger.dispatchedBricks).toLocaleString('en-IN')}` +
-                   `\n• *बाकी ईंटें (Pending): ${Number(data.ledger.pendingBricks).toLocaleString('en-IN')}*` +
-                   `\n• कुल बिल: ₹${Number(data.ledger.totalBilled).toLocaleString('en-IN')}` +
-                   `\n• कुल जमा: ₹${Number(data.ledger.totalPaid).toLocaleString('en-IN')}` +
-                   `\n• *बकाया रकम (Due): ₹${Number(data.ledger.netDue).toLocaleString('en-IN')}*` +
-                   `\n• खाता स्थिति: *${data.ledger.status}*\n`;
-        }
+        
+        reply += `\n📊 *सप्लाई स्थिति:*` +
+                 `\n• कुल ईंटें: ${s.totalBrickOrdered.toLocaleString('en-IN')} नग (सप्लाई: ${s.totalBrickDispatched.toLocaleString('en-IN')} | बाकी: ${s.pendingBricks.toLocaleString('en-IN')})` +
+                 `\n• कुल रोड़ा: ${s.totalRodaOrdered} ट्रॉली (सप्लाई: ${s.totalRodaDispatched} | बाकी: ${s.pendingRoda})`;
+
+        reply += `\n\n💰 *कुल वित्तीय मिलान (ईंट + रोड़ा):*` +
+                 `\n• कुल बिल मूल्य: ₹${s.grandBilled.toLocaleString('en-IN')}` +
+                 `\n• कुल जमा (Paid): ₹${s.grandPaid.toLocaleString('en-IN')}` +
+                 `\n• *शुद्ध बकाया (Net Due): ₹${s.grandDue.toLocaleString('en-IN')}*` +
+                 `\n• खाता स्थिति: *${s.status}*\n`;
 
         if (data.dispatches.length > 0) {
           reply += `\n🚚 *हालिया सप्लाई विवरण:*`;
           data.dispatches.slice(-3).forEach(d => {
-            reply += `\n• ${d.date}: ${d.qty} [${d.grade}] | बाकी: ${d.remaining} (${d.driver || 'N/A'})`;
+            reply += `\n• ${d.date}: ${d.qty} [${d.grade}] | ड्राइवर: ${d.driver || 'N/A'}`;
           });
         }
         await sendWhatsAppReply(sender, reply);
@@ -1521,7 +1632,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // 6. READ-ONLY SLIP SUMMARY
+    // 9. READ-ONLY SLIP SUMMARY
     if (parsed.intent === 'query_slip_summary') {
       let summaryReply = parsed.reply_text || '📋 पर्ची का हिसाब जांच लिया गया है।';
       if (parsed.daily_closing) {
@@ -1536,35 +1647,34 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // 7. COMPREHENSIVE BATCH & IMAGE TRANSACTION HANDLER
+    // 10. COMPREHENSIVE BATCH & IMAGE TRANSACTION HANDLER
     const hasBatchData = (parsed.orders?.length > 0) || (parsed.dispatches?.length > 0) || (parsed.expenses?.length > 0) || (parsed.daily_closing && Object.keys(parsed.daily_closing).length > 0);
 
-    if (imageMessage || parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image' || hasBatchData) {
+    if (imageMessage || parsed.intent === 'batch_update' || parsed.intent === 'recheck_with_image' || (hasBatchData && parsed.intent !== 'order')) {
       const asyncTasks = [];
 
       if (parsed.orders && parsed.orders.length > 0) {
         const orderRows = parsed.orders.map(o => {
           const inferred = inferOrderDetails(o, parsed.dispatches || []);
-          const finalQty = inferred.quantity;
-          const finalGrade = inferred.grade;
-
           return [
             o.date || defaultDate,
             o.name || 'नकद ग्राहक',
             o.village || '',
-            finalGrade,
-            finalQty,
+            inferred.grade,
+            inferred.unit === 'ट्रॉली' ? `${inferred.quantity} ट्रॉली` : inferred.quantity,
             o.amount_payable || (o.amount_received || 0),
             o.amount_received || 0,
             o.pending_amount || Math.max(0, (o.amount_payable || 0) - (o.amount_received || 0)),
-            o.mode_of_payment || 'Cash'
+            o.mode_of_payment || 'Cash',
+            cleanSenderNumber,
+            o.payment_condition?.description || 'Daily Slip Entry'
           ];
         });
 
         asyncTasks.push(
           appendWithRetry({
             spreadsheetId: SPREADSHEET_ID,
-            range: 'Orders!A:I',
+            range: 'Orders!A:K',
             valueInputOption: 'USER_ENTERED',
             resource: { values: orderRows }
           })
@@ -1654,32 +1764,43 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       await Promise.all(asyncTasks);
       await regenerateCustomerLedger();
 
-      const finalReply = (parsed.reply_text || '✅ डायरी की सभी एंट्रीज (सप्लाई, खर्चे, जमा, बचत) दर्ज कर दी गई हैं।') + anomalyAlert;
+      const finalReply = (parsed.reply_text || '✅ डायरी की सभी प्रविष्टियां दर्ज कर दी गई हैं।') + anomalyAlert;
       await sendWhatsAppReply(sender, finalReply);
       return;
     }
 
-    // 8. SINGLE INTENTS
+    // 11. UNIVERSAL ORDER BOOKING & INSTANT MUNSHI NOTIFICATION
     if (parsed.intent === 'order' && sheets) {
       const ordersToProcess = (parsed.orders && parsed.orders.length > 0) ? parsed.orders : [parsed];
       const rows = ordersToProcess.map(o => {
         const inferred = inferOrderDetails(o, parsed.dispatches || []);
+        const payCond = o.payment_condition?.description || o.payment_condition?.type || 'Standard Booking';
         return [
           o.date || defaultDate,
-          o.name || 'नकद ग्राहक',
+          o.name || 'नया ग्राहक',
           o.village || '',
           inferred.grade,
-          inferred.quantity,
+          inferred.unit === 'ट्रॉली' ? `${inferred.quantity} ट्रॉली` : inferred.quantity,
           o.amount_payable || (o.amount_received || 0),
           o.amount_received || 0,
-          o.pending_amount || 0,
-          o.mode_of_payment || 'Cash'
+          o.pending_amount || Math.max(0, (o.amount_payable || 0) - (o.amount_received || 0)),
+          o.mode_of_payment || 'Cash',
+          cleanSenderNumber,
+          payCond
         ];
       });
 
-      await appendWithRetry({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A:I', valueInputOption: 'USER_ENTERED', resource: { values: rows } });
+      await appendWithRetry({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A:K', valueInputOption: 'USER_ENTERED', resource: { values: rows } });
       await regenerateCustomerLedger();
-      if (parsed.reply_text) await sendWhatsAppReply(sender, parsed.reply_text);
+
+      // Send Confirmation to Customer
+      const firstOrder = ordersToProcess[0];
+      const customerConfirm = `✅ *ऑर्डर पुष्टिकरण (Surendra Singh Eit Udyog)*\n\n• नाम: *${firstOrder.name || 'ग्राहक'}*\n• पता: *${firstOrder.village || 'N/A'}*\n• माल: *${ordersToProcess.map(o => `${o.quantity} [${o.grade || 'अव्वल'}]`).join(', ')}*\n• देय राशि: *₹${Number(firstOrder.amount_payable || 0).toLocaleString('en-IN')}*\n\nआपका ऑर्डर दर्ज कर लिया गया है। जल्द ही डिलीवरी की सूचना भेजी जाएगी।`;
+      await sendWhatsAppReply(sender, customerConfirm);
+
+      // Instant Notification to Munshi with Payment Conditions
+      let munshiAlert = `🚨 *नया ऑर्डर अलर्ट (New Booking)*\n\n• ग्राहक: *${firstOrder.name || 'ग्राहक'}* (${cleanSenderNumber})\n• गाँव: *${firstOrder.village || 'N/A'}*\n• मात्रा: *${ordersToProcess.map(o => `${o.quantity} [${o.grade || 'अव्वल'}]`).join(', ')}*\n• कुल बिल: *₹${Number(firstOrder.amount_payable || 0).toLocaleString('en-IN')}*\n• भुगतान शर्त: *${firstOrder.payment_condition?.description || 'N/A'}*`;
+      await sendWhatsAppReply(MUNSHI_PHONE_NUMBER, munshiAlert);
       return;
     }
 
@@ -1726,7 +1847,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // 9. UPDATES & DELETIONS
+    // 12. UPDATES & DELETIONS
     if (parsed.intent === 'update_entry' && sheets) {
       let updatesList = Array.isArray(parsed.updates) && parsed.updates.length > 0 ? parsed.updates : [{
         target_tab: (parsed.target_tabs && parsed.target_tabs[0]) || 'Supply_Dispatch',
