@@ -97,36 +97,41 @@ function resolveDateStr(inputDate) {
   return inputDate.replace(/\//g, '-').trim();
 }
 
+// --- Robust Unicode-Agnostic Roda Detector ---
+function isRodaGrade(str) {
+  if (!str) return false;
+  const s = str.toString().toLowerCase();
+  return /रो[ड़ड]|roda|rodda|trolley|ट्रॉली|ट्राली|ट्रोली|trauli/i.test(s);
+}
+
 // --- Multi-Tier Exact Rate Resolution ---
 function getRateForGrade(gradeStr) {
   if (!gradeStr) return 7500;
-  const g = gradeStr.toString().trim();
+  const g = gradeStr.toString().toLowerCase();
 
-  // Priority 1: Multi-word & Roda Trolley Grades
-  if (g.includes('अव्वल रोड़ा') || g.includes('रोड़ा अव्वल')) return 5000;
-  if (g.includes('पीला रोड़ा') || g.includes('रोड़ा पीला')) return 2750;
-  if (g.includes('रोड़ा')) return 5000;
+  // Priority 1: Multi-word & Roda Trolley Grades (Handles all Unicode/Nukta forms)
+  if (/रो[ड़ड].*?पीला|पीला.*?रो[ड़ड]|roda.*?peela|peela.*?roda/i.test(g)) return 2750;
+  if (/रो[ड़ड].*?अव्वल|अव्वल.*?रो[ड़ड]|roda.*?awwal|awwal.*?roda/i.test(g)) return 5000;
+  if (isRodaGrade(g)) return 5000;
 
   // Priority 2: Standard Brick Grades (Per 1,000)
-  if (g.includes('अव्वल')) return 7500;
-  if (g.includes('मीठा')) return 6500;
-  if (g.includes('खंजड़')) return 6250;
-  if (g.includes('गोड़िया')) return 4500;
-  if (g.includes('पीला')) return 4000;
+  if (g.includes('अव्वल') || g.includes('awwal')) return 7500;
+  if (g.includes('मीठा') || g.includes('meetha')) return 6500;
+  if (g.includes('खंजड़') || g.includes('khanjad')) return 6250;
+  if (g.includes('गोड़िया') || g.includes('godiya')) return 4500;
+  if (g.includes('पीला') || g.includes('peela')) return 4000;
 
   return 7500;
 }
 
 // --- Brick & Roda Quantity Separation Helpers ---
 function parseBrickQty(val, grade = '') {
-  if (typeof val === 'number') return val;
   if (!val) return 0;
-  const gradeStr = (grade || '').toString().toLowerCase();
-  if (gradeStr.includes('रोड़ा') || gradeStr.includes('roda')) {
+  if (isRodaGrade(grade) || isRodaGrade(val)) {
     return 0;
   }
   const cleanedVal = val.toString()
-    .replace(/\d+\s*(?:ट्रॉली|ट्राली|ट्रोली|trolley|trauli|trolly)\s*(?:रोड़ा|roda)?/gi, '')
+    .replace(/\d+\s*(?:ट्रॉली|ट्राली|ट्रोली|trolley|trauli|trolly)\s*(?:रो[ड़ड]ा|roda)?/gi, '')
     .trim();
   const numbers = cleanedVal.match(/\d+/g);
   if (!numbers) return 0;
@@ -298,7 +303,6 @@ async function getNextConsecutiveInvoice(invData) {
     const sgst = taxable * 0.03;
     const total = taxable + cgst + sgst;
 
-    // Log the generated invoice directly to the Tax_Invoices tab
     await appendWithRetry({
       spreadsheetId: SPREADSHEET_ID,
       range: 'Tax_Invoices!A:J',
@@ -327,7 +331,7 @@ async function getNextConsecutiveInvoice(invData) {
   }
 }
 
-// --- Dynamic A4 GST Tax Invoice PDF Generator (With Legal Disclaimer & Signatory) ---
+// --- Dynamic A4 GST Tax Invoice PDF Generator ---
 function createInvoicePDFBuffer(invoiceData) {
   return new Promise((resolve, reject) => {
     try {
@@ -516,7 +520,7 @@ function normalizeHindi(str) {
     [/meetha|mitha/g, 'मीठा'],
     [/awwal|awal/g, 'अव्वल'],
     [/peela|pila/g, 'पीला'],
-    [/roda|rodda/g, 'रोड़ा'],
+    [/ro[ड़ड]|roda|rodda/g, 'रोड़ा'],
     [/trolly|trolley|trauli|ट्राली|ट्रॉली/g, 'ट्रॉली'],
     [/bindha|vindha/g, 'विन्धा'],
     [/chintu/g, 'चिन्टू'],
@@ -769,9 +773,9 @@ CRITICAL OPERATIONAL RULES:
 }
 
 function inferOrderDetails(order, dispatches = []) {
-  let qty = parseBrickQty(order.quantity, order.grade);
+  const isRoda = isRodaGrade(order.grade) || (order.unit === 'ट्रॉली');
+  let qty = isRoda ? parseTrolleyQty(order.quantity) : parseBrickQty(order.quantity, order.grade);
   let grade = order.grade || 'अव्वल';
-  const isRoda = grade.includes('रोड़ा') || (order.unit === 'ट्रॉली');
   const amount = Number(order.amount_received) || Number(order.amount_payable) || 0;
   const orderNameNorm = normalizeHindi(order.name);
 
@@ -861,7 +865,7 @@ async function processBatchDispatches(dateStr, dispatches) {
   for (const dispatch of dispatches) {
     const searchNameNorm = normalizeHindi(dispatch.name);
     const targetGradeNorm = normalizeHindi(dispatch.grade);
-    const isRoda = (dispatch.grade || '').includes('रोड़ा');
+    const isRoda = isRodaGrade(dispatch.grade);
     const numericDispatched = isRoda ? parseTrolleyQty(dispatch.dispatched_qty) : parseBrickQty(dispatch.dispatched_qty, dispatch.grade);
 
     let targetRowIndex = -1;
@@ -983,7 +987,7 @@ async function regenerateCustomerLedger() {
       const name = o[1];
       if (!name) continue;
       const grade = o[3] || 'अव्वल';
-      const isRoda = grade.includes('रोड़ा');
+      const isRoda = isRodaGrade(grade) || (o[4] && isRodaGrade(o[4]));
       const itemType = isRoda ? 'रोड़ा (Roda)' : 'ईंट (Bricks)';
       const key = `${normalizeHindi(name)}_${isRoda ? 'RODA' : 'BRICK'}`;
 
@@ -1011,7 +1015,7 @@ async function regenerateCustomerLedger() {
       const name = d[1];
       if (!name) continue;
       const grade = d[3] || 'अव्वल';
-      const isRoda = grade.includes('रोड़ा');
+      const isRoda = isRodaGrade(grade) || isRodaGrade(d[4]) || isRodaGrade(d[5]);
       const itemType = isRoda ? 'रोड़ा (Roda)' : 'ईंट (Bricks)';
       const key = `${normalizeHindi(name)}_${isRoda ? 'RODA' : 'BRICK'}`;
 
@@ -1023,7 +1027,7 @@ async function regenerateCustomerLedger() {
         village: d[2] || '',
         itemType,
         unit: isRoda ? 'ट्रॉली' : 'नग',
-        orderedQty: masterCount,
+        orderedQty: 0,
         dispatchedQty: 0,
         totalBilled: 0,
         totalPaid: 0,
@@ -1031,8 +1035,9 @@ async function regenerateCustomerLedger() {
       };
 
       item.dispatchedQty += dispCount;
+
       if (!item.hasExplicitOrder) {
-        if (item.orderedQty === 0) item.orderedQty = item.dispatchedQty;
+        item.orderedQty += (masterCount > 0 ? masterCount : dispCount);
         
         let billedVal = 0;
         if (isRoda) {
@@ -1113,7 +1118,7 @@ async function updateSingleRow(tab, rowIndex, updates) {
       if (updates.total_ordered_qty !== undefined) row[4] = updates.total_ordered_qty;
       if (updates.dispatched_qty !== undefined) row[5] = updates.dispatched_qty;
       if (updates.total_dispatched !== undefined) row[6] = updates.total_dispatched;
-      const isRoda = (row[3] || '').includes('रोड़ा');
+      const isRoda = isRodaGrade(row[3]);
       const ord = isRoda ? parseTrolleyQty(row[4]) : parseBrickQty(row[4], row[3]);
       const disp = isRoda ? parseTrolleyQty(row[6]) : parseBrickQty(row[6], row[3]);
       row[7] = isRoda ? `${Math.max(0, ord - disp)} ट्रॉली` : Math.max(0, ord - disp);
@@ -1343,7 +1348,7 @@ async function getCustomerDetails(customerName, targetDate = null) {
       const paid = Number(line[7]) || 0;
       const due = Number(line[8]) || 0;
 
-      if (itemType.includes('रोड़ा') || itemType.includes('Roda')) {
+      if (isRodaGrade(itemType)) {
         totalRodaOrdered += ord;
         totalRodaDispatched += disp;
       } else {
@@ -1655,7 +1660,6 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
         ratePerThousand: invReq.rate_per_thousand || 7500
       };
 
-      // Generate next sequential invoice number and log to Tax_Invoices tab
       invData.invoiceNo = await getNextConsecutiveInvoice(invData);
 
       try {
