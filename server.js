@@ -109,12 +109,10 @@ function getRateForGrade(gradeStr) {
   if (!gradeStr) return 7500;
   const g = gradeStr.toString().toLowerCase();
 
-  // Priority 1: Multi-word & Roda Trolley Grades (Handles all Unicode/Nukta forms)
   if (/रो[ड़ड].*?पीला|पीला.*?रो[ड़ड]|roda.*?peela|peela.*?roda/i.test(g)) return 2750;
   if (/रो[ड़ड].*?अव्वल|अव्वल.*?रो[ड़ड]|roda.*?awwal|awwal.*?roda/i.test(g)) return 5000;
   if (isRodaGrade(g)) return 5000;
 
-  // Priority 2: Standard Brick Grades (Per 1,000)
   if (g.includes('अव्वल') || g.includes('awwal')) return 7500;
   if (g.includes('मीठा') || g.includes('meetha')) return 6500;
   if (g.includes('खंजड़') || g.includes('khanjad')) return 6250;
@@ -215,6 +213,63 @@ function toAsciiText(str, enFallback = '') {
 
   const transliterated = transliterateHindiToEnglish(str.toString());
   return transliterated || 'Customer';
+}
+
+// --- Transliteration & Phonetic Normalization (CANONICAL TARGET: कधंई) ---
+function normalizeHindi(str) {
+  if (!str) return '';
+  let s = str.toString().trim().toLowerCase();
+
+  const transMap = [
+    [/kanhai|kanahi|kandhai|कन्हाई|कनहाई|कधई|कन्धाई|कंधाई/g, 'कधंई'],
+    [/santram|santuram/g, 'सन्तराम'],
+    [/anup|anoop/g, 'अनूप'],
+    [/singh/g, 'सिंह'],
+    [/balgobind|balgovind|balgovinda/g, 'बालगोविन्द'],
+    [/blooming|bird/g, 'ब्लूमिंग'],
+    [/mahulara|mahulada/g, 'महुलारा'],
+    [/mukim|mukeem/g, 'मुकीम'],
+    [/nanhe|nanhey/g, 'नन्हे'],
+    [/mulayam|yadav/g, 'मुलायम'],
+    [/ramkumar|ram kumar/g, 'रामकुमार'],
+    [/gagan/g, 'गगन'],
+    [/meetha|mitha/g, 'मीठा'],
+    [/awwal|awal/g, 'अव्वल'],
+    [/peela|pila/g, 'पीला'],
+    [/ro[ड़ड]|roda|rodda/g, 'रोड़ा'],
+    [/trolly|trolley|trauli|ट्राली|ट्रॉली/g, 'ट्रॉली'],
+    [/bindha|vindha/g, 'विन्धा'],
+    [/chintu/g, 'चिन्टू'],
+    [/khedu|khedoo/g, 'खेदू'],
+    [/suraj/g, 'सूरज'],
+    [/diesel/g, 'डीजल'],
+    [/jai\s*prakash|jaiprakash/g, 'जय प्रकाश'],
+    [/gaushala|goshala/g, 'गौशाला']
+  ];
+
+  for (const [regex, hindiVal] of transMap) s = s.replace(regex, hindiVal);
+
+  return s
+    .replace(/[\u0902\u0901]/g, 'न')
+    .replace(/[\u093E\u093F\u0940\u0941\u0942\u0943\u0947\u0948\u094B\u094C\u094D]/g, '')
+    .replace(/[\s\.\-_]/g, '');
+}
+
+function isCustomerMatch(rowName, rowVillage, queryStr) {
+  if (!queryStr) return false;
+  const nQuery = normalizeHindi(queryStr);
+  const nName = normalizeHindi(rowName);
+  const nVill = normalizeHindi(rowVillage);
+
+  if (nName && (nName.includes(nQuery) || nQuery.includes(nName))) return true;
+  if (nVill && (nVill.includes(nQuery) || nQuery.includes(nVill))) return true;
+
+  const queryTokens = queryStr.toLowerCase().split(/\s+/).filter(t => t.length > 2);
+  const targetStr = `${rowName || ''} ${rowVillage || ''}`.toLowerCase();
+  return queryTokens.some(token => {
+    const normToken = normalizeHindi(token);
+    return targetStr.includes(token) || (normToken && targetStr.includes(normToken));
+  });
 }
 
 async function appendWithRetry(params, retries = 2, delay = 800) {
@@ -437,7 +492,7 @@ function createInvoicePDFBuffer(invoiceData) {
       doc.fontSize(9.5).font('Helvetica-Bold').fillColor('#0f172a').text(`For ${FIRM_NAME}`, 320, sigY, { align: 'right', width: 235 });
       doc.fontSize(8.5).font('Helvetica').fillColor('#475569').text('(Authorized Signatory)', 320, sigY + 42, { align: 'right', width: 235 });
 
-      // 9. Statutory Legal Disclaimer (Rule 46 of CGST Rules)
+      // 9. Statutory Legal Disclaimer
       const footerY = sigY + 68;
       doc.rect(40, footerY - 5, 515, 1).fill('#e2e8f0');
       doc.fontSize(8).font('Helvetica-Oblique').fillColor('#64748b').text(
@@ -497,46 +552,6 @@ SGST @ 3%                     : ₹${sgst.toFixed(2)}
 =========================================
 (This is a computer-generated invoice and does not require a physical signature.)
 For ${FIRM_NAME} - Authorized Signatory`;
-}
-
-// --- Transliteration & Phonetic Normalization (CANONICAL TARGET: कधंई) ---
-function normalizeHindi(str) {
-  if (!str) return '';
-  let s = str.toString().trim().toLowerCase();
-
-  const transMap = [
-    [/kanhai|kanahi|kandhai|कन्हाई|कनहाई|कधई|कन्धाई|कंधाई/g, 'कधंई'],
-    [/santram|santuram/g, 'सन्तराम'],
-    [/anup|anoop/g, 'अनूप'],
-    [/singh/g, 'सिंह'],
-    [/balgobind|balgovind|balgovinda/g, 'बालगोविन्द'],
-    [/blooming|bird/g, 'ब्लूमिंग'],
-    [/mahulara|mahulada/g, 'महुलारा'],
-    [/mukim|mukeem/g, 'मुकीम'],
-    [/nanhe|nanhey/g, 'नन्हे'],
-    [/mulayam|yadav/g, 'मुलायम'],
-    [/ramkumar|ram kumar/g, 'रामकुमार'],
-    [/gagan/g, 'गगन'],
-    [/meetha|mitha/g, 'मीठा'],
-    [/awwal|awal/g, 'अव्वल'],
-    [/peela|pila/g, 'पीला'],
-    [/ro[ड़ड]|roda|rodda/g, 'रोड़ा'],
-    [/trolly|trolley|trauli|ट्राली|ट्रॉली/g, 'ट्रॉली'],
-    [/bindha|vindha/g, 'विन्धा'],
-    [/chintu/g, 'चिन्टू'],
-    [/khedu|khedoo/g, 'खेदू'],
-    [/suraj/g, 'सूरज'],
-    [/diesel/g, 'डीजल'],
-    [/jai\s*prakash|jaiprakash/g, 'जय प्रकाश'],
-    [/gaushala|goshala/g, 'गौशाला']
-  ];
-
-  for (const [regex, hindiVal] of transMap) s = s.replace(regex, hindiVal);
-
-  return s
-    .replace(/[\u0902\u0901]/g, 'न')
-    .replace(/[\u093E\u093F\u0940\u0941\u0942\u0943\u0947\u0948\u094B\u094C\u094D]/g, '')
-    .replace(/[\s\.\-_]/g, '');
 }
 
 function repairTruncatedJSON(jsonStr) {
@@ -757,7 +772,7 @@ CRITICAL OPERATIONAL RULES:
    - If a message, photo, or audio is NOT related to brick kiln operations (e.g. casual greetings like "Hi", "Hello", personal chat, machinery photos, selfies, weather, jokes), set intent: "ignore" and reply_text: "".
 2. UNIVERSAL ORDERS & PAYMENT CONDITIONS:
    - Accept orders from ANY customer with details.
-   - For mixed orders (e.g. 2000 अव्वल + 1 ट्रॉली रोड़ा), output SEPARATE items in the 'orders' array (never combine piece and trolley count into one number like 2001).
+   - For mixed orders (e.g. 2000 अव्वल + 1 ट्रॉली रोड़ा), output SEPARATE items in the 'orders' array.
    - Classify payment condition:
      * Condition 1: Pay driver at site (cod_driver)
      * Condition 2: Paid cash to person (advance_cash_person)
@@ -1010,7 +1025,7 @@ async function regenerateCustomerLedger() {
       ledgerMap.set(key, item);
     }
 
-    // 2. Process Dispatches (Supply / Credit Deliveries)
+    // 2. Process Dispatches (Supply / Deliveries)
     for (const d of dispatches) {
       const name = d[1];
       if (!name) continue;
@@ -1304,7 +1319,6 @@ async function generateDateReport(dateStr, scope = 'full') {
 // --- Customer Details & Aggregated Full Hisab (Bricks + Roda) ---
 async function getCustomerDetails(customerName, targetDate = null) {
   if (!sheets || !SPREADSHEET_ID || !customerName) return null;
-  const searchNorm = normalizeHindi(customerName);
   const cleanDate = targetDate ? resolveDateStr(targetDate) : null;
 
   try {
@@ -1318,18 +1332,16 @@ async function getCustomerDetails(customerName, targetDate = null) {
     const orderRows = orderRes.data.values || [];
     const ledgerRows = ledgerRes.data.values || [];
 
-    const matchedLedgerLines = ledgerRows.filter(r => normalizeHindi(r[0]).includes(searchNorm));
+    const matchedLedgerLines = ledgerRows.filter(r => isCustomerMatch(r[0], r[1], customerName));
 
     const dispatches = dispatchRows.filter(row => {
-      const nameNorm = normalizeHindi(row[1]);
-      const matchName = nameNorm && (nameNorm.includes(searchNorm) || searchNameNorm.includes(nameNorm));
+      const matchName = isCustomerMatch(row[1], row[2], customerName);
       const rowDate = (row[0] || '').replace(/\//g, '-').trim();
       return matchName && (cleanDate ? rowDate === cleanDate : true);
     });
 
     const orders = orderRows.filter(row => {
-      const nameNorm = normalizeHindi(row[1]);
-      const matchName = nameNorm && (nameNorm.includes(searchNorm) || searchNameNorm.includes(nameNorm));
+      const matchName = isCustomerMatch(row[1], row[2], customerName);
       const rowDate = (row[0] || '').replace(/\//g, '-').trim();
       return matchName && (cleanDate ? rowDate === cleanDate : true);
     });
@@ -1338,7 +1350,7 @@ async function getCustomerDetails(customerName, targetDate = null) {
 
     let totalBrickOrdered = 0, totalBrickDispatched = 0;
     let totalRodaOrdered = 0, totalRodaDispatched = 0;
-    let grandBilled = 0, grandPaid = 0, grandDue = 0;
+    let grandBilled = 0, grandPaid = 0;
 
     matchedLedgerLines.forEach(line => {
       const itemType = line[2] || '';
@@ -1346,7 +1358,6 @@ async function getCustomerDetails(customerName, targetDate = null) {
       const disp = Number(line[4]) || 0;
       const billed = Number(line[6]) || 0;
       const paid = Number(line[7]) || 0;
-      const due = Number(line[8]) || 0;
 
       if (isRodaGrade(itemType)) {
         totalRodaOrdered += ord;
@@ -1357,8 +1368,9 @@ async function getCustomerDetails(customerName, targetDate = null) {
       }
       grandBilled += billed;
       grandPaid += paid;
-      grandDue += due;
     });
+
+    const grandDue = Math.max(0, grandBilled - grandPaid);
 
     return {
       name: matchedLedgerLines[0]?.[0] || dispatches[0]?.[1] || orders[0]?.[1] || customerName,
@@ -1373,7 +1385,7 @@ async function getCustomerDetails(customerName, targetDate = null) {
         pendingRoda: Math.max(0, totalRodaOrdered - totalRodaDispatched),
         grandBilled,
         grandPaid,
-        grandDue: Math.max(0, grandBilled - grandPaid),
+        grandDue,
         status: grandDue === 0 && grandBilled > 0 ? 'बेबाक (Settled)' : (grandDue > 0 ? `बाकी: ₹${grandDue.toLocaleString('en-IN')}` : 'बाकी माल')
       },
       dispatches: dispatches.map(d => ({
@@ -1699,8 +1711,8 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
     }
 
     // 8. CUSTOMER FULL HISAB QUERIES (AGGREGATED BRICKS + RODA)
-    if (parsed.intent === 'query_customer' && sheets) {
-      const customerName = parsed.search_filter?.customer_name || parsed.name;
+    if (parsed.intent === 'query_customer' || (text && (text.includes('हिसाब') || text.toLowerCase().includes('hisab')))) {
+      const customerName = parsed.search_filter?.customer_name || parsed.name || text.replace(/का|हिसाब|बताओ|hisab|batao|bataiye|de do|account/gi, '').trim();
       const dateFilter = parsed.search_filter?.date || null;
       const data = await getCustomerDetails(customerName, dateFilter);
 
