@@ -97,25 +97,23 @@ function resolveDateStr(inputDate) {
   return inputDate.replace(/\//g, '-').trim();
 }
 
-// --- Rate Matrix ---
-const GRADE_RATES = {
-  'अव्वल': 7500,
-  'मीठा': 6500,
-  'खंजड़': 6250,
-  'गोड़िया': 4500,
-  'पीला': 4000,
-  'अव्वल रोड़ा': 5000,
-  'पीला रोड़ा': 2750,
-  'रोड़ा अव्वल': 5000,
-  'रोड़ा पीला': 2750,
-  'रोड़ा': 5000
-};
-
+// --- Multi-Tier Exact Rate Resolution ---
 function getRateForGrade(gradeStr) {
   if (!gradeStr) return 7500;
-  for (const [g, rate] of Object.entries(GRADE_RATES)) {
-    if (gradeStr.includes(g)) return rate;
-  }
+  const g = gradeStr.toString().trim();
+
+  // Priority 1: Multi-word & Roda Trolley Grades
+  if (g.includes('अव्वल रोड़ा') || g.includes('रोड़ा अव्वल')) return 5000;
+  if (g.includes('पीला रोड़ा') || g.includes('रोड़ा पीला')) return 2750;
+  if (g.includes('रोड़ा')) return 5000;
+
+  // Priority 2: Standard Brick Grades (Per 1,000)
+  if (g.includes('अव्वल')) return 7500;
+  if (g.includes('मीठा')) return 6500;
+  if (g.includes('खंजड़')) return 6250;
+  if (g.includes('गोड़िया')) return 4500;
+  if (g.includes('पीला')) return 4000;
+
   return 7500;
 }
 
@@ -972,7 +970,7 @@ async function regenerateCustomerLedger() {
   if (!sheets || !SPREADSHEET_ID) return;
   try {
     const [ordersRes, dispatchRes] = await Promise.all([
-      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A2:J' }),
+      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A2:K' }),
       sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Supply_Dispatch!A2:J' })
     ]);
 
@@ -980,6 +978,7 @@ async function regenerateCustomerLedger() {
     const dispatches = dispatchRes.data.values || [];
     const ledgerMap = new Map();
 
+    // 1. Process Orders (Jama / Advance Bookings)
     for (const o of orders) {
       const name = o[1];
       if (!name) continue;
@@ -1007,6 +1006,7 @@ async function regenerateCustomerLedger() {
       ledgerMap.set(key, item);
     }
 
+    // 2. Process Dispatches (Supply / Credit Deliveries)
     for (const d of dispatches) {
       const name = d[1];
       if (!name) continue;
@@ -1033,8 +1033,17 @@ async function regenerateCustomerLedger() {
       item.dispatchedQty += dispCount;
       if (!item.hasExplicitOrder) {
         if (item.orderedQty === 0) item.orderedQty = item.dispatchedQty;
-        const rate = getRateForGrade(grade);
-        const billedVal = isRoda ? (dispCount * rate) : (dispCount * rate) / 1000;
+        
+        let billedVal = 0;
+        if (isRoda) {
+          billedVal = dispCount * getRateForGrade(grade);
+        } else if (grade.includes('गोड़िया') && grade.includes('मीठा')) {
+          billedVal = (1000 * 4500 / 1000) + (1000 * 6500 / 1000);
+        } else if (grade.includes('अव्वल') && grade.includes('मीठा')) {
+          billedVal = (2000 * 7500 / 1000) + (4000 * 6500 / 1000);
+        } else {
+          billedVal = (dispCount * getRateForGrade(grade)) / 1000;
+        }
         item.totalBilled += billedVal;
       }
       ledgerMap.set(key, item);
@@ -1308,14 +1317,14 @@ async function getCustomerDetails(customerName, targetDate = null) {
 
     const dispatches = dispatchRows.filter(row => {
       const nameNorm = normalizeHindi(row[1]);
-      const matchName = nameNorm && (nameNorm.includes(searchNorm) || searchNorm.includes(nameNorm));
+      const matchName = nameNorm && (nameNorm.includes(searchNorm) || searchNameNorm.includes(nameNorm));
       const rowDate = (row[0] || '').replace(/\//g, '-').trim();
       return matchName && (cleanDate ? rowDate === cleanDate : true);
     });
 
     const orders = orderRows.filter(row => {
       const nameNorm = normalizeHindi(row[1]);
-      const matchName = nameNorm && (nameNorm.includes(searchNorm) || searchNorm.includes(nameNorm));
+      const matchName = nameNorm && (nameNorm.includes(searchNorm) || searchNameNorm.includes(nameNorm));
       const rowDate = (row[0] || '').replace(/\//g, '-').trim();
       return matchName && (cleanDate ? rowDate === cleanDate : true);
     });
@@ -1593,7 +1602,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       let munshiAck = `🚚 *सप्लाई स्टेटस अपडेट:* ${du.customer_name || 'ग्राहक'} (${du.stage || 'Status'})\n• विवरण: ${du.quantity_str || '1 ट्रॉली'}\n• ड्राइवर: ${du.driver_name || 'N/A'}`;
       
       if (du.customer_phone) {
-        await sendWhatsAppReply(du.customer_phone, du.customer_message || `नमस्ते, सुरेन्द्र सिंह ईंट उद्योग से आपकी ईंटों की सप्लाई का अपडेट: ${du.stage}`);
+        await sendWhatsAppReply(du.customer_phone, du.customer_message || `नमस्ते, ${FIRM_NAME} से आपकी ईंटों की सप्लाई का अपडेट: ${du.stage}`);
         munshiAck += `\n📲 *ग्राहक (${du.customer_phone}) को लाइव सूचना भेज दी गई है।*`;
       } else {
         munshiAck += `\nℹ️ *ग्राहक का फोन नंबर उपलब्ध नहीं है।*`;
