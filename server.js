@@ -31,6 +31,10 @@ const BANK_ACCOUNT_NO = process.env.BANK_ACCOUNT_NO || '11150200000035';
 const BANK_IFSC = process.env.BANK_IFSC || 'BARB0KUMARG';
 const BANK_HOLDER = process.env.BANK_ACCOUNT_HOLDER || 'SURENDRA SINGH EIT BHATTA';
 
+// Sequential GST Invoicing Configuration
+const INVOICE_PREFIX = process.env.INVOICE_PREFIX || 'SSEU/26-27/';
+const STARTING_INVOICE_NO = Number(process.env.STARTING_INVOICE_NO) || 1;
+
 const MODEL_NAME = process.env.MODEL_NAME || 'gemini-3.6-flash';
 
 const ALLOWED_NUMBERS = process.env.ALLOWED_NUMBERS
@@ -264,7 +268,68 @@ async function sendWhatsAppDocument(recipient, base64Pdf, fileName, caption = ''
   console.log(`[PDF Invoice] Dispatched to ${cleanNumber}`);
 }
 
-// --- Dynamic A4 GST 6% Tax Invoice PDF Generator ---
+// --- Consecutive GST Invoice Number Generator & Logger ---
+async function getNextConsecutiveInvoice(invData) {
+  if (!sheets || !SPREADSHEET_ID) {
+    return `${INVOICE_PREFIX}${String(Date.now()).slice(-4)}`;
+  }
+
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Tax_Invoices!A2:A'
+    });
+    const rows = res.data.values || [];
+    let nextNum = STARTING_INVOICE_NO;
+
+    if (rows.length > 0) {
+      const numbers = rows.map(r => {
+        if (!r[0]) return 0;
+        const match = r[0].toString().match(/(\d+)$/);
+        return match ? parseInt(match[1], 10) : 0;
+      });
+      const maxExisting = Math.max(...numbers, 0);
+      nextNum = Math.max(maxExisting + 1, STARTING_INVOICE_NO);
+    }
+
+    const sequentialNo = `${INVOICE_PREFIX}${String(nextNum).padStart(4, '0')}`;
+    const qty = Number(invData.qty) || 2000;
+    const rate = Number(invData.ratePerThousand) || 7500;
+    const taxable = (qty * rate) / 1000;
+    const cgst = taxable * 0.03;
+    const sgst = taxable * 0.03;
+    const total = taxable + cgst + sgst;
+
+    // Log the generated invoice directly to the Tax_Invoices tab
+    await appendWithRetry({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Tax_Invoices!A:J',
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [[
+          sequentialNo,
+          invData.date || getISTDate(0),
+          invData.customerName,
+          invData.village,
+          invData.grade,
+          qty,
+          taxable,
+          cgst,
+          sgst,
+          total
+        ]]
+      }
+    });
+
+    console.log(`[Consecutive GST Invoice] Created: ${sequentialNo}`);
+    return sequentialNo;
+  } catch (err) {
+    console.error('[Invoice Numbering Error]:', err.message);
+    return `${INVOICE_PREFIX}${String(Date.now()).slice(-4)}`;
+  }
+}
+
+// --- Dynamic A4 GST Tax Invoice PDF Generator (With Legal Disclaimer & Signatory) ---
 function createInvoicePDFBuffer(invoiceData) {
   return new Promise((resolve, reject) => {
     try {
@@ -276,7 +341,7 @@ function createInvoicePDFBuffer(invoiceData) {
       doc.on('error', reject);
 
       const {
-        invoiceNo = `BK-${Date.now().toString().slice(-4)}`,
+        invoiceNo = `${INVOICE_PREFIX}0001`,
         date = getISTDate(0),
         customerName = 'Customer',
         customerNameEn = '',
@@ -357,13 +422,28 @@ function createInvoicePDFBuffer(invoiceData) {
       doc.text(`Rs. ${totalAmount.toFixed(2)}`, 455, taxY + 56);
 
       // 7. Settlement Bank Account Details Box
-      const bankY = taxY + 110;
-      doc.rect(40, bankY - 10, 515, 65).stroke('#cbd5e1');
-      doc.fontSize(9).font('Helvetica-Bold').fillColor('#c2410c').text('BANK PAYMENT & SETTLEMENT DETAILS:', 50, bankY);
+      const bankY = taxY + 95;
+      doc.rect(40, bankY - 8, 515, 60).stroke('#cbd5e1');
+      doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#c2410c').text('BANK PAYMENT & SETTLEMENT DETAILS:', 50, bankY);
       doc.font('Helvetica').fillColor('#0f172a');
-      doc.text(`Bank Name : ${BANK_NAME}`, 50, bankY + 15);
-      doc.text(`Account No: ${BANK_ACCOUNT_NO}`, 50, bankY + 28);
-      doc.text(`IFSC Code : ${BANK_IFSC} | Holder: ${BANK_HOLDER}`, 50, bankY + 41);
+      doc.text(`Bank Name : ${BANK_NAME}`, 50, bankY + 14);
+      doc.text(`Account No: ${BANK_ACCOUNT_NO}`, 50, bankY + 26);
+      doc.text(`IFSC Code : ${BANK_IFSC} | Holder: ${BANK_HOLDER}`, 50, bankY + 38);
+
+      // 8. Authorized Signatory Block
+      const sigY = bankY + 70;
+      doc.fontSize(9.5).font('Helvetica-Bold').fillColor('#0f172a').text(`For ${FIRM_NAME}`, 320, sigY, { align: 'right', width: 235 });
+      doc.fontSize(8.5).font('Helvetica').fillColor('#475569').text('(Authorized Signatory)', 320, sigY + 42, { align: 'right', width: 235 });
+
+      // 9. Statutory Legal Disclaimer (Rule 46 of CGST Rules)
+      const footerY = sigY + 68;
+      doc.rect(40, footerY - 5, 515, 1).fill('#e2e8f0');
+      doc.fontSize(8).font('Helvetica-Oblique').fillColor('#64748b').text(
+        'This is a computer-generated invoice and does not require a physical signature (Issued under Rule 46 of CGST Rules, 2017).',
+        40,
+        footerY + 4,
+        { align: 'center', width: 515 }
+      );
 
       doc.end();
     } catch (err) {
@@ -387,7 +467,7 @@ function formatGSTInvoice({ invoiceNo, date, customerName, village, grade, qty, 
            ${FIRM_ADDRESS}
            TAX INVOICE (पक्का बिल)
 =========================================
-इनवॉइस सं०: ${invoiceNo || `BK-${Date.now().toString().slice(-4)}`}
+इनवॉइस सं०: ${invoiceNo}
 दिनांक: ${date || getISTDate(0)}
 GSTIN: ${FIRM_GSTIN}
 State: Uttar Pradesh (Code: 09)
@@ -412,7 +492,9 @@ SGST @ 3%                     : ₹${sgst.toFixed(2)}
 • खाता: ${BANK_ACCOUNT_NO}
 • IFSC: ${BANK_IFSC}
 • खाता धारक: ${BANK_HOLDER}
-=========================================`;
+=========================================
+(This is a computer-generated invoice and does not require a physical signature.)
+For ${FIRM_NAME} - Authorized Signatory`;
 }
 
 // --- Transliteration & Phonetic Normalization (CANONICAL TARGET: कधंई) ---
@@ -531,7 +613,7 @@ Analyze transaction text, voice transcripts, or photos of daily diary pages. Ret
 
 {
   "intent": "order" | "delivery_status_update" | "batch_update" | "query_slip_summary" | "dispatch" | "expense" | "daily_summary" | "query_date_summary" | "query_customer" | "update_entry" | "delete_entry" | "recheck_with_image" | "generate_invoice" | "learn_memory" | "sync_ledger" | "coal_entry" | "green_brick_entry" | "clarification" | "ignore",
-  "target_tabs": ["Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "Customer_Ledger" | "Coal_Fuel_Khata" | "Green_Brick_Stock" | "Agent_Memory" | "ALL"],
+  "target_tabs": ["Orders" | "Supply_Dispatch" | "Expenses" | "Daily_Closing" | "Customer_Ledger" | "Coal_Fuel_Khata" | "Green_Brick_Stock" | "Agent_Memory" | "Tax_Invoices" | "ALL"],
   "delete_all": boolean,
   "search_filter": {
     "customer_name": string,
@@ -885,7 +967,7 @@ async function processBatchDispatches(dateStr, dispatches) {
   await Promise.all(tasks);
 }
 
-// --- Customer Ledger Engine (Separate Rows for Bricks & Roda) ---
+// --- Customer Ledger Engine (Strict 10-Column Separation for Bricks & Roda) ---
 async function regenerateCustomerLedger() {
   if (!sheets || !SPREADSHEET_ID) return;
   try {
@@ -999,10 +1081,10 @@ async function updateSingleRow(tab, rowIndex, updates) {
   try {
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: SPREADSHEET_ID,
-      range: `${tab}!A${rowIndex}:J${rowIndex}`
+      range: `${tab}!A${rowIndex}:K${rowIndex}`
     });
     const row = res.data.values?.[0] || [];
-    while (row.length < 10) row.push('');
+    while (row.length < 11) row.push('');
 
     if (updates.date) row[0] = updates.date;
 
@@ -1043,7 +1125,7 @@ async function updateSingleRow(tab, rowIndex, updates) {
 
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
-      range: `${tab}!A${rowIndex}:J${rowIndex}`,
+      range: `${tab}!A${rowIndex}:K${rowIndex}`,
       valueInputOption: 'USER_ENTERED',
       resource: { values: [row] }
     });
@@ -1214,7 +1296,7 @@ async function getCustomerDetails(customerName, targetDate = null) {
   try {
     const [dispatchRes, orderRes, ledgerRes] = await Promise.all([
       sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Supply_Dispatch!A2:J' }),
-      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A2:I' }),
+      sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Orders!A2:K' }),
       sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Customer_Ledger!A2:J' })
     ]);
 
@@ -1293,6 +1375,7 @@ async function getCustomerDetails(customerName, targetDate = null) {
   }
 }
 
+// --- Schema Structure Synchronizer ---
 async function ensureSchemaStructure() {
   if (!sheets || !SPREADSHEET_ID) return;
 
@@ -1303,6 +1386,7 @@ async function ensureSchemaStructure() {
     "Expenses": ["Date", "Category", "Paid_To", "Amount", "Remarks"],
     "Customer_Ledger": ["Customer_Name", "Village", "Item_Type", "Ordered_Qty", "Dispatched_Qty", "Unit", "Total_Billed", "Total_Paid", "Net_Due", "Status"],
     "Agent_Memory": ["Category", "Alias_Trigger", "Canonical_Value", "Associated_Location", "Notes"],
+    "Tax_Invoices": ["Invoice_No", "Date", "Customer_Name", "Village", "Brick_Grade", "Quantity", "Taxable_Value", "CGST_3Pct", "SGST_3Pct", "Total_Amount"],
     "Coal_Fuel_Khata": ["Date", "Description", "Inward_MT", "Rate", "Tubs_Burnt", "Kg_Per_Tub", "Consumed_MT", "Status"],
     "Green_Brick_Stock": ["Date", "Molded_Inward", "Bhari_Loaded", "Rain_Damage_Lost", "Status"],
     "Stock_Inventory": ["Date", "Brick_Grade", "Opening_Stock", "Production_Nikasi", "Dispatched_Deducted", "Damaged_Lost", "Closing_Stock"],
@@ -1542,7 +1626,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       }
     }
 
-    // 5. FAST PDF GST INVOICE GENERATION
+    // 5. FAST PDF GST INVOICE GENERATION (CONSECUTIVE NUMBERING & COMPLIANCE)
     if (parsed.intent === 'generate_invoice' || (text && (text.includes('बिल') || text.toLowerCase().includes('bill')))) {
       const invReq = parsed.invoice_request || {};
       
@@ -1552,7 +1636,6 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       const villageEn = invReq.village_en || toAsciiText(villageRaw);
 
       const invData = {
-        invoiceNo: `BK-${Date.now().toString().slice(-4)}`,
         date: defaultDate,
         customerName: customerNameRaw,
         customerNameEn: customerNameEn,
@@ -1563,13 +1646,16 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
         ratePerThousand: invReq.rate_per_thousand || 7500
       };
 
+      // Generate next sequential invoice number and log to Tax_Invoices tab
+      invData.invoiceNo = await getNextConsecutiveInvoice(invData);
+
       try {
         const base64Pdf = await createInvoicePDFBuffer(invData);
         await sendWhatsAppDocument(
           sender,
           base64Pdf,
-          `Invoice_${invData.invoiceNo}.pdf`,
-          `📄 *पक्का बिल (Tax Invoice)*\n• फर्म: *${FIRM_NAME}*\n• ग्राहक: *${invData.customerName}* (${invData.village})\n• मात्रा: *${Number(invData.qty).toLocaleString('en-IN')} नग [${invData.grade}]*\n• कुल मूल्य: *₹${((invData.qty * invData.ratePerThousand / 1000) * 1.06).toFixed(2)}*`
+          `Invoice_${invData.invoiceNo.replace(/\//g, '_')}.pdf`,
+          `📄 *पक्का बिल (Tax Invoice)*\n• इनवॉइस सं०: *${invData.invoiceNo}*\n• फर्म: *${FIRM_NAME}*\n• ग्राहक: *${invData.customerName}* (${invData.village})\n• मात्रा: *${Number(invData.qty).toLocaleString('en-IN')} नग [${invData.grade}]*\n• कुल मूल्य: *₹${((invData.qty * invData.ratePerThousand / 1000) * 1.06).toFixed(2)}*`
         );
       } catch (pdfErr) {
         console.error('[PDF Fallback to Text]:', pdfErr.message);
@@ -1585,7 +1671,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       await getDynamicRules(true);
       await sendWhatsAppReply(
         sender,
-        `🔄 *शीट डेटा सफलतापूर्वक सिंक और अपडेट हो गया है!*\n\n• सभी ग्राहक खाते (ईंट व रोड़ा) री-कैलकुलेट हो चुके हैं।\n• मेमोरी और मानक नियम सक्रिय हैं।`
+        `🔄 *शीट डेटा सफलतापूर्वक सिंक और अपडेट हो गया है!*\n\n• सभी ग्राहक खाते (ईंट व रोड़ा) 10-कॉलम संरचना में री-कैलकुलेट हो चुके हैं।\n• मेमोरी और मानक नियम सक्रिय हैं।`
       );
       return;
     }
@@ -1795,7 +1881,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
 
       // Send Confirmation to Customer
       const firstOrder = ordersToProcess[0];
-      const customerConfirm = `✅ *ऑर्डर पुष्टिकरण (Surendra Singh Eit Udyog)*\n\n• नाम: *${firstOrder.name || 'ग्राहक'}*\n• पता: *${firstOrder.village || 'N/A'}*\n• माल: *${ordersToProcess.map(o => `${o.quantity} [${o.grade || 'अव्वल'}]`).join(', ')}*\n• देय राशि: *₹${Number(firstOrder.amount_payable || 0).toLocaleString('en-IN')}*\n\nआपका ऑर्डर दर्ज कर लिया गया है। जल्द ही डिलीवरी की सूचना भेजी जाएगी।`;
+      const customerConfirm = `✅ *ऑर्डर पुष्टिकरण (${FIRM_NAME})*\n\n• नाम: *${firstOrder.name || 'ग्राहक'}*\n• पता: *${firstOrder.village || 'N/A'}*\n• माल: *${ordersToProcess.map(o => `${o.quantity} [${o.grade || 'अव्वल'}]`).join(', ')}*\n• देय राशि: *₹${Number(firstOrder.amount_payable || 0).toLocaleString('en-IN')}*\n\nआपका ऑर्डर दर्ज कर लिया गया है। जल्द ही डिलीवरी की सूचना भेजी जाएगी।`;
       await sendWhatsAppReply(sender, customerConfirm);
 
       // Instant Notification to Munshi with Payment Conditions
