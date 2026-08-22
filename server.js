@@ -97,7 +97,7 @@ function resolveDateStr(inputDate) {
   return inputDate.replace(/\//g, '-').trim();
 }
 
-// --- Robust Unicode-Agnostic Roda Detector ---
+// --- Unicode-Agnostic Roda Detector ---
 function isRodaGrade(str) {
   if (!str) return false;
   const s = str.toString().toLowerCase();
@@ -109,10 +109,12 @@ function getRateForGrade(gradeStr) {
   if (!gradeStr) return 7500;
   const g = gradeStr.toString().toLowerCase();
 
+  // Priority 1: Multi-word & Roda Trolley Grades
   if (/रो[ड़ड].*?पीला|पीला.*?रो[ड़ड]|roda.*?peela|peela.*?roda/i.test(g)) return 2750;
   if (/रो[ड़ड].*?अव्वल|अव्वल.*?रो[ड़ड]|roda.*?awwal|awwal.*?roda/i.test(g)) return 5000;
   if (isRodaGrade(g)) return 5000;
 
+  // Priority 2: Standard Brick Grades (Per 1,000)
   if (g.includes('अव्वल') || g.includes('awwal')) return 7500;
   if (g.includes('मीठा') || g.includes('meetha')) return 6500;
   if (g.includes('खंजड़') || g.includes('khanjad')) return 6250;
@@ -122,7 +124,7 @@ function getRateForGrade(gradeStr) {
   return 7500;
 }
 
-// --- Brick & Roda Quantity Separation Helpers ---
+// --- Quantity Extraction Helpers ---
 function parseBrickQty(val, grade = '') {
   if (!val) return 0;
   if (isRodaGrade(grade) || isRodaGrade(val)) {
@@ -770,7 +772,11 @@ PRICE LIST & REVERSE BENCHMARKS:
 CRITICAL OPERATIONAL RULES:
 1. NON-BUSINESS FILTER (SILENT IGNORE):
    - If a message, photo, or audio is NOT related to brick kiln operations (e.g. casual greetings like "Hi", "Hello", personal chat, machinery photos, selfies, weather, jokes), set intent: "ignore" and reply_text: "".
-2. UNIVERSAL ORDERS & PAYMENT CONDITIONS:
+2. ADVANCE & RETROACTIVE JAMA/PAYMENTS:
+   - When user records payment or settlement (e.g. "गगन सिंह का 15000 जमा दर्ज करो 10 अगस्त को"), set intent: "order".
+   - Extract the specific mentioned date (e.g. "10-08-2026").
+   - Set amount_payable, amount_received, and pending_amount: 0.
+3. UNIVERSAL ORDERS & PAYMENT CONDITIONS:
    - Accept orders from ANY customer with details.
    - For mixed orders (e.g. 2000 अव्वल + 1 ट्रॉली रोड़ा), output SEPARATE items in the 'orders' array.
    - Classify payment condition:
@@ -778,12 +784,12 @@ CRITICAL OPERATIONAL RULES:
      * Condition 2: Paid cash to person (advance_cash_person)
      * Condition 3: Paid cash at home to parents (home_parents)
      * Condition 4: Online transfer to account holder (online_transfer)
-3. DELIVERY STATUS UPDATES (LOAD / DISPATCH / ETA):
+4. DELIVERY STATUS UPDATES (LOAD / DISPATCH / ETA):
    - When text/voice says "लोड हो रहा है", "भट्ठे से निकल गया", "10-15 मिनट में पहुंचेगा", set intent: "delivery_status_update" and format a respectful Hindi notification in 'customer_message'.
-4. RODA VS BRICK SEPARATION:
+5. RODA VS BRICK SEPARATION:
    - RODA is strictly measured in 'ट्रॉली'. Bricks in pieces (नग). NEVER output 6001 for 6000 bricks + 1 trolley.
-5. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम).
-6. Format all dates as DD-MM-YYYY using current year 2026.
+6. Standardize canonical master customer 'कधंई' (Village: पूरे काशीराम).
+7. Format all dates as DD-MM-YYYY using current year 2026.
 `;
 }
 
@@ -1167,16 +1173,16 @@ async function updateSingleRow(tab, rowIndex, updates) {
 
 async function findRowByFilter(tab, filter) {
   try {
-    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${tab}!A2:J` });
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${tab}!A2:K` });
     const rows = res.data.values || [];
-    const searchNameNorm = normalizeHindi(filter?.customer_name || filter?.name);
-    const searchPayeeNorm = normalizeHindi(filter?.paid_to);
+    const searchName = filter?.customer_name || filter?.name;
+    const searchPayee = filter?.paid_to;
     const searchGradeNorm = normalizeHindi(filter?.grade);
 
     for (let i = rows.length - 1; i >= 0; i--) {
       const row = rows[i];
-      const matchName = searchNameNorm && (normalizeHindi(row[1]).includes(searchNameNorm) || searchNameNorm.includes(normalizeHindi(row[1])));
-      const matchPayee = searchPayeeNorm && (normalizeHindi(row[2]).includes(searchPayeeNorm) || searchPayeeNorm.includes(normalizeHindi(row[2])));
+      const matchName = searchName && isCustomerMatch(row[1], row[2], searchName);
+      const matchPayee = searchPayee && isCustomerMatch(row[2], '', searchPayee);
 
       if (matchName || matchPayee) {
         if (searchGradeNorm && row[3] && !normalizeHindi(row[3]).includes(searchGradeNorm)) continue;
@@ -1193,7 +1199,7 @@ async function executeBatchUpdates(updatesList) {
   if (!sheets || !SPREADSHEET_ID || !Array.isArray(updatesList) || updatesList.length === 0) return 0;
   let updatedCount = 0;
   for (const item of updatesList) {
-    const tab = item.target_tab || 'Supply_Dispatch';
+    const tab = item.target_tab || 'Orders';
     let targetRow = item.row_number;
     if (!targetRow || targetRow < 2) {
       targetRow = await findRowByFilter(tab, item.filter || item);
@@ -1225,21 +1231,21 @@ async function deleteSheetEntries(targetTabs, filter, deleteAll = false) {
 
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   let totalDeletedCount = 0;
-  const searchNameNorm = normalizeHindi(filter?.customer_name);
+  const searchName = filter?.customer_name;
 
   for (const tab of tabsToProcess) {
     const sheetMeta = meta.data.sheets.find(s => s.properties.title === tab);
     if (!sheetMeta) continue;
     const sheetId = sheetMeta.properties.sheetId;
 
-    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${tab}!A2:J` });
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${tab}!A2:K` });
     const rows = res.data.values || [];
     if (rows.length === 0) continue;
 
     const requests = [];
-    if (searchNameNorm) {
+    if (searchName) {
       for (let i = rows.length - 1; i >= 0; i--) {
-        if (normalizeHindi(rows[i][1]).includes(searchNameNorm)) {
+        if (isCustomerMatch(rows[i][1], rows[i][2], searchName)) {
           requests.push({
             deleteDimension: { range: { sheetId, dimension: 'ROWS', startIndex: i + 1, endIndex: i + 2 } }
           });
@@ -1880,15 +1886,15 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // 11. UNIVERSAL ORDER BOOKING & INSTANT MUNSHI NOTIFICATION
+    // 11. UNIVERSAL ORDER BOOKING & INSTANT MUNSHI NOTIFICATION (WITH RETROACTIVE SUPPORT)
     if (parsed.intent === 'order' && sheets) {
       const ordersToProcess = (parsed.orders && parsed.orders.length > 0) ? parsed.orders : [parsed];
       const rows = ordersToProcess.map(o => {
         const inferred = inferOrderDetails(o, parsed.dispatches || []);
-        const payCond = o.payment_condition?.description || o.payment_condition?.type || 'Standard Booking';
+        const payCond = o.payment_condition?.description || o.payment_condition?.type || 'Customer Payment Entry';
         return [
-          o.date || defaultDate,
-          o.name || 'नया ग्राहक',
+          o.date ? resolveDateStr(o.date) : defaultDate,
+          o.name || 'ग्राहक',
           o.village || '',
           inferred.grade,
           inferred.unit === 'ट्रॉली' ? `${inferred.quantity} ट्रॉली` : inferred.quantity,
@@ -1906,12 +1912,14 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
 
       // Send Confirmation to Customer
       const firstOrder = ordersToProcess[0];
-      const customerConfirm = `✅ *ऑर्डर पुष्टिकरण (${FIRM_NAME})*\n\n• नाम: *${firstOrder.name || 'ग्राहक'}*\n• पता: *${firstOrder.village || 'N/A'}*\n• माल: *${ordersToProcess.map(o => `${o.quantity} [${o.grade || 'अव्वल'}]`).join(', ')}*\n• देय राशि: *₹${Number(firstOrder.amount_payable || 0).toLocaleString('en-IN')}*\n\nआपका ऑर्डर दर्ज कर लिया गया है। जल्द ही डिलीवरी की सूचना भेजी जाएगी।`;
+      const customerConfirm = `✅ *भुगतान / ऑर्डर पुष्टिकरण (${FIRM_NAME})*\n\n• नाम: *${firstOrder.name || 'ग्राहक'}*\n• दिनांक: *${firstOrder.date ? resolveDateStr(firstOrder.date) : defaultDate}*\n• जमा राशि: *₹${Number(firstOrder.amount_received || firstOrder.amount_payable || 0).toLocaleString('en-IN')}*\n• विवरण: *${ordersToProcess.map(o => `${o.quantity} [${o.grade || 'अव्वल'}]`).join(', ')}*\n\nखाता बही (Customer Ledger) में प्रविष्टि सफलतापूर्वक दर्ज व अपडेट कर दी गई है।`;
       await sendWhatsAppReply(sender, customerConfirm);
 
-      // Instant Notification to Munshi with Payment Conditions
-      let munshiAlert = `🚨 *नया ऑर्डर अलर्ट (New Booking)*\n\n• ग्राहक: *${firstOrder.name || 'ग्राहक'}* (${cleanSenderNumber})\n• गाँव: *${firstOrder.village || 'N/A'}*\n• मात्रा: *${ordersToProcess.map(o => `${o.quantity} [${o.grade || 'अव्वल'}]`).join(', ')}*\n• कुल बिल: *₹${Number(firstOrder.amount_payable || 0).toLocaleString('en-IN')}*\n• भुगतान शर्त: *${firstOrder.payment_condition?.description || 'N/A'}*`;
-      await sendWhatsAppReply(MUNSHI_PHONE_NUMBER, munshiAlert);
+      // Instant Notification to Munshi
+      let munshiAlert = `🚨 *जमा / ऑर्डर अलर्ट (${FIRM_NAME})*\n\n• ग्राहक: *${firstOrder.name || 'ग्राहक'}* (${cleanSenderNumber})\n• दिनांक: *${firstOrder.date ? resolveDateStr(firstOrder.date) : defaultDate}*\n• जमा रकम: *₹${Number(firstOrder.amount_received || firstOrder.amount_payable || 0).toLocaleString('en-IN')}*\n• विवरण: *${firstOrder.payment_condition?.description || 'N/A'}*`;
+      if (MUNSHI_PHONE_NUMBER && cleanSenderNumber !== MUNSHI_PHONE_NUMBER) {
+        await sendWhatsAppReply(MUNSHI_PHONE_NUMBER, munshiAlert);
+      }
       return;
     }
 
@@ -1958,17 +1966,62 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
       return;
     }
 
-    // 12. UPDATES & DELETIONS
+    // 12. SMART UPDATES & AUTO-HEALING PAYMENT SETTLEMENT
     if (parsed.intent === 'update_entry' && sheets) {
       let updatesList = Array.isArray(parsed.updates) && parsed.updates.length > 0 ? parsed.updates : [{
-        target_tab: (parsed.target_tabs && parsed.target_tabs[0]) || 'Supply_Dispatch',
+        target_tab: (parsed.target_tabs && parsed.target_tabs[0]) || 'Orders',
         row_number: parsed.search_filter?.row_number,
         filter: parsed.search_filter,
         fields: parsed.fields_to_update
       }];
-      const count = await executeBatchUpdates(updatesList);
+
+      let count = await executeBatchUpdates(updatesList);
+
+      // --- Auto-Healing Fallback for Prior/Unrecorded Orders ---
+      if (count === 0 && (parsed.search_filter?.customer_name || parsed.name)) {
+        const custName = parsed.search_filter?.customer_name || parsed.name;
+        const custDetails = await getCustomerDetails(custName);
+
+        if (custDetails && custDetails.dispatches.length > 0) {
+          const firstDisp = custDetails.dispatches[0];
+          const isRoda = isRodaGrade(firstDisp.grade);
+          const qty = isRoda ? parseTrolleyQty(firstDisp.qty) : parseBrickQty(firstDisp.qty, firstDisp.grade);
+          const rate = getRateForGrade(firstDisp.grade);
+          const totalVal = isRoda ? (qty * rate) : (qty * rate) / 1000;
+          const paidVal = parsed.fields_to_update?.amount_received || totalVal;
+
+          await appendWithRetry({
+            spreadsheetId: SPREADSHEET_ID,
+            range: 'Orders!A:K',
+            valueInputOption: 'USER_ENTERED',
+            resource: {
+              values: [[
+                firstDisp.date || defaultDate,
+                custDetails.name,
+                custDetails.village || '',
+                firstDisp.grade,
+                isRoda ? `${qty} ट्रॉली` : qty,
+                totalVal,
+                paidVal,
+                Math.max(0, totalVal - paidVal),
+                'Cash',
+                cleanSenderNumber,
+                'Prior Unrecorded Order Auto-Settled'
+              ]]
+            }
+          });
+          count = 1;
+          console.log(`[Auto-Heal Payment] Created missing Orders record for ${custDetails.name}`);
+        }
+      }
+
       await regenerateCustomerLedger();
-      await sendWhatsAppReply(sender, count > 0 ? (parsed.reply_text || `✅ ${count} प्रविष्टि(याँ) अपडेट हो गईं।`) : 'माफ कीजिए, यह एंट्री नहीं मिली।');
+      await sendWhatsAppReply(
+        sender,
+        count > 0 
+          ? (parsed.reply_text || `✅ ${parsed.search_filter?.customer_name || 'ग्राहक'} का भुगतान खाता सफलतापूर्वक अपडेट और बेबाक (Settled) कर दिया गया है।`) 
+          : 'माफ कीजिए, यह एंट्री नहीं मिली।'
+      );
       return;
     }
 
