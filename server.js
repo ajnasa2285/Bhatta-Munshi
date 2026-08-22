@@ -146,6 +146,50 @@ function parseTrolleyQty(val) {
   return numMatch ? Number(numMatch[0]) : 1;
 }
 
+function calculateBilledAmount(qtyVal, gradeVal) {
+  const isRoda = isRodaGrade(gradeVal) || isRodaGrade(qtyVal);
+  if (isRoda) {
+    const tQty = parseTrolleyQty(qtyVal);
+    const rate = getRateForGrade(gradeVal);
+    return tQty * rate;
+  }
+
+  const qStr = (qtyVal || '').toString();
+  const gStr = (gradeVal || '').toString();
+
+  // If quantity string has mixed breakdown like "2000 अव्वल + 4000 मीठा"
+  if (qStr.includes('+') || qStr.includes('/') || qStr.includes(',')) {
+    let sum = 0;
+    const chunks = qStr.split(/[+\/,]/);
+    for (const chunk of chunks) {
+      const c = chunk.trim();
+      if (!c) continue;
+      const cQty = parseBrickQty(c, c);
+      const cRate = getRateForGrade(c);
+      sum += (cQty * cRate) / 1000;
+    }
+    if (sum > 0) return sum;
+  }
+
+  // If grade column itself specifies a standard mixed load
+  if (gStr.includes('अव्वल') && gStr.includes('मीठा')) {
+    const totalQty = parseBrickQty(qtyVal, gradeVal);
+    if (totalQty === 6000) {
+      return (2000 * 7500 / 1000) + (4000 * 6500 / 1000); // 15000 + 26000 = 41000
+    }
+  }
+  if (gStr.includes('गोड़िया') && gStr.includes('मीठा')) {
+    const totalQty = parseBrickQty(qtyVal, gradeVal);
+    if (totalQty === 2000) {
+      return (1000 * 4500 / 1000) + (1000 * 6500 / 1000); // 4500 + 6500 = 11000
+    }
+  }
+
+  const bQty = parseBrickQty(qtyVal, gradeVal);
+  const rate = getRateForGrade(gradeVal);
+  return (bQty * rate) / 1000;
+}
+
 // --- Dynamic Transliteration Engine for Safe PDF Rendering ---
 function transliterateHindiToEnglish(text) {
   if (!text) return '';
@@ -217,7 +261,7 @@ function toAsciiText(str, enFallback = '') {
   return transliterated || 'Customer';
 }
 
-// --- Transliteration & Phonetic Normalization (CANONICAL TARGET: कधंई) ---
+// --- Transliteration & Phonetic Normalization ---
 function normalizeHindi(str) {
   if (!str) return '';
   let s = str.toString().trim().toLowerCase();
@@ -990,7 +1034,7 @@ async function processBatchDispatches(dateStr, dispatches) {
   await Promise.all(tasks);
 }
 
-// --- Customer Ledger Engine (Strict 10-Column Separation for Bricks & Roda) ---
+// --- Customer Ledger Engine (Strict 10-Column Separation & Mixed Quantity Preservation) ---
 async function regenerateCustomerLedger() {
   if (!sheets || !SPREADSHEET_ID) return;
   try {
@@ -1012,20 +1056,28 @@ async function regenerateCustomerLedger() {
       const itemType = isRoda ? 'रोड़ा (Roda)' : 'ईंट (Bricks)';
       const key = `${normalizeHindi(name)}_${isRoda ? 'RODA' : 'BRICK'}`;
 
+      const rawQtyStr = (o[4] || '').toString().trim();
+      const count = isRoda ? parseTrolleyQty(o[4]) : parseBrickQty(o[4], grade);
+
       const item = ledgerMap.get(key) || {
         name,
         village: o[2] || '',
         itemType,
         unit: isRoda ? 'ट्रॉली' : 'नग',
-        orderedQty: 0,
-        dispatchedQty: 0,
+        numericOrderedQty: 0,
+        numericDispatchedQty: 0,
+        orderedQtyDisplay: '',
+        dispatchedQtyDisplay: '',
         totalBilled: 0,
         totalPaid: 0,
         hasExplicitOrder: true
       };
 
-      const count = isRoda ? parseTrolleyQty(o[4]) : parseBrickQty(o[4], grade);
-      item.orderedQty += count;
+      item.numericOrderedQty += count;
+      if (rawQtyStr && (rawQtyStr.includes('+') || rawQtyStr.includes('/') || rawQtyStr.includes(','))) {
+        item.orderedQtyDisplay = rawQtyStr;
+      }
+
       item.totalBilled += Number(o[5]) || 0;
       item.totalPaid += Number(o[6]) || 0;
       ledgerMap.set(key, item);
@@ -1040,6 +1092,8 @@ async function regenerateCustomerLedger() {
       const itemType = isRoda ? 'रोड़ा (Roda)' : 'ईंट (Bricks)';
       const key = `${normalizeHindi(name)}_${isRoda ? 'RODA' : 'BRICK'}`;
 
+      const rawDispStr = (d[5] || d[6] || '').toString().trim();
+      const rawMasterStr = (d[4] || '').toString().trim();
       const dispCount = isRoda ? parseTrolleyQty(d[6] || d[5]) : parseBrickQty(d[6] || d[5], grade);
       const masterCount = isRoda ? parseTrolleyQty(d[4]) : parseBrickQty(d[4], grade);
 
@@ -1048,28 +1102,28 @@ async function regenerateCustomerLedger() {
         village: d[2] || '',
         itemType,
         unit: isRoda ? 'ट्रॉली' : 'नग',
-        orderedQty: 0,
-        dispatchedQty: 0,
+        numericOrderedQty: 0,
+        numericDispatchedQty: 0,
+        orderedQtyDisplay: '',
+        dispatchedQtyDisplay: '',
         totalBilled: 0,
         totalPaid: 0,
         hasExplicitOrder: false
       };
 
-      item.dispatchedQty += dispCount;
+      item.numericDispatchedQty += dispCount;
+
+      // Preserve explicit mixed strings like "2000 अव्वल + 4000 मीठा" or "1000 गोड़िया / 1000 मीठा"
+      if (rawDispStr && (rawDispStr.includes('+') || rawDispStr.includes('/') || rawDispStr.includes(','))) {
+        item.dispatchedQtyDisplay = rawDispStr;
+        if (!item.orderedQtyDisplay || !item.hasExplicitOrder) {
+          item.orderedQtyDisplay = rawMasterStr && (rawMasterStr.includes('+') || rawMasterStr.includes('/')) ? rawMasterStr : rawDispStr;
+        }
+      }
 
       if (!item.hasExplicitOrder) {
-        item.orderedQty += (masterCount > 0 ? masterCount : dispCount);
-        
-        let billedVal = 0;
-        if (isRoda) {
-          billedVal = dispCount * getRateForGrade(grade);
-        } else if (grade.includes('गोड़िया') && grade.includes('मीठा')) {
-          billedVal = (1000 * 4500 / 1000) + (1000 * 6500 / 1000);
-        } else if (grade.includes('अव्वल') && grade.includes('मीठा')) {
-          billedVal = (2000 * 7500 / 1000) + (4000 * 6500 / 1000);
-        } else {
-          billedVal = (dispCount * getRateForGrade(grade)) / 1000;
-        }
+        item.numericOrderedQty += (masterCount > 0 ? masterCount : dispCount);
+        const billedVal = calculateBilledAmount(d[5] || d[6] || d[4], grade);
         item.totalBilled += billedVal;
       }
       ledgerMap.set(key, item);
@@ -1077,7 +1131,9 @@ async function regenerateCustomerLedger() {
 
     const ledgerRows = [];
     for (const [, acc] of ledgerMap.entries()) {
-      const pendingQty = Math.max(0, acc.orderedQty - acc.dispatchedQty);
+      const finalOrderedDisplay = acc.orderedQtyDisplay || acc.numericOrderedQty;
+      const finalDispatchedDisplay = acc.dispatchedQtyDisplay || acc.numericDispatchedQty;
+      const pendingQty = Math.max(0, acc.numericOrderedQty - acc.numericDispatchedQty);
       const netDue = Math.max(0, acc.totalBilled - acc.totalPaid);
       const status = (pendingQty === 0 && netDue === 0 && acc.totalBilled > 0)
         ? 'बेबाक (Settled)'
@@ -1087,8 +1143,8 @@ async function regenerateCustomerLedger() {
         acc.name,
         acc.village,
         acc.itemType,
-        acc.orderedQty,
-        acc.dispatchedQty,
+        finalOrderedDisplay,
+        finalDispatchedDisplay,
         acc.unit,
         acc.totalBilled,
         acc.totalPaid,
@@ -1360,14 +1416,14 @@ async function getCustomerDetails(customerName, targetDate = null) {
 
     matchedLedgerLines.forEach(line => {
       const itemType = line[2] || '';
-      const ord = Number(line[3]) || 0;
-      const disp = Number(line[4]) || 0;
+      const ord = parseBrickQty(line[3], itemType) || Number(line[3]) || 0;
+      const disp = parseBrickQty(line[4], itemType) || Number(line[4]) || 0;
       const billed = Number(line[6]) || 0;
       const paid = Number(line[7]) || 0;
 
       if (isRodaGrade(itemType)) {
-        totalRodaOrdered += ord;
-        totalRodaDispatched += disp;
+        totalRodaOrdered += (parseTrolleyQty(line[3]) || 1);
+        totalRodaDispatched += (parseTrolleyQty(line[4]) || 1);
       } else {
         totalBrickOrdered += ord;
         totalBrickDispatched += disp;
@@ -1986,8 +2042,7 @@ app.post(['/webhook', '/webhook/*', '/webhook/messages-upsert'], async (req, res
           const firstDisp = custDetails.dispatches[0];
           const isRoda = isRodaGrade(firstDisp.grade);
           const qty = isRoda ? parseTrolleyQty(firstDisp.qty) : parseBrickQty(firstDisp.qty, firstDisp.grade);
-          const rate = getRateForGrade(firstDisp.grade);
-          const totalVal = isRoda ? (qty * rate) : (qty * rate) / 1000;
+          const totalVal = calculateBilledAmount(firstDisp.qty, firstDisp.grade);
           const paidVal = parsed.fields_to_update?.amount_received || totalVal;
 
           await appendWithRetry({
